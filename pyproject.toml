@@ -1,0 +1,24 @@
+[project]
+name = "tactile-vla"
+version = "0.1.0"
+description = "Project code for tactile captioning, VLA training adapters, and runtime inference."
+requires-python = ">=3.11"
+dependencies = [
+    "h5py>=3.10",
+    "numpy>=1.22",
+    "pyarrow>=15.0",
+    "safetensors>=0.4",
+    "torch>=2.0",
+    "tqdm>=4.0",
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
