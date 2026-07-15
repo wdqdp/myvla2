@@ -27,6 +27,33 @@ logger = logging.getLogger("openpi")
 ArrayT = TypeVar("ArrayT", bound=jax.Array | torch.Tensor | np.ndarray)
 
 
+def _intersect_params_preserving_none(reference: at.Params, params: at.Params) -> at.Params:
+    """Remove extra checkpoint paths without dropping structural None leaves."""
+    flat_reference = traverse_util.flatten_dict(reference)
+    flat_params = traverse_util.flatten_dict(params)
+    result = {path: value for path, value in flat_params.items() if path in flat_reference}
+
+    # Orbax's intersect_trees uses JAX pytree semantics, where None has no
+    # leaves, and therefore removes entries such as GRUCell.dense_h.bias=None.
+    # These entries are still part of the NNX pure-dict structure and must be
+    # retained for state.replace_by_pure_dict().
+    for path, reference_value in flat_reference.items():
+        if reference_value is None:
+            checkpoint_value = flat_params.get(path)
+            if checkpoint_value is not None:
+                raise ValueError(
+                    f"Checkpoint parameter structure mismatch at {path!r}: "
+                    f"expected None, got {type(checkpoint_value).__name__}."
+                )
+            result[path] = None
+        elif path in result and jax.dtypes.issubdtype(reference_value.dtype, jax.dtypes.prng_key):
+            checkpoint_value = result[path]
+            if not jax.dtypes.issubdtype(checkpoint_value.dtype, jax.dtypes.prng_key):
+                result[path] = jax.random.wrap_key_data(checkpoint_value)
+
+    return traverse_util.unflatten_dict(result)
+
+
 class ModelType(enum.Enum):
     """Supported model types."""
 
@@ -94,6 +121,10 @@ class Observation(Generic[ArrayT]):
     # Low-dimensional robot state.
     state: at.Float[ArrayT, "*b s"]
 
+    # Dense low-dimensional state history and its valid-frame mask.
+    state_history: at.Float[ArrayT, "*b hs hsd"] | None = None
+    state_history_mask: at.Bool[ArrayT, "*b hs"] | None = None
+
     # Tokenized prompt.
     tokenized_prompt: at.Int[ArrayT, "*b l"] | None = None
     # Tokenized prompt mask.
@@ -112,6 +143,8 @@ class Observation(Generic[ArrayT]):
         # Ensure that tokenized_prompt and tokenized_prompt_mask are provided together.
         if ("tokenized_prompt" in data) != ("tokenized_prompt_mask" in data):
             raise ValueError("tokenized_prompt and tokenized_prompt_mask must be provided together.")
+        if ("state_history" in data) != ("state_history_mask" in data):
+            raise ValueError("state_history and state_history_mask must be provided together.")
         # If images are uint8, convert them to [-1, 1] float32.
         for key in data["image"]:
             if data["image"][key].dtype == np.uint8:
@@ -122,6 +155,8 @@ class Observation(Generic[ArrayT]):
             images=data["image"],
             image_masks=data["image_mask"],
             state=data["state"],
+            state_history=data.get("state_history"),
+            state_history_mask=data.get("state_history_mask"),
             tokenized_prompt=data.get("tokenized_prompt"),
             tokenized_prompt_mask=data.get("tokenized_prompt_mask"),
             token_ar_mask=data.get("token_ar_mask"),
@@ -201,6 +236,8 @@ def preprocess_observation(
         images=out_images,
         image_masks=out_masks,
         state=observation.state,
+        state_history=observation.state_history,
+        state_history_mask=observation.state_history_mask,
         tokenized_prompt=observation.tokenized_prompt,
         tokenized_prompt_mask=observation.tokenized_prompt_mask,
         token_ar_mask=observation.token_ar_mask,
@@ -234,9 +271,10 @@ class BaseModelConfig(abc.ABC):
         """Create a model with the given parameters."""
         model = nnx.eval_shape(self.create, jax.random.key(0))
         graphdef, state = nnx.split(model)
+        expected_params = state.to_pure_dict()
         if remove_extra_params:
-            params = ocp.transform_utils.intersect_trees(state.to_pure_dict(), params)
-        at.check_pytree_equality(expected=state.to_pure_dict(), got=params, check_shapes=True, check_dtypes=False)
+            params = _intersect_params_preserving_none(expected_params, params)
+        at.check_pytree_equality(expected=expected_params, got=params, check_shapes=True, check_dtypes=False)
         state.replace_by_pure_dict(params)
         return nnx.merge(graphdef, state)
 
@@ -314,13 +352,25 @@ def restore_params(
         metadata = ckptr.metadata(params_path)
         item = {"params": metadata["params"]}
 
+        def make_restore_args(value_metadata):
+            restore_dtype = dtype
+            metadata_dtype = getattr(value_metadata, "dtype", None)
+            # A requested inference dtype applies only to floating-point
+            # weights. Keep RNG keys/counters and other integer state in their
+            # checkpoint dtype.
+            if (
+                restore_dtype is not None
+                and metadata_dtype is not None
+                and not jnp.issubdtype(metadata_dtype, jnp.inexact)
+            ):
+                restore_dtype = None
+            return ocp.ArrayRestoreArgs(sharding=sharding, restore_type=restore_type, dtype=restore_dtype)
+
         params = ckptr.restore(
             params_path,
             ocp.args.PyTreeRestore(
                 item=item,
-                restore_args=jax.tree.map(
-                    lambda _: ocp.ArrayRestoreArgs(sharding=sharding, restore_type=restore_type, dtype=dtype), item
-                ),
+                restore_args=jax.tree.map(make_restore_args, item),
             ),
         )["params"]
 

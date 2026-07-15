@@ -15,6 +15,11 @@ from openpi.shared import array_typing as at
 
 logger = logging.getLogger("openpi")
 
+# Keep this initializer as a module-level singleton. NNX stores initializer callables
+# in GraphDef metadata, so constructing a new closure inside Pi0.__init__ makes two
+# otherwise identical model graphs compare as different during jax.jit sharding.
+_HISTORY_PROJECTION_KERNEL_INIT = jax.nn.initializers.normal(1e-3)
+
 
 def make_attn_mask(input_mask, mask_ar):
     """Adapted from big_vision.
@@ -67,6 +72,10 @@ class Pi0(_model.BaseModel):
     def __init__(self, config: pi0_config.Pi0Config, rngs: nnx.Rngs):
         super().__init__(config.action_dim, config.action_horizon, config.max_token_len)
         self.pi05 = config.pi05
+        self.use_state_history = config.use_state_history
+        self.state_history_len = config.state_history_len
+        self.state_history_dim = config.state_history_dim
+        self.history_hidden_dim = config.history_hidden_dim
         paligemma_config = _gemma.get_config(config.paligemma_variant)
         action_expert_config = _gemma.get_config(config.action_expert_variant)
         # TODO: rewrite gemma in NNX. For now, use bridge.
@@ -93,6 +102,19 @@ class Pi0(_model.BaseModel):
         if config.pi05:
             self.time_mlp_in = nnx.Linear(action_expert_config.width, action_expert_config.width, rngs=rngs)
             self.time_mlp_out = nnx.Linear(action_expert_config.width, action_expert_config.width, rngs=rngs)
+            if config.use_state_history:
+                self.history_gru = nnx.GRUCell(
+                    config.state_history_dim,
+                    config.history_hidden_dim,
+                    rngs=rngs,
+                )
+                self.history_norm = nnx.LayerNorm(config.history_hidden_dim, rngs=rngs)
+                self.history_proj = nnx.Linear(
+                    config.history_hidden_dim,
+                    action_expert_config.width,
+                    kernel_init=_HISTORY_PROJECTION_KERNEL_INIT,
+                    rngs=rngs,
+                )
         else:
             self.state_proj = nnx.Linear(config.action_dim, action_expert_config.width, rngs=rngs)
             self.action_time_mlp_in = nnx.Linear(2 * action_expert_config.width, action_expert_config.width, rngs=rngs)
@@ -101,6 +123,31 @@ class Pi0(_model.BaseModel):
 
         # This attribute gets automatically set by model.train() and model.eval().
         self.deterministic = True
+
+    def encode_state_history(self, obs: _model.Observation) -> at.Float[at.Array, "b emb"]:
+        if not self.use_state_history:
+            raise ValueError("encode_state_history called while state-history conditioning is disabled")
+        if obs.state_history is None or obs.state_history_mask is None:
+            raise ValueError("State-history model requires state_history and state_history_mask")
+        if obs.state_history.shape[1:] != (self.state_history_len, self.state_history_dim):
+            raise ValueError(
+                f"Expected state_history [B,{self.state_history_len},{self.state_history_dim}], "
+                f"got {obs.state_history.shape}"
+            )
+        if obs.state_history_mask.shape[1:] != (self.state_history_len,):
+            raise ValueError(
+                f"Expected state_history_mask [B,{self.state_history_len}], got {obs.state_history_mask.shape}"
+            )
+
+        hidden = jnp.zeros(
+            (obs.state_history.shape[0], self.history_hidden_dim),
+            dtype=obs.state_history.dtype,
+        )
+        for step in range(self.state_history_len):
+            candidate, _ = self.history_gru(hidden, obs.state_history[:, step, :])
+            valid = obs.state_history_mask[:, step, None]
+            hidden = jnp.where(valid, candidate, hidden)
+        return self.history_proj(self.history_norm(hidden))
 
     @at.typecheck
     def embed_prefix(
@@ -138,7 +185,12 @@ class Pi0(_model.BaseModel):
 
     @at.typecheck
     def embed_suffix(
-        self, obs: _model.Observation, noisy_actions: _model.Actions, timestep: at.Float[at.Array, " b"]
+        self,
+        obs: _model.Observation,
+        noisy_actions: _model.Actions,
+        timestep: at.Float[at.Array, " b"],
+        *,
+        history_cond: at.Float[at.Array, "b emb"] | None = None,
     ) -> tuple[
         at.Float[at.Array, "b s emb"],
         at.Bool[at.Array, "b s"],
@@ -167,6 +219,10 @@ class Pi0(_model.BaseModel):
             time_emb = nnx.swish(time_emb)
             action_expert_tokens = action_tokens
             adarms_cond = time_emb
+            if self.use_state_history:
+                if history_cond is None:
+                    history_cond = self.encode_state_history(obs)
+                adarms_cond = adarms_cond + history_cond
         else:
             # mix timestep + action information using an MLP (no adaRMS)
             time_tokens = einops.repeat(time_emb, "b emb -> b s emb", s=self.action_horizon)
@@ -227,6 +283,7 @@ class Pi0(_model.BaseModel):
         # distribution. yes, this is the opposite of the pi0 paper, and I'm sorry.
         dt = -1.0 / num_steps
         batch_size = observation.state.shape[0]
+        history_cond = self.encode_state_history(observation) if self.use_state_history else None
         if noise is None:
             noise = jax.random.normal(rng, (batch_size, self.action_horizon, self.action_dim))
 
@@ -239,7 +296,10 @@ class Pi0(_model.BaseModel):
         def step(carry):
             x_t, time = carry
             suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(
-                observation, x_t, jnp.broadcast_to(time, batch_size)
+                observation,
+                x_t,
+                jnp.broadcast_to(time, batch_size),
+                history_cond=history_cond,
             )
             # `suffix_attn_mask` is shape (b, suffix_len, suffix_len) indicating how the suffix tokens can attend to each
             # other

@@ -14,9 +14,9 @@ OPENPI_ROOT = PROJECT_ROOT / "openpi"
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 sys.path.insert(0, str(OPENPI_ROOT / "src"))
 
-DEFAULT_DATASET_DIR = Path("/home/test/qxh/workspace/tac_ws/lerobot_data/tactile_vla")
-DEFAULT_SPLIT_FILE = Path("/data1/outputs/vla/indices/splits.json")
-DEFAULT_OUTPUT_DIR = Path("/data1/outputs/vla/assets/tactile_vla_h50")
+DEFAULT_DATASET_DIR = Path("/data1/tac_data/lerobot_data/tactile_vla")
+DEFAULT_SPLIT_FILE = Path("/data1/outputs/vla/indices/splits_h30_state_memory.json")
+DEFAULT_OUTPUT_DIR = Path("/data1/outputs/vla/assets/tactile_vla_h30_state_memory")
 
 os.environ.setdefault("HF_HOME", str(PROJECT_ROOT / ".cache" / "huggingface"))
 os.environ.setdefault("HF_DATASETS_CACHE", str(PROJECT_ROOT / ".cache" / "huggingface" / "datasets"))
@@ -40,7 +40,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--split-file", type=Path, default=DEFAULT_SPLIT_FILE)
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--action-horizon", type=int, default=50)
+    parser.add_argument("--action-horizon", type=int, default=30)
     parser.add_argument("--delta-action-dims", type=int, default=7)
     parser.add_argument("--max-frames", type=int)
     parser.add_argument("--overwrite-splits", action="store_true")

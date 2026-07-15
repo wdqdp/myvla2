@@ -17,12 +17,12 @@ OPENPI_ROOT = PROJECT_ROOT / "openpi"
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 sys.path.insert(0, str(OPENPI_ROOT / "src"))
 
-DEFAULT_DATASET_DIR = Path("/home/test/qxh/workspace/tac_ws/lerobot_data/tactile_vla")
-DEFAULT_INDEX_FILE = Path("/data1/outputs/vla/indices/vla_indices_h50.json")
-DEFAULT_SPLIT_FILE = Path("/data1/outputs/vla/indices/splits.json")
-DEFAULT_NORM_STATS_DIR = Path("/data1/outputs/vla/assets/tactile_vla_h50")
+DEFAULT_DATASET_DIR = Path("/data1/tac_data/lerobot_data/tactile_vla")
+DEFAULT_INDEX_FILE = Path("/data1/outputs/vla/indices/vla_indices_h30_state_memory.json")
+DEFAULT_SPLIT_FILE = Path("/data1/outputs/vla/indices/splits_h30_state_memory.json")
+DEFAULT_NORM_STATS_DIR = Path("/data1/outputs/vla/assets/tactile_vla_h30_state_memory")
 DEFAULT_OUTPUT_DIR = Path("/data1/outputs/vla/stage_b_heads")
-DEFAULT_BACKBONE_CHECKPOINT = Path("/data1/outputs/vla/stage_a_action/pi05_delta_tac_h50/10000")
+DEFAULT_BACKBONE_CHECKPOINT = Path("/data1/outputs/vla/stage_a_action/pi05_delta_tac_h30_state_memory/10000")
 
 os.environ.setdefault("HF_HOME", str(PROJECT_ROOT / ".cache" / "huggingface"))
 os.environ.setdefault("HF_DATASETS_CACHE", str(PROJECT_ROOT / ".cache" / "huggingface" / "datasets"))
@@ -78,7 +78,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--split-file", type=Path, default=DEFAULT_SPLIT_FILE)
     parser.add_argument("--norm-stats-dir", type=Path, default=DEFAULT_NORM_STATS_DIR)
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
-    parser.add_argument("--run-name", default="pi05_heads_jax_h50")
+    parser.add_argument("--run-name", default="pi05_heads_jax_h30_state_memory")
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--num-workers", type=int, default=2)
     parser.add_argument("--epochs", type=int, default=5)
@@ -86,8 +86,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--grad-clip", type=float, default=1.0)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--action-horizon", type=int, default=50)
+    parser.add_argument("--action-horizon", type=int, default=30)
     parser.add_argument("--action-dim", type=int, default=32)
+    parser.add_argument("--state-history-len", type=int, default=60)
+    parser.add_argument("--state-history-dim", type=int, default=7)
+    parser.add_argument("--history-hidden-dim", type=int, default=256)
+    parser.add_argument("--use-state-history", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--max-token-len", type=int, default=200)
     parser.add_argument("--paligemma-variant", default="gemma_2b_lora")
     parser.add_argument("--action-expert-variant", default="gemma_300m_lora")
@@ -162,6 +166,7 @@ def build_loader(
         stage=stage,  # type: ignore[arg-type]
         reasoning_source_indices=reasoning_source_indices,
         action_horizon=args.action_horizon,
+        state_history_len=args.state_history_len if args.use_state_history else 0,
         video_backend=args.video_backend,
     )
     transformed = TransformedTactileVLADataset(
@@ -441,6 +446,8 @@ def main() -> None:
         raise ValueError("Stage B requires --backbone-checkpoint unless --allow-random-backbone is set.")
     if args.batch_size % jax.device_count() != 0:
         raise ValueError(f"batch_size={args.batch_size} must be divisible by jax.device_count()={jax.device_count()}.")
+    if args.use_state_history and args.state_history_dim != 7:
+        raise ValueError("This dataset stores 7-D puppet qpos; --state-history-dim must be 7")
 
     jax_cache_dir = PROJECT_ROOT / ".cache" / "jax"
     jax_cache_dir.mkdir(parents=True, exist_ok=True)
@@ -459,6 +466,10 @@ def main() -> None:
         action_horizon=args.action_horizon,
         max_token_len=args.max_token_len,
         pi05=True,
+        use_state_history=args.use_state_history,
+        state_history_len=args.state_history_len,
+        state_history_dim=args.state_history_dim,
+        history_hidden_dim=args.history_hidden_dim,
         pytorch_compile_mode=None,
     )
     train_status = build_loader(args, model_config, split="train", stage="status", shuffle=True)

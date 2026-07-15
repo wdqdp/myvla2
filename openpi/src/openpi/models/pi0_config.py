@@ -32,6 +32,12 @@ class Pi0Config(_model.BaseModelConfig):
     # This config option is not used directly by the model, but it is read by the ModelTransformFactory.
     discrete_state_input: bool = None  # type: ignore
 
+    # Optional dense proprioceptive history conditioning for the pi05 action expert.
+    use_state_history: bool = False
+    state_history_len: int = 60
+    state_history_dim: int = 7
+    history_hidden_dim: int = 256
+
     pytorch_compile_mode: str | None = "max-autotune"
 
     def __post_init__(self):
@@ -39,6 +45,10 @@ class Pi0Config(_model.BaseModelConfig):
             object.__setattr__(self, "max_token_len", 200 if self.pi05 else 48)
         if self.discrete_state_input is None:
             object.__setattr__(self, "discrete_state_input", self.pi05)
+        if self.use_state_history and not self.pi05:
+            raise ValueError("State-history conditioning is currently supported only for pi05")
+        if self.use_state_history and min(self.state_history_len, self.state_history_dim, self.history_hidden_dim) <= 0:
+            raise ValueError("State-history dimensions must all be positive")
         if self.pytorch_compile_mode is not None:
             assert self.pytorch_compile_mode in [
                 "default",
@@ -78,6 +88,18 @@ class Pi0Config(_model.BaseModelConfig):
                     "right_wrist_0_rgb": image_mask_spec,
                 },
                 state=jax.ShapeDtypeStruct([batch_size, self.action_dim], jnp.float32),
+                state_history=(
+                    jax.ShapeDtypeStruct(
+                        [batch_size, self.state_history_len, self.state_history_dim], jnp.float32
+                    )
+                    if self.use_state_history
+                    else None
+                ),
+                state_history_mask=(
+                    jax.ShapeDtypeStruct([batch_size, self.state_history_len], jnp.bool_)
+                    if self.use_state_history
+                    else None
+                ),
                 tokenized_prompt=jax.ShapeDtypeStruct([batch_size, self.max_token_len], jnp.int32),
                 tokenized_prompt_mask=jax.ShapeDtypeStruct([batch_size, self.max_token_len], bool),
             )

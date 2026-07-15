@@ -4,6 +4,7 @@ import re
 from typing import Protocol, runtime_checkable
 
 import flax.traverse_util
+import jax
 import numpy as np
 
 import openpi.models.model as _model
@@ -46,12 +47,13 @@ class CheckpointWeightLoader(WeightLoader):
     """
 
     params_path: str
+    missing_regex: str = ".*lora.*"
 
     def load(self, params: at.Params) -> at.Params:
         # We are loading np.ndarray and relying on the training code to properly convert and shard the params.
         loaded_params = _model.restore_params(download.maybe_download(self.params_path), restore_type=np.ndarray)
-        # Add all missing LoRA weights.
-        return _merge_params(loaded_params, params, missing_regex=".*lora.*")
+        # Merge explicitly allowed new parameters (LoRA by default) from the reference initialization.
+        return _merge_params(loaded_params, params, missing_regex=self.missing_regex)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -91,7 +93,38 @@ def _merge_params(loaded_params: at.Params, params: at.Params, *, missing_regex:
     result = {}
     for k, v in flat_loaded.items():
         if k in flat_ref:
-            result[k] = v.astype(flat_ref[k].dtype) if v.dtype != flat_ref[k].dtype else v
+            ref_value = flat_ref[k]
+            # NNX parameter trees can contain explicit None leaves.  For example,
+            # GRUCell.dense_h.bias is None when the recurrent projection does not
+            # use a bias.  Orbax preserves that leaf in the checkpoint, so it is
+            # part of the model structure rather than a missing parameter.
+            if v is None or ref_value is None:
+                if v is not None or ref_value is not None:
+                    raise ValueError(
+                        f"Checkpoint parameter structure mismatch at {k!r}: "
+                        f"checkpoint value is {type(v).__name__}, "
+                        f"reference value is {type(ref_value).__name__}."
+                    )
+                result[k] = None
+                continue
+            # Orbax serializes JAX typed PRNG keys as their raw uint32 key data
+            # when restore_type=np.ndarray.  Re-wrap that data before comparing
+            # against the typed key<fry> leaf in the NNX reference state.
+            if jax.dtypes.issubdtype(ref_value.dtype, jax.dtypes.prng_key):
+                restored_key = (
+                    v
+                    if jax.dtypes.issubdtype(v.dtype, jax.dtypes.prng_key)
+                    else jax.random.wrap_key_data(v)
+                )
+                if restored_key.shape != ref_value.shape or restored_key.dtype != ref_value.dtype:
+                    raise ValueError(
+                        f"Checkpoint PRNG key mismatch at {k!r}: "
+                        f"checkpoint shape/dtype is {restored_key.shape}/{restored_key.dtype}, "
+                        f"reference shape/dtype is {ref_value.shape}/{ref_value.dtype}."
+                    )
+                result[k] = restored_key
+                continue
+            result[k] = v.astype(ref_value.dtype) if v.dtype != ref_value.dtype else v
 
     flat_loaded.clear()
 

@@ -61,6 +61,9 @@ class TactileVLAOpenPIInputs:
     """Convert a raw local LeRobot row to OpenPI's model input dictionary."""
 
     right_wrist_valid: bool = False
+    use_state_history: bool = False
+    state_history_len: int = 60
+    state_history_dim: int = 7
 
     def __call__(self, data: dict) -> dict:
         base_image = _parse_image(data["observation/image"])
@@ -79,6 +82,19 @@ class TactileVLAOpenPIInputs:
             },
             "prompt": str(data["prompt"]),
         }
+        if self.use_state_history:
+            if "observation/state_history" not in data or "observation/state_history_mask" not in data:
+                raise ValueError("State-history model requires observation/state_history and its mask")
+            history = _to_numpy(data["observation/state_history"]).astype(np.float32)
+            history_mask = _to_numpy(data["observation/state_history_mask"]).astype(np.bool_)
+            if history.shape != (self.state_history_len, self.state_history_dim):
+                raise ValueError(
+                    f"Expected state history [{self.state_history_len},{self.state_history_dim}], got {history.shape}"
+                )
+            if history_mask.shape != (self.state_history_len,):
+                raise ValueError(f"Expected state history mask [{self.state_history_len}], got {history_mask.shape}")
+            result["state_history"] = history
+            result["state_history_mask"] = history_mask
         if "actions" in data:
             result["actions"] = _to_numpy(data["actions"]).astype(np.float32)
         for key in (
@@ -101,8 +117,40 @@ class TactileVLAOpenPIInputs:
 class CastStateActionFloat32:
     def __call__(self, data: dict) -> dict:
         data["state"] = np.asarray(data["state"], dtype=np.float32)
+        if "state_history" in data:
+            data["state_history"] = np.asarray(data["state_history"], dtype=np.float32)
+        if "state_history_mask" in data:
+            data["state_history_mask"] = np.asarray(data["state_history_mask"], dtype=np.bool_)
         if "actions" in data:
             data["actions"] = np.asarray(data["actions"], dtype=np.float32)
+        return data
+
+
+@dataclass(frozen=True)
+class NormalizeStateHistory:
+    """Normalize qpos history with the same statistics as the current state."""
+
+    norm_stats: dict | None
+    use_quantiles: bool = True
+
+    def __call__(self, data: dict) -> dict:
+        if self.norm_stats is None or "state_history" not in data:
+            return data
+        stats = self.norm_stats.get("state")
+        if stats is None:
+            raise KeyError("norm_stats does not contain the state statistics required by state_history")
+        history = np.asarray(data["state_history"], dtype=np.float32)
+        if self.use_quantiles:
+            if stats.q01 is None or stats.q99 is None:
+                raise ValueError("Quantile normalization requested, but state q01/q99 are missing")
+            q01 = np.asarray(stats.q01)[..., : history.shape[-1]]
+            q99 = np.asarray(stats.q99)[..., : history.shape[-1]]
+            history = (history - q01) / (q99 - q01 + 1e-6) * 2.0 - 1.0
+        else:
+            mean = np.asarray(stats.mean)[..., : history.shape[-1]]
+            std = np.asarray(stats.std)[..., : history.shape[-1]]
+            history = (history - mean) / (std + 1e-6)
+        data["state_history"] = history.astype(np.float32)
         return data
 
 
@@ -117,6 +165,7 @@ class TactileVLAFrameDataset(torch.utils.data.Dataset):
         stage: StageName,
         reasoning_source_indices: Sequence[int] | None = None,
         action_horizon: int = 30,
+        state_history_len: int = 0,
         fps: int = 30,
         video_backend: str = "pyav",
     ) -> None:
@@ -132,14 +181,21 @@ class TactileVLAFrameDataset(torch.utils.data.Dataset):
             raise ValueError("reasoning_source_indices must have the same length as indices")
         self.stage = stage
         self.action_horizon = action_horizon
+        self.state_history_len = int(state_history_len)
+        if self.state_history_len < 0:
+            raise ValueError(f"state_history_len must be non-negative, got {self.state_history_len}")
         self.fps = fps
-        delta_timestamps = None
+        delta_timestamps = {}
+        if self.state_history_len > 0:
+            delta_timestamps["observation.state"] = [
+                step / fps for step in range(-(self.state_history_len - 1), 1)
+            ]
         if stage == "execution":
-            delta_timestamps = {"action": [step / fps for step in range(action_horizon)]}
+            delta_timestamps["action"] = [step / fps for step in range(action_horizon)]
         self._dataset = LeRobotDataset(
             "tactile_vla",
             root=self.dataset_dir,
-            delta_timestamps=delta_timestamps,
+            delta_timestamps=delta_timestamps or None,
             download_videos=False,
             video_backend=video_backend,
         )
@@ -186,10 +242,11 @@ class TactileVLAFrameDataset(torch.utils.data.Dataset):
             recovery_plan_mask = True
         prompt_item = reasoning_item if self.stage == "reasoning" else item
 
+        state = item["observation.state"]
         result = {
             "observation/image": item["observation.images.front"],
             "observation/wrist_image": item["observation.images.left"],
-            "observation/state": item["observation.state"],
+            "observation/state": state[-1] if self.state_history_len > 0 else state,
             "prompt": self._prompt(prompt_item),
             "need_recovery_label": int(need_recovery),
             "failure_reason_label": int(failure_reason_label),
@@ -201,6 +258,17 @@ class TactileVLAFrameDataset(torch.utils.data.Dataset):
             "attempt_id": int(_scalar(item["attempt_id"])),
             "frame_index": int(_scalar(item["frame_index"])),
         }
+        if self.state_history_len > 0:
+            state_history = _to_numpy(state).astype(np.float32)
+            history_is_pad = _to_numpy(item["observation.state_is_pad"]).astype(np.bool_)
+            expected_shape = (self.state_history_len, state_history.shape[-1])
+            if state_history.shape != expected_shape or history_is_pad.shape != (self.state_history_len,):
+                raise ValueError(
+                    "Unexpected state history returned by LeRobot: "
+                    f"history={state_history.shape}, pad={history_is_pad.shape}, expected={expected_shape}"
+                )
+            result["observation/state_history"] = state_history
+            result["observation/state_history_mask"] = np.logical_not(history_is_pad)
         if self.stage == "execution":
             result["actions"] = item["action"]
         return result
@@ -218,11 +286,19 @@ def build_transform(
     import openpi.transforms as openpi_transforms
     from openpi.models import tokenizer as openpi_tokenizer
 
-    transforms = [TactileVLAOpenPIInputs()]
+    use_state_history = bool(getattr(model_config, "use_state_history", False))
+    transforms = [
+        TactileVLAOpenPIInputs(
+            use_state_history=use_state_history,
+            state_history_len=int(getattr(model_config, "state_history_len", 60)),
+            state_history_dim=int(getattr(model_config, "state_history_dim", 7)),
+        )
+    ]
     if use_delta_actions:
         transforms.append(openpi_transforms.DeltaActions(openpi_transforms.make_bool_mask(delta_action_dims)))
     transforms.extend(
         [
+            NormalizeStateHistory(norm_stats, use_quantiles=use_quantile_norm),
             openpi_transforms.Normalize(norm_stats, use_quantiles=use_quantile_norm),
             CastStateActionFloat32(),
             openpi_transforms.ResizeImages(224, 224),

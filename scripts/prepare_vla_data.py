@@ -11,10 +11,10 @@ import sys
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
-DEFAULT_DATASET_DIR = Path("/home/test/qxh/workspace/tac_ws/lerobot_data/tactile_vla")
+DEFAULT_DATASET_DIR = Path("/data1/tac_data/lerobot_data/tactile_vla")
 DEFAULT_OUTPUT_DIR = Path("/data1/outputs/vla/indices")
-DEFAULT_SPLIT_FILE = Path("/data1/outputs/vla/indices/splits.json")
-DEFAULT_INDEX_FILE = DEFAULT_OUTPUT_DIR / "vla_indices_h50.json"
+DEFAULT_SPLIT_FILE = Path("/data1/outputs/vla/indices/splits_h30_state_memory.json")
+DEFAULT_INDEX_FILE = DEFAULT_OUTPUT_DIR / "vla_indices_h30_state_memory.json"
 
 from tactile_vla.vla.index import SplitConfig
 from tactile_vla.vla.index import index_payload
@@ -35,7 +35,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--status-negative-ratio", type=float, default=3.0)
     parser.add_argument("--reasoning-augment-after-frames", type=int, default=10)
-    parser.add_argument("--action-horizon", type=int, default=50)
+    parser.add_argument("--action-horizon", type=int, default=30)
     parser.add_argument("--overwrite", action="store_true")
     return parser.parse_args()
 

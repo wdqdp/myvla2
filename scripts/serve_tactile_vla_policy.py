@@ -7,10 +7,10 @@ import argparse
 import json
 import logging
 import os
-from pathlib import Path
 import socket
 import sys
 import time
+from pathlib import Path
 from typing import Any
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -22,22 +22,20 @@ os.environ.setdefault("HF_HOME", str(PROJECT_ROOT / ".cache" / "huggingface"))
 os.environ.setdefault("HF_DATASETS_CACHE", str(PROJECT_ROOT / ".cache" / "huggingface" / "datasets"))
 os.environ.setdefault("TORCH_HOME", str(PROJECT_ROOT / ".cache" / "torch"))
 
-from flax import nnx
-from flax import traverse_util
 import jax
 import jax.numpy as jnp
 import numpy as np
+from flax import nnx, traverse_util
 
 from openpi.models import model as openpi_model
 from openpi.models.model import Observation
 from openpi.models.pi0_config import Pi0Config
 from openpi.serving import websocket_policy_server
-from openpi.shared import nnx_utils
-from openpi.shared import normalize
+from openpi.shared import nnx_utils, normalize
+from tactile_vla.runtime.state_history import DEFAULT_STATE_HISTORY_FPS
 from tactile_vla.vla import labels as vla_labels
 from tactile_vla.vla import stage_b_jax
-from tactile_vla.vla.openpi_bridge import build_action_output_transform
-from tactile_vla.vla.openpi_bridge import build_transform
+from tactile_vla.vla.openpi_bridge import build_action_output_transform, build_transform
 
 
 def parse_args() -> argparse.Namespace:
@@ -50,6 +48,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--action-horizon", type=int)
     parser.add_argument("--action-dim", type=int)
     parser.add_argument("--output-action-dim", type=int, default=7)
+    parser.add_argument("--use-state-history", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--state-history-len", type=int)
+    parser.add_argument("--state-history-dim", type=int)
+    parser.add_argument("--state-history-fps", type=float)
+    parser.add_argument("--history-hidden-dim", type=int)
     parser.add_argument("--max-token-len", type=int)
     parser.add_argument("--paligemma-variant")
     parser.add_argument("--action-expert-variant")
@@ -145,6 +148,15 @@ class TactileVLAPolicy:
         dtype = jnp.bfloat16 if model_config.dtype == "bfloat16" else jnp.float32
         logging.info("Loading Stage A params from %s", params_dir)
         params = openpi_model.restore_params(params_dir, dtype=dtype)
+        flat_param_paths = traverse_util.flatten_dict(params)
+        checkpoint_has_history = any(path and str(path[0]).startswith("history_") for path in flat_param_paths)
+        if checkpoint_has_history != model_config.use_state_history:
+            raise ValueError(
+                "Stage A checkpoint/config state-history mismatch: "
+                f"checkpoint_has_history={checkpoint_has_history}, "
+                f"use_state_history={model_config.use_state_history}. "
+                "Use the config.json saved with this checkpoint or pass matching history arguments."
+            )
         self._model = model_config.load(params)
         self._model.eval()
         self._sample_actions = nnx_utils.module_jit(self._model.sample_actions)
@@ -235,6 +247,11 @@ class TactileVLAPolicy:
 
 def build_model_config(args: argparse.Namespace, stage_a_config: dict[str, Any]) -> Pi0Config:
     precision = _resolve_precision(args.precision or stage_a_config.get("precision"))
+    use_state_history = (
+        bool(args.use_state_history)
+        if args.use_state_history is not None
+        else bool(stage_a_config.get("use_state_history", False))
+    )
     return Pi0Config(
         dtype=precision,
         paligemma_variant=args.paligemma_variant or stage_a_config.get("paligemma_variant", "gemma_2b_lora"),
@@ -244,6 +261,10 @@ def build_model_config(args: argparse.Namespace, stage_a_config: dict[str, Any])
         action_horizon=int(args.action_horizon or stage_a_config.get("action_horizon", 30)),
         max_token_len=int(args.max_token_len or stage_a_config.get("max_token_len", 200)),
         pi05=True,
+        use_state_history=use_state_history,
+        state_history_len=int(args.state_history_len or stage_a_config.get("state_history_len", 60)),
+        state_history_dim=int(args.state_history_dim or stage_a_config.get("state_history_dim", 7)),
+        history_hidden_dim=int(args.history_hidden_dim or stage_a_config.get("history_hidden_dim", 256)),
         pytorch_compile_mode=None,
     )
 
@@ -252,12 +273,26 @@ def warm_up_policy(policy: TactileVLAPolicy) -> dict[str, Any]:
     """Compile both inference paths and validate their basic output contract."""
     image = np.zeros((224, 224, 3), dtype=np.uint8)
     state = np.zeros((7,), dtype=np.float32)
+    history = np.zeros(
+        (policy._model_config.state_history_len, policy._model_config.state_history_dim),  # noqa: SLF001
+        dtype=np.float32,
+    )
+    history_mask = np.ones((policy._model_config.state_history_len,), dtype=np.bool_)  # noqa: SLF001
+    history_inputs = (
+        {
+            "observation/state_history": history,
+            "observation/state_history_mask": history_mask,
+        }
+        if policy._model_config.use_state_history  # noqa: SLF001
+        else {}
+    )
     execution = policy.infer(
         {
             "mode": "execution",
             "observation/image": image,
             "observation/wrist_image": image,
             "observation/state": state,
+            **history_inputs,
             "prompt": (
                 "Mode: execution. Task: dry run. Tactile: no rotation. "
                 "Recovery plan: none. Output the next robot action chunk and monitor whether recovery is needed."
@@ -270,6 +305,7 @@ def warm_up_policy(policy: TactileVLAPolicy) -> dict[str, Any]:
             "observation/image": image,
             "observation/wrist_image": image,
             "observation/state": state,
+            **history_inputs,
             "prompt": (
                 "Mode: reasoning. Task: dry run. Tactile: no rotation. "
                 "Failure-recovery memory: none. Choose the next recovery plan."
@@ -304,6 +340,13 @@ def main() -> None:
     params_dir = _resolve_params_dir(args.stage_a_checkpoint)
     head_params_path = _resolve_heads_path(args.stage_b_heads)
     norm_stats = None if args.no_norm else normalize.load(args.norm_stats_dir)
+    state_history_fps = float(
+        args.state_history_fps
+        if args.state_history_fps is not None
+        else stage_a_config.get("state_history_fps", DEFAULT_STATE_HISTORY_FPS)
+    )
+    if state_history_fps <= 0:
+        raise ValueError(f"state_history_fps must be positive, got {state_history_fps}")
     metadata = {
         "name": "tactile_vla_policy",
         "stage_a_checkpoint": str(args.stage_a_checkpoint),
@@ -311,6 +354,11 @@ def main() -> None:
         "action_horizon": model_config.action_horizon,
         "action_dim": model_config.action_dim,
         "output_action_dim": args.output_action_dim,
+        "use_state_history": model_config.use_state_history,
+        "state_history_len": model_config.state_history_len,
+        "state_history_dim": model_config.state_history_dim,
+        "state_history_fps": state_history_fps,
+        "history_hidden_dim": model_config.history_hidden_dim,
         "need_recovery_threshold": args.need_recovery_threshold,
         "failure_reasons": list(vla_labels.FAILURE_REASONS),
         "recovery_plans": list(vla_labels.RECOVERY_PLANS),

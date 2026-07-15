@@ -1,5 +1,7 @@
 from flax import nnx
+from flax import traverse_util
 import jax
+import jax.numpy as jnp
 import pytest
 
 from openpi.models import model as _model
@@ -7,6 +9,36 @@ from openpi.models import pi0_config
 from openpi.models import pi0_fast
 from openpi.shared import download
 from openpi.shared import nnx_utils
+
+
+def test_intersect_params_preserves_structural_none():
+    reference_key = jax.random.key(0)
+    reference = {
+        "history_gru": {
+            "dense_h": {
+                "bias": None,
+                "kernel": jax.ShapeDtypeStruct((2, 3), jnp.float32),
+            },
+            "rngs": {
+                "key": jax.ShapeDtypeStruct(reference_key.shape, reference_key.dtype),
+            },
+        }
+    }
+    params = {
+        "history_gru": {
+            "dense_h": {"bias": None, "kernel": jnp.ones((2, 3))},
+            "rngs": {"key": jax.random.key_data(jax.random.key(42))},
+        },
+        "checkpoint_only": {"value": jnp.ones(())},
+    }
+
+    result = _model._intersect_params_preserving_none(reference, params)  # noqa: SLF001
+    flat_result = traverse_util.flatten_dict(result)
+
+    assert flat_result[("history_gru", "dense_h", "bias")] is None
+    assert ("history_gru", "dense_h", "kernel") in flat_result
+    assert flat_result[("history_gru", "rngs", "key")].dtype == reference_key.dtype
+    assert ("checkpoint_only", "value") not in flat_result
 
 
 def test_pi0_model():

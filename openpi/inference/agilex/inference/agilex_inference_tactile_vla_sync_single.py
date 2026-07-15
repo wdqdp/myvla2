@@ -28,15 +28,16 @@ import cv2
 import numpy as np
 from openpi_client import image_tools
 from openpi_client import websocket_client_policy
-
 from tactile_vla.captioner.predictor import TactileCaptionerPredictor
+from tactile_vla.runtime.state_history import DEFAULT_STATE_HISTORY_FPS
+from tactile_vla.runtime.state_history import StateHistoryBuffer
+from tactile_vla.runtime.state_history import pad_state_history
 from tactile_vla.runtime.tactile_buffer import DEFAULT_TACTILE_CAPTION
 from tactile_vla.runtime.tactile_buffer import RosTactileBuffer
 from tactile_vla.runtime.tactile_buffer import TactileTopics
 from tactile_vla.runtime.tactile_buffer import TactileWindowBuffer
 from tactile_vla.vla.prompts import build_execution_prompt
 from tactile_vla.vla.prompts import build_reasoning_prompt
-
 
 DEFAULT_INSTRUCTION = "Pick up and transfer the object stably."
 DEFAULT_CAPTIONER = PROJECT_ROOT / "outputs" / "tactile_captioner" / "tcn_v1_balanced" / "best.pt"
@@ -175,8 +176,8 @@ class NoopRate:
 
 class RosOperator:
     def __init__(self, args: argparse.Namespace) -> None:
-        import rospy
         from cv_bridge import CvBridge
+        import rospy
         from sensor_msgs.msg import Image
         from sensor_msgs.msg import JointState
         from std_msgs.msg import Header
@@ -190,6 +191,12 @@ class RosOperator:
         self.img_front_deque = deque()
         self.img_left_deque = deque()
         self.puppet_arm_deque = deque()
+        self.state_history = StateHistoryBuffer(
+            history_len=args.state_history_len,
+            state_dim=7,
+            history_fps=args.state_history_fps,
+            max_sample_gap_seconds=args.state_history_max_gap_seconds,
+        )
         self.puppet_arm_publisher = None
         self.tactile = None
         self._init_ros()
@@ -283,11 +290,23 @@ class RosOperator:
         if len(self.puppet_arm_deque) >= 2000:
             self.puppet_arm_deque.popleft()
         self.puppet_arm_deque.append(msg)
+        self.state_history.push(msg.header.stamp.to_sec(), np.asarray(msg.position, dtype=np.float32))
+
+    def reset_state_history(self) -> None:
+        self.state_history.clear()
+
+    def get_state_history(self, puppet_arm) -> tuple[np.ndarray, np.ndarray]:
+        return self.state_history.snapshot(
+            current_timestamp=puppet_arm.header.stamp.to_sec(),
+            current_state=np.asarray(puppet_arm.position, dtype=np.float32),
+        )
 
 
 @dataclass
 class ReplayJointState:
     position: np.ndarray
+    timestamp: float
+    index: int
 
 
 class ReplayOperator:
@@ -341,13 +360,37 @@ class ReplayOperator:
         return (
             self._read_image("camera/color/front", index),
             self._read_image("camera/color/left", index),
-            ReplayJointState(np.asarray(self.file["arm/jointStatePosition/puppetRight"][index], dtype=float)),
+            ReplayJointState(
+                np.asarray(self.file["arm/jointStatePosition/puppetRight"][index], dtype=float),
+                float(self.file["timestamp"][index]),
+                index,
+            ),
         )
+
+    def reset_state_history(self) -> None:
+        # One replay file is one attempt/episode, so its frame index already defines the boundary.
+        pass
+
+    def get_state_history(self, puppet_arm: ReplayJointState) -> tuple[np.ndarray, np.ndarray]:
+        start = max(0, puppet_arm.index - self.args.state_history_len + 1)
+        states = np.asarray(
+            self.file["arm/jointStatePosition/puppetRight"][start : puppet_arm.index + 1],
+            dtype=np.float32,
+        )
+        return pad_state_history(states, history_len=self.args.state_history_len, state_dim=7)
 
 
 class MockPolicy:
     def get_server_metadata(self) -> dict[str, Any]:
-        return {"name": "mock_tactile_vla_policy", "action_horizon": 30, "output_action_dim": 7}
+        return {
+            "name": "mock_tactile_vla_policy",
+            "action_horizon": 30,
+            "output_action_dim": 7,
+            "use_state_history": True,
+            "state_history_len": 60,
+            "state_history_dim": 7,
+            "state_history_fps": DEFAULT_STATE_HISTORY_FPS,
+        }
 
     def infer(self, payload: dict[str, Any]) -> dict[str, Any]:
         if payload.get("mode") == "reasoning":
@@ -383,16 +426,26 @@ def build_payload(
     img_front_bgr: np.ndarray,
     img_left_bgr: np.ndarray,
     qpos: np.ndarray,
+    state_history: np.ndarray,
+    state_history_mask: np.ndarray,
     prompt: str,
 ) -> dict[str, Any]:
     qpos = np.asarray(qpos, dtype=np.float32)
     if qpos.shape[0] != 7:
         raise ValueError(f"Expected puppetRight qpos dim 7, got {qpos.shape}")
+    state_history = np.asarray(state_history, dtype=np.float32)
+    state_history_mask = np.asarray(state_history_mask, dtype=np.bool_)
+    if state_history.shape != (state_history_mask.shape[0], 7):
+        raise ValueError(
+            f"Expected state_history [T,7] matching mask [T], got {state_history.shape} and {state_history_mask.shape}"
+        )
     return {
         "mode": mode,
         "observation/image": prepare_rgb(img_front_bgr),
         "observation/wrist_image": prepare_rgb(img_left_bgr),
         "observation/state": qpos,
+        "observation/state_history": state_history,
+        "observation/state_history_mask": state_history_mask,
         "prompt": prompt,
     }
 
@@ -487,6 +540,8 @@ def run_reasoning(
     img_front: np.ndarray,
     img_left: np.ndarray,
     qpos: np.ndarray,
+    state_history: np.ndarray,
+    state_history_mask: np.ndarray,
     tactile_caption: str,
     memory: list[dict[str, Any]],
     failed_attempt_id: int,
@@ -503,6 +558,8 @@ def run_reasoning(
         img_front_bgr=img_front,
         img_left_bgr=img_left,
         qpos=qpos,
+        state_history=state_history,
+        state_history_mask=state_history_mask,
         prompt=prompt,
     )
     response = policy.infer(payload)
@@ -531,6 +588,28 @@ def run_closed_loop(args: argparse.Namespace, operator: RosOperator | ReplayOper
             f"Requested chunk_size={args.chunk_size}, but the server only returns "
             f"action_horizon={server_action_horizon}. Use matching H50/H30 artifacts or reduce --chunk_size."
         )
+    if not bool(server_metadata.get("use_state_history", False)):
+        raise ValueError("This V2 inference client requires a server with use_state_history=true")
+    server_history_len = int(server_metadata.get("state_history_len", 0))
+    server_history_dim = int(server_metadata.get("state_history_dim", 0))
+    server_history_fps = float(server_metadata.get("state_history_fps", 0.0))
+    if (server_history_len, server_history_dim) != (args.state_history_len, 7):
+        raise ValueError(
+            "Client/server state-history shape mismatch: "
+            f"client=[{args.state_history_len},7], server=[{server_history_len},{server_history_dim}]"
+        )
+    if not np.isclose(server_history_fps, args.state_history_fps):
+        raise ValueError(
+            f"Client state_history_fps={args.state_history_fps} does not match "
+            f"server state_history_fps={server_history_fps}"
+        )
+    history_span_seconds = (args.state_history_len - 1) / args.state_history_fps
+    print(
+        "State history resampling: "
+        f"{args.state_history_len} frames at {args.state_history_fps:g} Hz "
+        f"({history_span_seconds:.3f} s), nearest ROS qpos within "
+        f"{args.state_history_max_gap_seconds * 1000.0:.1f} ms"
+    )
     if not args.start_immediately and args.replay_attempt_dir is None:
         input("Press enter to continue")
 
@@ -540,6 +619,7 @@ def run_closed_loop(args: argparse.Namespace, operator: RosOperator | ReplayOper
 
     with KeyboardPoller() as keyboard:
         for attempt_id in range(1, args.max_attempts + 1):
+            operator.reset_state_history()
             print(f"Starting attempt {attempt_id} recovery_plan={input_recovery_plan or 'none'}")
             step = 0
             if attempt_id > 1 and args.recovery_tactile_ignore_seconds > 0:
@@ -551,6 +631,7 @@ def run_closed_loop(args: argparse.Namespace, operator: RosOperator | ReplayOper
             while step < args.max_publish_step and not operator.is_shutdown():
                 img_front, img_left, puppet_arm = get_ros_observation(args, operator)
                 qpos = np.asarray(puppet_arm.position, dtype=float)
+                state_history, state_history_mask = operator.get_state_history(puppet_arm)
                 if pre_action is None:
                     pre_action = qpos.copy()
 
@@ -576,11 +657,14 @@ def run_closed_loop(args: argparse.Namespace, operator: RosOperator | ReplayOper
                     img_front_bgr=img_front,
                     img_left_bgr=img_left,
                     qpos=qpos,
+                    state_history=state_history,
+                    state_history_mask=state_history_mask,
                     prompt=prompt,
                 )
                 start = time.time()
                 response = policy.infer(payload)
                 print(f"Model input prompt: {prompt}")
+                print(f"State history valid frames: {int(state_history_mask.sum())}/{state_history_mask.shape[0]}")
                 print(f"Model inference time: {(time.time() - start) * 1000:.3f} ms")
 
                 need_recovery = bool(response.get("need_recovery", False))
@@ -604,6 +688,7 @@ def run_closed_loop(args: argparse.Namespace, operator: RosOperator | ReplayOper
                             "tactile_caption": tactile_caption,
                             "tactile_ignored": tactile_ignored,
                             "tactile_ignore_remaining_steps": tactile_ignore_remaining_steps,
+                            "state_history_valid_frames": int(state_history_mask.sum()),
                         },
                     )
                     print(f"need_recovery=true failure_reason={failure_reason}; stopping this chunk")
@@ -616,6 +701,8 @@ def run_closed_loop(args: argparse.Namespace, operator: RosOperator | ReplayOper
                         img_front=img_front,
                         img_left=img_left,
                         qpos=qpos,
+                        state_history=state_history,
+                        state_history_mask=state_history_mask,
                         tactile_caption=tactile_caption,
                         memory=memory,
                         failed_attempt_id=attempt_id,
@@ -643,6 +730,7 @@ def run_closed_loop(args: argparse.Namespace, operator: RosOperator | ReplayOper
                             0, tactile_ignore_remaining_steps - published
                         ),
                         "need_recovery_probs": response.get("need_recovery_probs"),
+                        "state_history_valid_frames": int(state_history_mask.sum()),
                     },
                 )
 
@@ -687,6 +775,19 @@ def get_arguments() -> tuple[argparse.Namespace, argparse.ArgumentParser]:
     parser.add_argument("--tactile_window_size", type=int, default=30)
     parser.add_argument("--publish_rate", type=int, default=30)
     parser.add_argument("--chunk_size", type=int, default=30)
+    parser.add_argument("--state-history-len", type=int, default=60)
+    parser.add_argument(
+        "--state-history-fps",
+        type=float,
+        default=DEFAULT_STATE_HISTORY_FPS,
+        help="Timestamp grid frequency for the model state history; independent of ROS topic and action publish rates.",
+    )
+    parser.add_argument(
+        "--state-history-max-gap-seconds",
+        type=float,
+        default=0.02,
+        help="Mask a history point when its nearest ROS qpos is farther away than this threshold.",
+    )
     parser.add_argument(
         "--arm_steps_length",
         nargs=7,
@@ -730,6 +831,12 @@ def main() -> None:
         parser.error("--publish_rate must be positive")
     if args.chunk_size <= 0:
         parser.error("--chunk_size must be positive")
+    if args.state_history_len <= 0:
+        parser.error("--state-history-len must be positive")
+    if args.state_history_fps <= 0:
+        parser.error("--state-history-fps must be positive")
+    if args.state_history_max_gap_seconds <= 0:
+        parser.error("--state-history-max-gap-seconds must be positive")
     if args.recovery_tactile_ignore_seconds < 0:
         parser.error("--recovery-tactile-ignore-seconds must be non-negative")
     if args.seed is not None:
