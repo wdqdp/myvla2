@@ -148,13 +148,96 @@ def build_splits(records: Iterable[FrameRecord], config: SplitConfig) -> dict[st
     rng = random.Random(config.seed)
     rng.shuffle(original_episode_ids)
 
-    total = len(original_episode_ids)
-    train_count = int(round(total * config.train_ratio))
-    val_count = int(round(total * config.val_ratio))
+    train_count, val_count, _ = _target_split_counts(len(original_episode_ids), config)
     train_ids = sorted(original_episode_ids[:train_count])
     val_ids = sorted(original_episode_ids[train_count : train_count + val_count])
     test_ids = sorted(original_episode_ids[train_count + val_count :])
     return {"train": train_ids, "val": val_ids, "test": test_ids}
+
+
+def _target_split_counts(total: int, config: SplitConfig) -> tuple[int, int, int]:
+    train_count = int(round(total * config.train_ratio))
+    val_count = int(round(total * config.val_ratio))
+    return train_count, val_count, total - train_count - val_count
+
+
+def _split_episode_ids(payload: dict[str, Any]) -> dict[str, list[int]]:
+    try:
+        stored_splits = payload["original_episode_ids"]
+        return {name: [int(value) for value in stored_splits[name]] for name in ("train", "val", "test")}
+    except (KeyError, TypeError) as exc:
+        raise ValueError("Split file must contain train/val/test under original_episode_ids") from exc
+
+
+def validate_split_coverage(records: Iterable[FrameRecord], splits: dict[str, list[int]]) -> None:
+    dataset_ids = {record.original_episode_id for record in records}
+    assigned: set[int] = set()
+    for name in ("train", "val", "test"):
+        split_ids = splits.get(name)
+        if split_ids is None:
+            raise ValueError(f"Split is missing {name!r}")
+        duplicate_ids = assigned.intersection(split_ids)
+        if duplicate_ids:
+            raise ValueError(f"Original episode IDs occur in multiple splits: {sorted(duplicate_ids)}")
+        assigned.update(split_ids)
+
+    missing_ids = dataset_ids - assigned
+    unknown_ids = assigned - dataset_ids
+    if missing_ids or unknown_ids:
+        raise ValueError(
+            "Split does not exactly cover the dataset: "
+            f"missing episode IDs={sorted(missing_ids)}, unknown episode IDs={sorted(unknown_ids)}"
+        )
+
+
+def extend_splits(
+    records: Iterable[FrameRecord],
+    base_splits: dict[str, list[int]],
+    config: SplitConfig,
+) -> tuple[dict[str, list[int]], dict[str, list[int]]]:
+    """Preserve a base split and assign only newly added original episodes."""
+    records = list(records)
+    dataset_ids = {record.original_episode_id for record in records}
+    base_ids: set[int] = set()
+    for name in ("train", "val", "test"):
+        if name not in base_splits:
+            raise ValueError(f"Base split is missing {name!r}")
+        duplicate_ids = base_ids.intersection(base_splits[name])
+        if duplicate_ids:
+            raise ValueError(f"Original episode IDs occur in multiple base splits: {sorted(duplicate_ids)}")
+        base_ids.update(base_splits[name])
+
+    unknown_base_ids = base_ids - dataset_ids
+    if unknown_base_ids:
+        raise ValueError(f"Base split contains episode IDs absent from the expanded dataset: {sorted(unknown_base_ids)}")
+
+    new_ids = sorted(dataset_ids - base_ids)
+    target_counts = dict(zip(("train", "val", "test"), _target_split_counts(len(dataset_ids), config), strict=True))
+    added_counts = {name: target_counts[name] - len(base_splits[name]) for name in target_counts}
+    negative_counts = {name: count for name, count in added_counts.items() if count < 0}
+    if negative_counts:
+        raise ValueError(
+            "Base split is larger than the requested final split allocation; "
+            f"negative added counts={negative_counts}"
+        )
+    if sum(added_counts.values()) != len(new_ids):
+        raise ValueError(
+            f"Cannot assign {len(new_ids)} new episodes to requested added counts {added_counts}; "
+            "check split ratios and the base split"
+        )
+
+    rng = random.Random(config.seed)
+    rng.shuffle(new_ids)
+    additions: dict[str, list[int]] = {}
+    offset = 0
+    for name in ("train", "val", "test"):
+        end = offset + added_counts[name]
+        additions[name] = sorted(new_ids[offset:end])
+        offset = end
+
+    splits = {name: sorted([*base_splits[name], *additions[name]]) for name in ("train", "val", "test")}
+    validate_split_coverage(records, splits)
+    return splits, additions
 
 
 def load_or_create_splits(
@@ -163,19 +246,36 @@ def load_or_create_splits(
     config: SplitConfig,
     *,
     overwrite: bool = False,
+    base_split_path: str | Path | None = None,
 ) -> dict[str, list[int]]:
     split_path = Path(split_path)
     if split_path.exists() and not overwrite:
         payload = json.loads(split_path.read_text())
-        return {name: [int(value) for value in values] for name, values in payload["original_episode_ids"].items()}
+        splits = _split_episode_ids(payload)
+        validate_split_coverage(records, splits)
+        return splits
 
-    splits = build_splits(records, config)
+    additions = None
+    if base_split_path is not None:
+        base_split_path = Path(base_split_path)
+        if not base_split_path.is_file():
+            raise FileNotFoundError(f"Base split file does not exist: {base_split_path}")
+        base_splits = _split_episode_ids(json.loads(base_split_path.read_text()))
+        splits, additions = extend_splits(records, base_splits, config)
+    else:
+        splits = build_splits(records, config)
+        validate_split_coverage(records, splits)
+
     payload = {
         "split_unit": "original_episode_id",
         "config": asdict(config),
         "original_episode_ids": splits,
         "counts": {name: len(values) for name, values in splits.items()},
     }
+    if base_split_path is not None:
+        payload["base_split_file"] = str(base_split_path)
+        payload["added_original_episode_ids"] = additions
+        payload["added_counts"] = {name: len(values) for name, values in additions.items()}
     split_path.parent.mkdir(parents=True, exist_ok=True)
     split_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n")
     return splits

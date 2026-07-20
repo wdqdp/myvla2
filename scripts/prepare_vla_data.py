@@ -11,10 +11,11 @@ import sys
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
-DEFAULT_DATASET_DIR = Path("/data1/tac_data/lerobot_data/tactile_vla")
+DEFAULT_DATASET_DIR = Path("/data1/tac_data/lerobot_data/tactile_vla_expanded")
 DEFAULT_OUTPUT_DIR = Path("/data1/outputs/vla/indices")
-DEFAULT_SPLIT_FILE = Path("/data1/outputs/vla/indices/splits_h30_state_memory.json")
-DEFAULT_INDEX_FILE = DEFAULT_OUTPUT_DIR / "vla_indices_h30_state_memory.json"
+DEFAULT_SPLIT_FILE = Path("/data1/outputs/vla/indices/splits_h30_state_memory_expanded.json")
+DEFAULT_INDEX_FILE = DEFAULT_OUTPUT_DIR / "vla_indices_h30_state_memory_expanded.json"
+DEFAULT_BASE_SPLIT_FILE = Path("/data1/outputs/vla/indices/splits_h30_state_memory.json")
 
 from tactile_vla.vla.index import SplitConfig
 from tactile_vla.vla.index import index_payload
@@ -29,6 +30,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
     parser.add_argument("--split-file", type=Path, default=DEFAULT_SPLIT_FILE)
     parser.add_argument("--index-file", type=Path, default=DEFAULT_INDEX_FILE)
+    parser.add_argument(
+        "--base-split-file",
+        type=Path,
+        default=DEFAULT_BASE_SPLIT_FILE,
+        help="Preserve assignments in this split and assign only newly added original episodes.",
+    )
     parser.add_argument("--train-ratio", type=float, default=0.8)
     parser.add_argument("--val-ratio", type=float, default=0.1)
     parser.add_argument("--test-ratio", type=float, default=0.1)
@@ -52,7 +59,13 @@ def main() -> None:
         test_ratio=args.test_ratio,
         seed=args.seed,
     )
-    splits = load_or_create_splits(records, split_file, split_config, overwrite=args.overwrite)
+    splits = load_or_create_splits(
+        records,
+        split_file,
+        split_config,
+        overwrite=args.overwrite,
+        base_split_path=args.base_split_file,
+    )
     payload = index_payload(
         records,
         splits,

@@ -14,9 +14,9 @@ OPENPI_ROOT = PROJECT_ROOT / "openpi"
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 sys.path.insert(0, str(OPENPI_ROOT / "src"))
 
-DEFAULT_DATASET_DIR = Path("/data1/tac_data/lerobot_data/tactile_vla")
-DEFAULT_SPLIT_FILE = Path("/data1/outputs/vla/indices/splits_h30_state_memory.json")
-DEFAULT_OUTPUT_DIR = Path("/data1/outputs/vla/assets/tactile_vla_h30_state_memory")
+DEFAULT_DATASET_DIR = Path("/data1/tac_data/lerobot_data/tactile_vla_expanded")
+DEFAULT_SPLIT_FILE = Path("/data1/outputs/vla/indices/splits_h30_state_memory_expanded.json")
+DEFAULT_OUTPUT_DIR = Path("/data1/outputs/vla/assets/tactile_vla_h30_state_memory_expanded")
 
 os.environ.setdefault("HF_HOME", str(PROJECT_ROOT / ".cache" / "huggingface"))
 os.environ.setdefault("HF_DATASETS_CACHE", str(PROJECT_ROOT / ".cache" / "huggingface" / "datasets"))

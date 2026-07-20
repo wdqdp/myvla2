@@ -19,10 +19,10 @@ OPENPI_ROOT = PROJECT_ROOT / "openpi"
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 sys.path.insert(0, str(OPENPI_ROOT / "src"))
 
-DEFAULT_DATASET_DIR = Path("/data1/tac_data/lerobot_data/tactile_vla")
-DEFAULT_INDEX_FILE = Path("/data1/outputs/vla/indices/vla_indices_h30_state_memory.json")
-DEFAULT_SPLIT_FILE = Path("/data1/outputs/vla/indices/splits_h30_state_memory.json")
-DEFAULT_NORM_STATS_DIR = Path("/data1/outputs/vla/assets/tactile_vla_h30_state_memory")
+DEFAULT_DATASET_DIR = Path("/data1/tac_data/lerobot_data/tactile_vla_expanded")
+DEFAULT_INDEX_FILE = Path("/data1/outputs/vla/indices/vla_indices_h30_state_memory_expanded.json")
+DEFAULT_SPLIT_FILE = Path("/data1/outputs/vla/indices/splits_h30_state_memory_expanded.json")
+DEFAULT_NORM_STATS_DIR = Path("/data1/outputs/vla/assets/tactile_vla_h30_state_memory_expanded")
 DEFAULT_OUTPUT_DIR = Path("/data1/outputs/vla/stage_a_action")
 DEFAULT_BASE_CHECKPOINT = Path.home() / ".cache/modelscope/hub/models/hairuoliu/pi05_base/params"
 
@@ -70,7 +70,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--split-file", type=Path, default=DEFAULT_SPLIT_FILE)
     parser.add_argument("--norm-stats-dir", type=Path, default=DEFAULT_NORM_STATS_DIR)
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
-    parser.add_argument("--run-name", default="pi05_delta_tac_h30_state_memory")
+    parser.add_argument("--run-name", default="pi05_delta_tac_h30_state_memory_expanded")
     parser.add_argument("--split", default="train", choices=("train", "val", "test"))
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--num-workers", type=int, default=2)
