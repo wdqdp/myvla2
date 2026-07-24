@@ -1,0 +1,11 @@
+Metadata-Version: 2.4
+Name: tactile-vla
+Version: 0.1.0
+Summary: Project code for tactile captioning, VLA training adapters, and runtime inference.
+Requires-Python: >=3.11
+Requires-Dist: h5py>=3.10
+Requires-Dist: numpy>=1.22
+Requires-Dist: pyarrow>=15.0
+Requires-Dist: safetensors>=0.4
+Requires-Dist: torch>=2.0
+Requires-Dist: tqdm>=4.0
