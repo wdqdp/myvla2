@@ -10,15 +10,15 @@ import sys
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
-from tactile_vla.captioner.training import CaptionerTrainConfig
-from tactile_vla.captioner.training import train
+from tactile_vla.captioner.training import CaptionerTrainConfig  # noqa: E402
+from tactile_vla.captioner.training import train  # noqa: E402
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dataset-dir", type=Path, default=PROJECT_ROOT / "data" / "tactile_captioner_data")
     parser.add_argument("--output-dir", type=Path, default=PROJECT_ROOT / "outputs" / "tactile_captioner")
-    parser.add_argument("--run-name", default="tcn_v1_balanced")
+    parser.add_argument("--run-name", default="tcn_v3_multifield")
     parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--lr", type=float, default=3e-4)
@@ -28,6 +28,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", default="auto")
     parser.add_argument("--no-balanced-train", action="store_true")
     parser.add_argument("--no-normalize", action="store_true")
+    parser.add_argument("--class-weighting", choices=("sqrt_inverse", "none"), default="sqrt_inverse")
     parser.add_argument("--label-smoothing", type=float, default=0.03)
     parser.add_argument("--grad-clip", type=float, default=1.0)
     parser.add_argument("--patience", type=int, default=10)
@@ -55,6 +56,7 @@ def main() -> None:
         device=args.device,
         balanced_train=not args.no_balanced_train,
         normalize=not args.no_normalize,
+        class_weighting=args.class_weighting,
         label_smoothing=args.label_smoothing,
         grad_clip=args.grad_clip,
         patience=args.patience,
@@ -67,8 +69,10 @@ def main() -> None:
     )
     summary = train(config)
     print(f"best_checkpoint={summary['best_checkpoint']}")
-    print(f"best_val_macro_f1={summary['best_val_macro_f1']:.6f}")
-    print(f"test_macro_f1={summary['test']['macro_f1']:.6f}")
+    print(f"best_val_mean_macro_f1={summary['best_val_mean_macro_f1']:.6f}")
+    print(f"test_mean_macro_f1={summary['test']['mean_macro_f1']:.6f}")
+    for field, metrics in summary["test"]["heads"].items():
+        print(f"test_{field}_macro_f1={metrics['macro_f1']:.6f}")
 
 
 if __name__ == "__main__":

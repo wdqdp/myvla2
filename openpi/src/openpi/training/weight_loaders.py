@@ -5,6 +5,7 @@ from typing import Protocol, runtime_checkable
 
 import flax.traverse_util
 import jax
+import jax.numpy as jnp
 import numpy as np
 
 import openpi.models.model as _model
@@ -114,7 +115,7 @@ def _merge_params(loaded_params: at.Params, params: at.Params, *, missing_regex:
                 restored_key = (
                     v
                     if jax.dtypes.issubdtype(v.dtype, jax.dtypes.prng_key)
-                    else jax.random.wrap_key_data(v)
+                    else jax.random.wrap_key_data(jnp.asarray(v, dtype=jnp.uint32))
                 )
                 if restored_key.shape != ref_value.shape or restored_key.dtype != ref_value.dtype:
                     raise ValueError(

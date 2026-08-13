@@ -385,6 +385,18 @@ class Module(nn.Module):
     def embed(self, tokens: at.Int[at.Array, "b t"]) -> at.Float[at.Array, "b t d"]:
         return self.embedder.encode(tokens).astype(self.embed_dtype)
 
+    def decode(self, hidden, token_ids=None):
+        """Project hidden states with the tied token embedding.
+
+        Stage-B constrained generation passes a compact set of token IDs so it
+        never materializes logits for the full 257k PaliGemma vocabulary.
+        """
+
+        if token_ids is None:
+            return self.embedder.decode(hidden)
+        token_embeddings = self.embedder.input_embedding_table[token_ids]
+        return jnp.einsum("...d,vd->...v", hidden, token_embeddings)
+
     @at.typecheck
     def __call__(
         self,
@@ -413,6 +425,10 @@ class Module(nn.Module):
     def init(self, use_adarms: Sequence[bool]):
         """Convenience method for initializing all parameters, necessary due to the quirks of linen."""
         self.embed(jnp.zeros((1, 1), dtype=jnp.int32))
+        self.decode(
+            jnp.zeros((1, 1, self.configs[0].width), dtype=jnp.float32),
+            jnp.zeros((1,), dtype=jnp.int32),
+        )
         self(
             [jnp.zeros((1, 1, c.width)) for c in self.configs],
             jnp.zeros((1, len(self.configs)), dtype=jnp.int32),

@@ -38,6 +38,8 @@ class FrameRecord:
     reasoning_failure_reason: str
     reasoning_failure_recovery_memory: str
     reasoning_recovery_plan: str
+    stage_a_eligible: bool = True
+    execution_eligible: bool = True
 
 
 @dataclass(frozen=True)
@@ -93,7 +95,15 @@ def scan_lerobot_frames(dataset_dir: str | Path) -> list[FrameRecord]:
 
     records: list[FrameRecord] = []
     for parquet_file in parquet_files:
-        data = pq.read_table(parquet_file, columns=columns).to_pydict()
+        available_columns = set(pq.read_schema(parquet_file).names)
+        selected_columns = list(columns)
+        has_stage_a_eligible = "stage_a_eligible" in available_columns
+        if has_stage_a_eligible:
+            selected_columns.append("stage_a_eligible")
+        has_execution_eligible = "execution_eligible" in available_columns
+        if has_execution_eligible:
+            selected_columns.append("execution_eligible")
+        data = pq.read_table(parquet_file, columns=selected_columns).to_pydict()
         num_rows = len(data["index"])
         string_columns = [
             "case_id",
@@ -112,6 +122,16 @@ def scan_lerobot_frames(dataset_dir: str | Path) -> list[FrameRecord]:
         strings = {key: _string_values(data[key]) for key in string_columns}
         need_recovery = _as_bool(data["need_recovery"])
         action_chunk_valid = _as_bool(data["action_chunk_valid"])
+        execution_eligible = (
+            _as_bool(data["execution_eligible"])
+            if has_execution_eligible
+            else [True] * num_rows
+        )
+        stage_a_eligible = (
+            _as_bool(data["stage_a_eligible"])
+            if has_stage_a_eligible
+            else [True] * num_rows
+        )
         reasoning_has_sample = _as_bool(data["reasoning_has_sample"])
         for idx in range(num_rows):
             records.append(
@@ -137,6 +157,8 @@ def scan_lerobot_frames(dataset_dir: str | Path) -> list[FrameRecord]:
                     reasoning_failure_reason=strings["reasoning_failure_reason"][idx],
                     reasoning_failure_recovery_memory=strings["reasoning_failure_recovery_memory"][idx],
                     reasoning_recovery_plan=strings["reasoning_recovery_plan"][idx],
+                    stage_a_eligible=stage_a_eligible[idx],
+                    execution_eligible=execution_eligible[idx],
                 )
             )
     records.sort(key=lambda record: record.global_index)
@@ -305,11 +327,15 @@ def execution_indices(
         return [
             record.global_index
             for record in records
-            if record.frame_index + action_horizon <= episode_frame_counts[record.lerobot_episode_index]
+            if record.stage_a_eligible
+            and record.execution_eligible
+            and record.frame_index + action_horizon <= episode_frame_counts[record.lerobot_episode_index]
         ]
 
     selected = []
     for record in records:
+        if not record.stage_a_eligible or not record.execution_eligible:
+            continue
         if action_chunk_valid_only and not record.action_chunk_valid:
             continue
         selected.append(record.global_index)
@@ -358,6 +384,101 @@ def status_indices(
     return sorted(positive + negative)
 
 
+def stratified_status_indices(
+    records: Iterable[FrameRecord],
+    *,
+    negative_ratio: float,
+    seed: int,
+) -> list[int]:
+    """Return deterministic class-stratified evaluation rows.
+
+    The ordering is deliberately interleaved so a caller-side evaluation cap
+    cannot consume only the long pre-failure negative prefix.
+    """
+
+    if negative_ratio <= 0:
+        raise ValueError(f"negative_ratio must be positive, got {negative_ratio}")
+    records = list(records)
+    positive = [record.global_index for record in records if record.need_recovery]
+    negative = [record.global_index for record in records if not record.need_recovery]
+    if not positive or not negative:
+        raise ValueError(
+            "Stratified need-recovery evaluation requires both classes: "
+            f"positive={len(positive)}, negative={len(negative)}"
+        )
+    rng = random.Random(seed)
+    rng.shuffle(positive)
+    rng.shuffle(negative)
+    keep_negative = min(len(negative), int(round(len(positive) * negative_ratio)))
+    negative = negative[:keep_negative]
+
+    result: list[int] = []
+    negative_offset = 0
+    per_positive = max(1, int(round(negative_ratio)))
+    for index in positive:
+        result.append(index)
+        result.extend(negative[negative_offset : negative_offset + per_positive])
+        negative_offset += per_positive
+    result.extend(negative[negative_offset:])
+    return result
+
+
+def failure_reason_indices(
+    records: Iterable[FrameRecord],
+    *,
+    window_frames: int,
+    training: bool,
+) -> list[int]:
+    """Select the fixed post-failure window used by the V3 diagnosis task.
+
+    The first frame whose ``need_recovery`` flag is true is the failure trigger.
+    Training uses exactly ``window_frames`` consecutive frames starting at that
+    trigger.  Evaluation uses only the final frame in the same window so that a
+    single attempt contributes a single, stable prediction.
+    """
+
+    if window_frames <= 0:
+        raise ValueError(f"window_frames must be positive, got {window_frames}")
+
+    by_attempt: dict[tuple[int, int], list[FrameRecord]] = {}
+    for record in records:
+        by_attempt.setdefault((record.lerobot_episode_index, record.attempt_id), []).append(record)
+
+    selected: list[int] = []
+    for attempt_key, attempt_records in sorted(by_attempt.items()):
+        attempt_records.sort(key=lambda record: record.frame_index)
+        failure_records = [
+            record
+            for record in attempt_records
+            if record.need_recovery and bool(record.failure_reason.strip())
+        ]
+        if not failure_records:
+            continue
+
+        first = failure_records[0]
+        by_frame = {record.frame_index: record for record in attempt_records}
+        required_frames = range(first.frame_index, first.frame_index + window_frames)
+        missing = [frame_index for frame_index in required_frames if frame_index not in by_frame]
+        if missing:
+            raise ValueError(
+                "V3 failure window is incomplete for "
+                f"lerobot_episode_index={attempt_key[0]}, attempt_id={attempt_key[1]}: "
+                f"start_frame={first.frame_index}, window_frames={window_frames}, missing={missing}"
+            )
+        window = [by_frame[frame_index] for frame_index in required_frames]
+        invalid = [record.frame_index for record in window if not record.failure_reason.strip()]
+        if invalid:
+            raise ValueError(
+                "V3 failure window contains frames without failure_reason for "
+                f"lerobot_episode_index={attempt_key[0]}, attempt_id={attempt_key[1]}: {invalid}"
+            )
+        if training:
+            selected.extend(record.global_index for record in window)
+        else:
+            selected.append(window[-1].global_index)
+    return sorted(selected)
+
+
 def reasoning_index_pairs(records: Iterable[FrameRecord], *, augment_after_frames: int = 0) -> list[dict[str, int]]:
     records = sorted(records, key=lambda record: (record.lerobot_episode_index, record.frame_index, record.global_index))
     by_attempt: dict[tuple[int, int], list[FrameRecord]] = {}
@@ -399,6 +520,8 @@ def summarize_records(records: Iterable[FrameRecord]) -> dict[str, Any]:
         "rotation_state_name": dict(Counter(record.rotation_state_name for record in records)),
         "reasoning_samples": sum(record.reasoning_has_sample for record in records),
         "action_chunk_valid": dict(Counter(str(record.action_chunk_valid).lower() for record in records)),
+        "execution_eligible": dict(Counter(str(record.execution_eligible).lower() for record in records)),
+        "stage_a_eligible": dict(Counter(str(record.stage_a_eligible).lower() for record in records)),
     }
 
 
@@ -441,6 +564,68 @@ def index_payload(
             ),
             "reasoning_indices": [pair["index"] for pair in reasoning_pairs],
             "reasoning_source_indices": [pair["source_index"] for pair in reasoning_pairs],
+        }
+    return payload
+
+
+def v3_index_payload(
+    records: list[FrameRecord],
+    splits: dict[str, list[int]],
+    *,
+    seed: int,
+    negative_ratio: float = 3.0,
+    reasoning_window_frames: int = 15,
+    action_horizon: int = 30,
+) -> dict[str, Any]:
+    """Build the four V3 Stage-B frame streams without legacy reasoning augmentation."""
+
+    if action_horizon <= 0:
+        raise ValueError(f"action_horizon must be positive, got {action_horizon}")
+    if reasoning_window_frames <= 0:
+        raise ValueError(
+            f"reasoning_window_frames must be positive, got {reasoning_window_frames}"
+        )
+
+    payload: dict[str, Any] = {
+        "schema_version": "tactile_vla_v3_stage_b_index_v1",
+        "seed": seed,
+        "status_negative_ratio": negative_ratio,
+        "reasoning_window_frames": reasoning_window_frames,
+        "action_horizon": action_horizon,
+        "splits": {},
+    }
+    for split_name, episode_ids in splits.items():
+        split_records = records_for_split(records, episode_ids)
+        training = split_name == "train"
+        execution = execution_indices(split_records, action_horizon=action_horizon)
+        failure = failure_reason_indices(
+            split_records,
+            window_frames=reasoning_window_frames,
+            training=training,
+        )
+        summary = summarize_records(split_records)
+        summary.update(
+            {
+                "execution_action_horizon": action_horizon,
+                "execution_indices": len(execution),
+                "failure_reason_indices": len(failure),
+            }
+        )
+        payload["splits"][split_name] = {
+            "summary": summary,
+            "execution_indices": execution,
+            "status_indices": status_indices(
+                split_records,
+                negative_ratio=negative_ratio,
+                seed=seed,
+            )
+            if training
+            else stratified_status_indices(
+                split_records,
+                negative_ratio=negative_ratio,
+                seed=seed,
+            ),
+            "failure_reason_indices": failure,
         }
     return payload
 

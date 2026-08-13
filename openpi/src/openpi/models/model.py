@@ -49,7 +49,9 @@ def _intersect_params_preserving_none(reference: at.Params, params: at.Params) -
         elif path in result and jax.dtypes.issubdtype(reference_value.dtype, jax.dtypes.prng_key):
             checkpoint_value = result[path]
             if not jax.dtypes.issubdtype(checkpoint_value.dtype, jax.dtypes.prng_key):
-                result[path] = jax.random.wrap_key_data(checkpoint_value)
+                result[path] = jax.random.wrap_key_data(
+                    jnp.asarray(checkpoint_value, dtype=jnp.uint32)
+                )
 
     return traverse_util.unflatten_dict(result)
 

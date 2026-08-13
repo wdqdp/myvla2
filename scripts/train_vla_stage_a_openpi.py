@@ -19,10 +19,13 @@ OPENPI_ROOT = PROJECT_ROOT / "openpi"
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 sys.path.insert(0, str(OPENPI_ROOT / "src"))
 
-DEFAULT_DATASET_DIR = Path("/data1/tac_data/lerobot_data/tactile_vla_expanded")
-DEFAULT_INDEX_FILE = Path("/data1/outputs/vla/indices/vla_indices_h30_state_memory_expanded.json")
-DEFAULT_SPLIT_FILE = Path("/data1/outputs/vla/indices/splits_h30_state_memory_expanded.json")
-DEFAULT_NORM_STATS_DIR = Path("/data1/outputs/vla/assets/tactile_vla_h30_state_memory_expanded")
+DEFAULT_DATASET_DIR = Path("/data1/tac_data/lerobot_data/tactile_vla_v3")
+DEFAULT_PROFILE_DIR = Path("/data1/outputs/vla/rotation_moderately_success_v1")
+DEFAULT_INDEX_FILE = DEFAULT_PROFILE_DIR / "vla_indices_v3.json"
+DEFAULT_SPLIT_FILE = DEFAULT_PROFILE_DIR / "splits.json"
+DEFAULT_NORM_STATS_DIR = Path(
+    "/data1/outputs/vla/assets/tactile_vla_rotation_moderately_success_v1"
+)
 DEFAULT_OUTPUT_DIR = Path("/data1/outputs/vla/stage_a_action")
 DEFAULT_BASE_CHECKPOINT = Path.home() / ".cache/modelscope/hub/models/hairuoliu/pi05_base/params"
 
@@ -52,6 +55,13 @@ from openpi.training import checkpoints as openpi_checkpoints
 from openpi.training import sharding
 from openpi.training import utils as training_utils
 from openpi.training import weight_loaders
+from tactile_vla.vla.artifacts import artifact_identity
+from tactile_vla.vla.artifacts import assert_identity_matches
+from tactile_vla.vla.artifacts import checkpoint_artifact_identity
+from tactile_vla.vla.artifacts import LEGACY_DATA_PROFILE
+from tactile_vla.vla.artifacts import validate_norm_stats_identity
+from tactile_vla.vla.data_profiles import ROTATION_MODERATELY_SUCCESS_V1
+from tactile_vla.vla.data_profiles import EXPECTED_ACTION_COUNTS
 from tactile_vla.vla.index import SplitConfig
 from tactile_vla.vla.index import index_payload
 from tactile_vla.vla.index import load_or_create_splits
@@ -61,6 +71,8 @@ from tactile_vla.vla.openpi_bridge import TactileVLAFrameDataset
 from tactile_vla.vla.openpi_bridge import TransformedTactileVLADataset
 from tactile_vla.vla.openpi_bridge import build_transform
 from tactile_vla.vla.openpi_bridge import collate_numpy
+from tactile_vla.vla.prompts import MINIMAL_PROMPT_PROFILE
+from tactile_vla.vla.prompts import resolve_prompt_profile
 
 
 def parse_args() -> argparse.Namespace:
@@ -70,7 +82,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--split-file", type=Path, default=DEFAULT_SPLIT_FILE)
     parser.add_argument("--norm-stats-dir", type=Path, default=DEFAULT_NORM_STATS_DIR)
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
-    parser.add_argument("--run-name", default="pi05_delta_tac_h30_state_memory_expanded")
+    parser.add_argument("--run-name", default="pi05_delta_tac_rotation_moderately_v1")
+    parser.add_argument("--data-profile", default=ROTATION_MODERATELY_SUCCESS_V1)
+    parser.add_argument("--prompt-profile", default=MINIMAL_PROMPT_PROFILE)
     parser.add_argument("--split", default="train", choices=("train", "val", "test"))
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--num-workers", type=int, default=2)
@@ -121,6 +135,11 @@ def ensure_index(args: argparse.Namespace) -> dict:
         payload = json.loads(args.index_file.read_text())
         validate_index_action_horizon(payload, args.action_horizon, index_path=args.index_file)
         return payload
+    if args.data_profile != LEGACY_DATA_PROFILE:
+        raise FileNotFoundError(
+            f"Versioned data profile index does not exist: {args.index_file}. "
+            "Run scripts/prepare_rotation_moderately_profile.py first."
+        )
     records = scan_lerobot_frames(args.dataset_dir)
     splits = load_or_create_splits(records, args.split_file, SplitConfig(seed=args.seed))
     payload = index_payload(
@@ -137,8 +156,12 @@ def ensure_index(args: argparse.Namespace) -> dict:
     return payload
 
 
-def build_loader(args: argparse.Namespace, model_config: Pi0Config) -> DataLoader:
-    payload = ensure_index(args)
+def build_loader(
+    args: argparse.Namespace,
+    model_config: Pi0Config,
+    payload: dict[str, Any] | None = None,
+) -> DataLoader:
+    payload = payload or ensure_index(args)
     indices = payload["splits"][args.split]["execution_indices"]
     if args.max_frames is not None:
         indices = indices[: args.max_frames]
@@ -150,6 +173,7 @@ def build_loader(args: argparse.Namespace, model_config: Pi0Config) -> DataLoade
         action_horizon=args.action_horizon,
         state_history_len=args.state_history_len if args.use_state_history else 0,
         video_backend=args.video_backend,
+        prompt_profile=args.prompt_profile,
     )
     transformed = TransformedTactileVLADataset(
         dataset,
@@ -177,6 +201,15 @@ def print_batch_shapes(batch: dict) -> None:
                 print(f"{key}.{sub_key}: shape={np.asarray(sub_value).shape} dtype={np.asarray(sub_value).dtype}")
         else:
             print(f"{key}: shape={np.asarray(value).shape} dtype={np.asarray(value).dtype}")
+
+
+def print_dry_run_inputs(loader: DataLoader, batch: dict[str, Any]) -> None:
+    raw_dataset = getattr(loader.dataset, "dataset", None)
+    if raw_dataset is not None:
+        sample = raw_dataset[0]
+        print(f"prompt_profile={raw_dataset.prompt_profile}")
+        print(f"text_prompt={sample['prompt']}")
+    print_batch_shapes(batch)
 
 
 def make_lr_schedule(args: argparse.Namespace) -> optax.Schedule:
@@ -401,6 +434,32 @@ def main() -> None:
         raise ValueError("This dataset stores 7-D puppet qpos; --state-history-dim must be 7")
     if args.train_lora_only and "lora" not in args.paligemma_variant and "lora" not in args.action_expert_variant:
         raise ValueError("--train-lora-only requires LoRA model variants.")
+    args.prompt_profile = resolve_prompt_profile(args.prompt_profile)
+    if args.max_frames is not None and not args.dry_run:
+        raise ValueError("--max-frames is only supported for --dry-run in profile-bound training")
+    if args.data_profile == ROTATION_MODERATELY_SUCCESS_V1:
+        pinned = {
+            "batch_size": (args.batch_size, 8),
+            "num_steps": (args.num_steps, 10_000),
+            "lr": (args.lr, 5e-5),
+            "lr_final": (args.lr_final, 5e-7),
+            "lr_transition_steps": (args.lr_transition_steps, 7_000),
+            "save_interval": (args.save_interval, 1_000),
+            "keep_period": (args.keep_period, 5_000),
+            "action_horizon": (args.action_horizon, 30),
+            "action_dim": (args.action_dim, 32),
+            "state_history_len": (args.state_history_len, 60),
+            "state_history_dim": (args.state_history_dim, 7),
+        }
+        mismatches = {
+            key: {"requested": actual, "required": expected}
+            for key, (actual, expected) in pinned.items()
+            if actual != expected
+        }
+        if mismatches:
+            raise ValueError(f"Versioned Stage A protocol mismatch: {mismatches}")
+        if args.allow_random_init:
+            raise ValueError("Versioned Stage A must initialize from the raw pi05_base checkpoint")
 
     precision = args.precision
     if precision == "auto":
@@ -420,10 +479,31 @@ def main() -> None:
         history_hidden_dim=args.history_hidden_dim,
         pytorch_compile_mode=None,
     )
-    loader = build_loader(args, model_config)
+    index = ensure_index(args)
+    identity = artifact_identity(
+        index,
+        index_path=args.index_file,
+        prompt_profile=args.prompt_profile,
+        requested_data_profile=args.data_profile,
+    )
+    if (
+        args.data_profile == ROTATION_MODERATELY_SUCCESS_V1
+        and identity["action_indices_identity"]["all"]["count"]
+        != EXPECTED_ACTION_COUNTS["all"]
+    ):
+        raise ValueError(
+            "Versioned Stage A index does not contain the required 98,233 action starts"
+        )
+    if not args.no_norm and args.data_profile != LEGACY_DATA_PROFILE:
+        validate_norm_stats_identity(
+            args.norm_stats_dir / "summary.json",
+            identity,
+            context="Stage A norm stats",
+        )
+    loader = build_loader(args, model_config, index)
     first_batch = next(iter(loader))
     if args.dry_run:
-        print_batch_shapes(first_batch)
+        print_dry_run_inputs(loader, first_batch)
         return
 
     run_dir = args.output_dir / args.run_name
@@ -433,8 +513,24 @@ def main() -> None:
         overwrite=args.overwrite,
         resume=args.resume,
     )
+    if resuming:
+        saved_config = json.loads((run_dir / "config.json").read_text())
+        assert_identity_matches(
+            checkpoint_artifact_identity(saved_config),
+            identity,
+            context="Stage A resume",
+        )
     if jax.process_index() == 0 and not resuming:
-        (run_dir / "config.json").write_text(json.dumps(vars(args), indent=2, default=str, ensure_ascii=False) + "\n")
+        config_payload = vars(args) | {
+            "artifact_identity": identity,
+            "data_config_hash": identity["data_config_hash"],
+            "action_frame_manifest_hash": identity["action_frame_manifest_hash"],
+            "action_indices_identity": identity["action_indices_identity"],
+            "index_sha256": identity["index_sha256"],
+        }
+        (run_dir / "config.json").write_text(
+            json.dumps(config_payload, indent=2, default=str, ensure_ascii=False) + "\n"
+        )
 
     rng = jax.random.key(args.seed)
     train_rng, init_rng = jax.random.split(rng)

@@ -2,6 +2,7 @@ from flax import nnx
 from flax import traverse_util
 import jax
 import jax.numpy as jnp
+import numpy as np
 import pytest
 
 from openpi.models import model as _model
@@ -27,7 +28,7 @@ def test_intersect_params_preserves_structural_none():
     params = {
         "history_gru": {
             "dense_h": {"bias": None, "kernel": jnp.ones((2, 3))},
-            "rngs": {"key": jax.random.key_data(jax.random.key(42))},
+            "rngs": {"key": np.asarray(jax.random.key_data(jax.random.key(42)))},
         },
         "checkpoint_only": {"value": jnp.ones(())},
     }
@@ -37,7 +38,10 @@ def test_intersect_params_preserves_structural_none():
 
     assert flat_result[("history_gru", "dense_h", "bias")] is None
     assert ("history_gru", "dense_h", "kernel") in flat_result
-    assert flat_result[("history_gru", "rngs", "key")].dtype == reference_key.dtype
+    restored_key = flat_result[("history_gru", "rngs", "key")]
+    assert restored_key.dtype == reference_key.dtype
+    assert isinstance(jax.random.key_data(restored_key), jax.Array)
+    assert restored_key.addressable_shards
     assert ("checkpoint_only", "value") not in flat_result
 
 

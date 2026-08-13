@@ -9,6 +9,9 @@ from __future__ import annotations
 import torch
 from torch import nn
 
+from tactile_vla.common.labels import LABEL_FIELDS
+from tactile_vla.common.labels import LABEL_MAPS
+
 
 class FrameGridEncoder(nn.Module):
     def __init__(self, input_channels: int = 18, feature_dim: int = 128, dropout: float = 0.1) -> None:
@@ -66,12 +69,17 @@ class TactileCaptioner(nn.Module):
         temporal_hidden_dim: int = 192,
         temporal_dilations: tuple[int, ...] = (1, 2, 4, 8),
         dropout: float = 0.1,
-        num_classes: int = 3,
+        head_num_classes: dict[str, int] | None = None,
     ) -> None:
         super().__init__()
         self.mesh_channels = mesh_channels
         self.force_channels = force_channels
-        self.num_classes = num_classes
+        provided_head_sizes = dict(head_num_classes or {field: len(LABEL_MAPS[field]) for field in LABEL_FIELDS})
+        if set(provided_head_sizes) != set(LABEL_FIELDS):
+            raise ValueError(f"head_num_classes fields must be {LABEL_FIELDS}, got {tuple(provided_head_sizes)}")
+        self.head_num_classes = {field: int(provided_head_sizes[field]) for field in LABEL_FIELDS}
+        if any(num_classes <= 1 for num_classes in self.head_num_classes.values()):
+            raise ValueError(f"Each tactile classification head needs at least two classes: {self.head_num_classes}")
         self.frame_encoder = FrameGridEncoder(
             input_channels=mesh_channels + force_channels,
             feature_dim=frame_feature_dim,
@@ -85,13 +93,16 @@ class TactileCaptioner(nn.Module):
         self.temporal = nn.Sequential(
             *[TemporalBlock(temporal_hidden_dim, dilation=dilation, dropout=dropout) for dilation in temporal_dilations]
         )
-        self.classifier = nn.Sequential(
-            nn.LayerNorm(temporal_hidden_dim),
-            nn.Dropout(dropout),
-            nn.Linear(temporal_hidden_dim, num_classes),
+        self.head_norm = nn.LayerNorm(temporal_hidden_dim)
+        self.head_dropout = nn.Dropout(dropout)
+        self.classifiers = nn.ModuleDict(
+            {
+                field: nn.Linear(temporal_hidden_dim, num_classes)
+                for field, num_classes in self.head_num_classes.items()
+            }
         )
 
-    def forward(self, mesh_motion: torch.Tensor, force: torch.Tensor) -> torch.Tensor:
+    def forward(self, mesh_motion: torch.Tensor, force: torch.Tensor) -> dict[str, torch.Tensor]:
         if mesh_motion.ndim != 5:
             raise ValueError(f"mesh_motion must have shape [B, T, C, H, W], got {tuple(mesh_motion.shape)}")
         if force.ndim != 5:
@@ -110,7 +121,8 @@ class TactileCaptioner(nn.Module):
         temporal_values = self.temporal_in(frame_features).transpose(1, 2)
         temporal_values = self.temporal(temporal_values)
         final_feature = temporal_values[:, :, -1]
-        return self.classifier(final_feature)
+        final_feature = self.head_dropout(self.head_norm(final_feature))
+        return {field: classifier(final_feature) for field, classifier in self.classifiers.items()}
 
     def config_dict(self) -> dict[str, object]:
         return {
@@ -119,6 +131,6 @@ class TactileCaptioner(nn.Module):
             "frame_feature_dim": self.temporal_in[0].in_features,
             "temporal_hidden_dim": self.temporal_in[0].out_features,
             "temporal_dilations": tuple(block.net[0].dilation[0] for block in self.temporal),
-            "dropout": float(self.classifier[1].p),
-            "num_classes": self.num_classes,
+            "dropout": float(self.head_dropout.p),
+            "head_num_classes": dict(self.head_num_classes),
         }

@@ -55,4 +55,6 @@ def test_merge_params_wraps_raw_prng_key_data():
 
     assert restored_key.shape == ()
     assert restored_key.dtype == key.dtype
+    assert isinstance(jax.random.key_data(restored_key), jax.Array)
+    assert restored_key.addressable_shards
     np.testing.assert_array_equal(jax.random.key_data(restored_key), jax.random.key_data(key))

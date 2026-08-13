@@ -212,9 +212,20 @@ class TactileVLAPolicy:
             raise ValueError(f"Expected restored actions [T,{self._output_action_dim}+], got {actions.shape}")
         return actions[:, : self._output_action_dim]
 
+    def _status_response(self, head_logits: dict[str, np.ndarray]) -> dict[str, Any]:
+        need_probs = _softmax_probs(head_logits["need_recovery"])
+        failure_probs = _softmax_probs(head_logits["failure_reason"])
+        failure_id = int(np.argmax(failure_probs))
+        return {
+            "need_recovery": bool(float(need_probs[1]) >= self._need_recovery_threshold),
+            "need_recovery_probs": need_probs.tolist(),
+            "failure_reason": vla_labels.id_to_failure_reason(failure_id),
+            "failure_reason_probs": failure_probs.tolist(),
+        }
+
     def infer(self, request: dict[str, Any]) -> dict[str, Any]:
         mode = str(request.get("mode", "execution"))
-        if mode not in {"execution", "reasoning"}:
+        if mode not in {"execution", "monitor", "reasoning"}:
             raise ValueError(f"Unknown tactile VLA mode: {mode!r}")
 
         start_time = time.monotonic()
@@ -230,19 +241,11 @@ class TactileVLAPolicy:
                 "policy_timing": {"infer_ms": (time.monotonic() - start_time) * 1000.0},
             }
 
-        actions = self._sample_absolute_actions(transformed, observation)
-        need_probs = _softmax_probs(head_logits["need_recovery"])
-        failure_probs = _softmax_probs(head_logits["failure_reason"])
-        need_recovery = bool(float(need_probs[1]) >= self._need_recovery_threshold)
-        failure_id = int(np.argmax(failure_probs))
-        return {
-            "actions": actions,
-            "need_recovery": need_recovery,
-            "need_recovery_probs": need_probs.tolist(),
-            "failure_reason": vla_labels.id_to_failure_reason(failure_id),
-            "failure_reason_probs": failure_probs.tolist(),
-            "policy_timing": {"infer_ms": (time.monotonic() - start_time) * 1000.0},
-        }
+        response = self._status_response(head_logits)
+        if mode == "execution":
+            response["actions"] = self._sample_absolute_actions(transformed, observation)
+        response["policy_timing"] = {"infer_ms": (time.monotonic() - start_time) * 1000.0}
+        return response
 
 
 def build_model_config(args: argparse.Namespace, stage_a_config: dict[str, Any]) -> Pi0Config:
@@ -299,6 +302,19 @@ def warm_up_policy(policy: TactileVLAPolicy) -> dict[str, Any]:
             ),
         }
     )
+    monitor = policy.infer(
+        {
+            "mode": "monitor",
+            "observation/image": image,
+            "observation/wrist_image": image,
+            "observation/state": state,
+            **history_inputs,
+            "prompt": (
+                "Mode: execution. Task: dry run. Tactile: no rotation. "
+                "Recovery plan: none. Output the next robot action chunk and monitor whether recovery is needed."
+            ),
+        }
+    )
     reasoning = policy.infer(
         {
             "mode": "reasoning",
@@ -323,6 +339,10 @@ def warm_up_policy(policy: TactileVLAPolicy) -> dict[str, Any]:
             "actions_shape": list(actions.shape),
             "need_recovery": bool(execution["need_recovery"]),
             "failure_reason": execution["failure_reason"],
+        },
+        "monitor": {
+            "need_recovery": bool(monitor["need_recovery"]),
+            "failure_reason": monitor["failure_reason"],
         },
         "reasoning": {
             "recovery_plan": reasoning["recovery_plan"],
@@ -360,6 +380,7 @@ def main() -> None:
         "state_history_fps": state_history_fps,
         "history_hidden_dim": model_config.history_hidden_dim,
         "need_recovery_threshold": args.need_recovery_threshold,
+        "supports_step_monitor": True,
         "failure_reasons": list(vla_labels.FAILURE_REASONS),
         "recovery_plans": list(vla_labels.RECOVERY_PLANS),
         "stage_a_config": stage_a_config,

@@ -1,0 +1,72 @@
+{
+  "schema_version": "tactile_vla_recovery_action_finetune_v1",
+  "selection_seed": 42,
+  "forbidden_recovery_magnitudes": [
+    "slightly"
+  ],
+  "normal_success_group": {
+    "name": "normal_success",
+    "attempt_id": 1,
+    "result": "success",
+    "sampling_weight": 1.0,
+    "strata": [
+      {
+        "name": "capture_block_1",
+        "episode_ranges": [
+          [
+            1,
+            20
+          ]
+        ],
+        "select_count": 8
+      },
+      {
+        "name": "capture_block_2",
+        "episode_ranges": [
+          [
+            21,
+            40
+          ]
+        ],
+        "select_count": 8
+      }
+    ]
+  },
+  "recovery_groups": [
+    {
+      "name": "recovery_moderately",
+      "enabled": true,
+      "attempt_id": 2,
+      "result": "success",
+      "horizontal_magnitude": "moderately",
+      "clip_seconds": 15.0,
+      "sampling_weight": 3.0,
+      "episode_ranges_by_direction": {
+        "right": [
+          [
+            41,
+            52
+          ]
+        ],
+        "left": [
+          [
+            61,
+            72
+          ]
+        ],
+        "front": [
+          [
+            81,
+            92
+          ]
+        ],
+        "back": [
+          [
+            101,
+            112
+          ]
+        ]
+      }
+    }
+  ]
+}

@@ -1,4 +1,4 @@
-"""Training and evaluation utilities for the tactile captioner."""
+"""Training and evaluation utilities for the V3 multi-head tactile captioner."""
 
 from __future__ import annotations
 
@@ -16,18 +16,24 @@ from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
 from tactile_vla.captioner.model import TactileCaptioner
-from tactile_vla.common.labels import ROTATION_LABELS
+from tactile_vla.common.labels import LABEL_FIELDS
+from tactile_vla.common.labels import LABEL_MAPS
+from tactile_vla.common.labels import LABEL_SCHEMA_VERSION
+from tactile_vla.common.labels import class_names
 from tactile_vla.common.metrics import classification_report
 from tactile_vla.common.seed import set_seed
 from tactile_vla.data.tactile_captioner_dataset import TactileCaptionerDataset
 from tactile_vla.data.tactile_captioner_dataset import label_counts
 
 
+CLASS_WEIGHTING_MODES = ("sqrt_inverse", "none")
+
+
 @dataclasses.dataclass
 class CaptionerTrainConfig:
     dataset_dir: Path = Path("data/tactile_captioner_data")
     output_dir: Path = Path("outputs/tactile_captioner")
-    run_name: str = "tcn_v1_balanced"
+    run_name: str = "tcn_v3_multifield"
     batch_size: int = 128
     epochs: int = 50
     lr: float = 3e-4
@@ -37,6 +43,7 @@ class CaptionerTrainConfig:
     device: str = "auto"
     balanced_train: bool = True
     normalize: bool = True
+    class_weighting: str = "sqrt_inverse"
     label_smoothing: float = 0.03
     grad_clip: float = 1.0
     patience: int = 10
@@ -105,13 +112,21 @@ def make_dataloader(
     )
 
 
-def compute_class_weights(counts: dict[int, int], *, num_classes: int) -> torch.Tensor:
-    max_count = max(counts.values())
-    weights = []
-    for label_id in range(num_classes):
-        count = max(1, int(counts.get(label_id, 0)))
-        weights.append(math.sqrt(max_count / count))
-    values = torch.tensor(weights, dtype=torch.float32)
+def compute_class_weights(
+    counts: dict[int, int],
+    *,
+    num_classes: int,
+    mode: str = "sqrt_inverse",
+) -> torch.Tensor:
+    if mode not in CLASS_WEIGHTING_MODES:
+        raise ValueError(f"Unknown class weighting mode {mode!r}; expected one of {CLASS_WEIGHTING_MODES}")
+    ordered_counts = [int(counts.get(label_id, 0)) for label_id in range(num_classes)]
+    if any(count <= 0 for count in ordered_counts):
+        raise ValueError(f"Every training class needs samples before weighting, got counts={ordered_counts}")
+    if mode == "none":
+        return torch.ones((num_classes,), dtype=torch.float32)
+    max_count = max(ordered_counts)
+    values = torch.tensor([math.sqrt(max_count / count) for count in ordered_counts], dtype=torch.float32)
     return values / values.mean().clamp_min(1e-6)
 
 
@@ -128,13 +143,27 @@ def make_scheduler(optimizer: torch.optim.Optimizer, *, total_steps: int) -> tor
 
 
 def _move_batch(
-    batch: dict[str, torch.Tensor],
+    batch: dict[str, Any],
     device: torch.device,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
     mesh_motion = batch["mesh_motion"].to(device, non_blocking=True)
     force = batch["force"].to(device, non_blocking=True)
-    labels = batch["label"].to(device, non_blocking=True)
+    labels = {
+        field: batch["labels"][field].to(device, non_blocking=True)
+        for field in LABEL_FIELDS
+    }
     return mesh_motion, force, labels
+
+
+def _make_criteria(
+    class_weights: dict[str, torch.Tensor],
+    *,
+    label_smoothing: float,
+) -> dict[str, nn.CrossEntropyLoss]:
+    return {
+        field: nn.CrossEntropyLoss(weight=class_weights[field], label_smoothing=label_smoothing)
+        for field in LABEL_FIELDS
+    }
 
 
 def _run_epoch(
@@ -142,7 +171,7 @@ def _run_epoch(
     loader: DataLoader,
     *,
     device: torch.device,
-    criterion: nn.Module,
+    criteria: dict[str, nn.CrossEntropyLoss],
     optimizer: torch.optim.Optimizer | None = None,
     scheduler: torch.optim.lr_scheduler.LambdaLR | None = None,
     grad_clip: float = 1.0,
@@ -151,8 +180,9 @@ def _run_epoch(
 ) -> dict[str, Any]:
     training = optimizer is not None
     model.train(training)
-    labels_all = []
-    preds_all = []
+    labels_all: dict[str, list[torch.Tensor]] = {field: [] for field in LABEL_FIELDS}
+    preds_all: dict[str, list[torch.Tensor]] = {field: [] for field in LABEL_FIELDS}
+    total_head_losses = {field: 0.0 for field in LABEL_FIELDS}
     total_loss = 0.0
     total_samples = 0
     last_grad_norm = 0.0
@@ -165,7 +195,11 @@ def _run_epoch(
 
         with torch.set_grad_enabled(training):
             logits = model(mesh_motion, force)
-            loss = criterion(logits, labels)
+            head_losses = {
+                field: criteria[field](logits[field], labels[field])
+                for field in LABEL_FIELDS
+            }
+            loss = torch.stack(tuple(head_losses.values())).mean()
             if training:
                 optimizer.zero_grad(set_to_none=True)
                 loss.backward()
@@ -175,28 +209,37 @@ def _run_epoch(
                 if scheduler is not None:
                     scheduler.step()
 
-        batch_size = int(labels.shape[0])
+        batch_size = int(labels[LABEL_FIELDS[0]].shape[0])
         total_loss += float(loss.detach().cpu()) * batch_size
         total_samples += batch_size
-        labels_all.append(labels.detach().cpu())
-        preds_all.append(torch.argmax(logits.detach(), dim=-1).cpu())
+        for field in LABEL_FIELDS:
+            total_head_losses[field] += float(head_losses[field].detach().cpu()) * batch_size
+            labels_all[field].append(labels[field].detach().cpu())
+            preds_all[field].append(torch.argmax(logits[field].detach(), dim=-1).cpu())
         iterator.set_postfix(loss=total_loss / max(1, total_samples))
 
-    if not labels_all:
+    if not labels_all[LABEL_FIELDS[0]]:
         raise RuntimeError(f"No batches were processed for {desc}")
-    labels_np = torch.cat(labels_all).numpy()
-    preds_np = torch.cat(preds_all).numpy()
-    report = classification_report(
-        labels_np,
-        preds_np,
-        num_classes=len(ROTATION_LABELS),
-        class_names=ROTATION_LABELS,
-    )
-    report["loss"] = total_loss / max(1, total_samples)
+
+    heads: dict[str, dict[str, Any]] = {}
+    for field in LABEL_FIELDS:
+        report = classification_report(
+            torch.cat(labels_all[field]).numpy(),
+            torch.cat(preds_all[field]).numpy(),
+            num_classes=len(LABEL_MAPS[field]),
+            class_names=class_names(field),
+        )
+        report["loss"] = total_head_losses[field] / max(1, total_samples)
+        heads[field] = report
+    result: dict[str, Any] = {
+        "loss": total_loss / max(1, total_samples),
+        "mean_macro_f1": float(np.mean([heads[field]["macro_f1"] for field in LABEL_FIELDS])),
+        "heads": heads,
+    }
     if training:
-        report["grad_norm"] = last_grad_norm
-        report["lr"] = optimizer.param_groups[0]["lr"]
-    return report
+        result["grad_norm"] = last_grad_norm
+        result["lr"] = optimizer.param_groups[0]["lr"]
+    return result
 
 
 def save_checkpoint(
@@ -208,6 +251,8 @@ def save_checkpoint(
     config: CaptionerTrainConfig,
     metrics: dict[str, Any],
     train_dataset: TactileCaptionerDataset,
+    class_counts: dict[str, dict[int, int]],
+    class_weights: dict[str, torch.Tensor],
 ) -> None:
     payload = {
         "epoch": epoch,
@@ -216,11 +261,16 @@ def save_checkpoint(
         "config": _jsonable(config),
         "model_config": model.config_dict(),
         "metrics": _jsonable(metrics),
-        "label_names": ROTATION_LABELS,
+        "label_schema_version": LABEL_SCHEMA_VERSION,
+        "label_maps": LABEL_MAPS,
+        "class_counts": class_counts,
+        "class_weights": {field: class_weights[field].detach().cpu().tolist() for field in LABEL_FIELDS},
         "normalization": train_dataset.normalization_stats(),
         "dataset_meta": {
+            "dataset_format": train_dataset.meta["dataset_format"],
             "window_size": train_dataset.window_size,
-            "label_map": train_dataset.meta.get("label_map"),
+            "label_schema_version": train_dataset.meta["label_schema_version"],
+            "label_maps": train_dataset.meta["label_maps"],
             "mesh_motion_shape": train_dataset.meta.get("mesh_motion_shape"),
             "force_shape": train_dataset.meta.get("force_shape"),
         },
@@ -236,6 +286,11 @@ def load_model_from_checkpoint(
 ) -> tuple[TactileCaptioner, dict[str, Any]]:
     resolved_device = resolve_device(device) if isinstance(device, str) else device
     checkpoint = torch.load(checkpoint_path, map_location=resolved_device, weights_only=False)
+    if checkpoint.get("label_schema_version") != LABEL_SCHEMA_VERSION:
+        raise ValueError(
+            f"Checkpoint uses label schema {checkpoint.get('label_schema_version')!r}; "
+            f"V3 requires {LABEL_SCHEMA_VERSION!r}"
+        )
     model_config = dict(checkpoint["model_config"])
     if "temporal_dilations" in model_config:
         model_config["temporal_dilations"] = tuple(model_config["temporal_dilations"])
@@ -247,6 +302,8 @@ def load_model_from_checkpoint(
 
 
 def train(config: CaptionerTrainConfig) -> dict[str, Any]:
+    if config.class_weighting not in CLASS_WEIGHTING_MODES:
+        raise ValueError(f"class_weighting must be one of {CLASS_WEIGHTING_MODES}")
     set_seed(config.seed)
     device = resolve_device(config.device)
     run_dir = config.run_dir
@@ -264,6 +321,8 @@ def train(config: CaptionerTrainConfig) -> dict[str, Any]:
     )
     val_dataset = TactileCaptionerDataset(config.dataset_dir, split="val", balanced=False, normalize=config.normalize)
     test_dataset = TactileCaptionerDataset(config.dataset_dir, split="test", balanced=False, normalize=config.normalize)
+    if not (train_dataset.head_num_classes == val_dataset.head_num_classes == test_dataset.head_num_classes):
+        raise ValueError("train/val/test tactile label maps do not match")
 
     train_loader = make_dataloader(
         train_dataset,
@@ -291,17 +350,31 @@ def train(config: CaptionerTrainConfig) -> dict[str, Any]:
         frame_feature_dim=config.frame_feature_dim,
         temporal_hidden_dim=config.temporal_hidden_dim,
         dropout=config.dropout,
-        num_classes=len(ROTATION_LABELS),
+        head_num_classes=train_dataset.head_num_classes,
     ).to(device)
 
     counts = label_counts(train_dataset)
-    class_weights = compute_class_weights(counts, num_classes=len(ROTATION_LABELS)).to(device)
-    criterion = nn.CrossEntropyLoss(weight=class_weights, label_smoothing=config.label_smoothing)
+    class_weights = {
+        field: compute_class_weights(
+            counts[field],
+            num_classes=train_dataset.head_num_classes[field],
+            mode=config.class_weighting,
+        ).to(device)
+        for field in LABEL_FIELDS
+    }
+    train_criteria = _make_criteria(class_weights, label_smoothing=config.label_smoothing)
+    eval_criteria = _make_criteria(
+        {
+            field: torch.ones((train_dataset.head_num_classes[field],), dtype=torch.float32, device=device)
+            for field in LABEL_FIELDS
+        },
+        label_smoothing=0.0,
+    )
     optimizer = torch.optim.AdamW(model.parameters(), lr=config.lr, weight_decay=config.weight_decay)
     train_steps_per_epoch = config.max_train_batches or len(train_loader)
     scheduler = make_scheduler(optimizer, total_steps=max(1, train_steps_per_epoch * config.epochs))
 
-    best_macro_f1 = -1.0
+    best_mean_macro_f1 = -1.0
     best_epoch = -1
     stale_epochs = 0
     best_path = run_dir / "best.pt"
@@ -312,7 +385,7 @@ def train(config: CaptionerTrainConfig) -> dict[str, Any]:
             model,
             train_loader,
             device=device,
-            criterion=criterion,
+            criteria=train_criteria,
             optimizer=optimizer,
             scheduler=scheduler,
             grad_clip=config.grad_clip,
@@ -323,7 +396,7 @@ def train(config: CaptionerTrainConfig) -> dict[str, Any]:
             model,
             val_loader,
             device=device,
-            criterion=criterion,
+            criteria=eval_criteria,
             max_batches=config.max_val_batches,
             desc=f"val {epoch}/{config.epochs}",
         )
@@ -331,7 +404,11 @@ def train(config: CaptionerTrainConfig) -> dict[str, Any]:
             "epoch": epoch,
             "train": train_metrics,
             "val": val_metrics,
-            "class_weights": class_weights.detach().cpu().tolist(),
+            "class_counts": counts,
+            "class_weights": {
+                field: class_weights[field].detach().cpu().tolist()
+                for field in LABEL_FIELDS
+            },
             "device": str(device),
         }
         _append_jsonl(metrics_path, record)
@@ -343,11 +420,13 @@ def train(config: CaptionerTrainConfig) -> dict[str, Any]:
             config=config,
             metrics=record,
             train_dataset=train_dataset,
+            class_counts=counts,
+            class_weights=class_weights,
         )
 
-        val_macro_f1 = float(val_metrics["macro_f1"])
-        if val_macro_f1 > best_macro_f1:
-            best_macro_f1 = val_macro_f1
+        val_mean_macro_f1 = float(val_metrics["mean_macro_f1"])
+        if val_mean_macro_f1 > best_mean_macro_f1:
+            best_mean_macro_f1 = val_mean_macro_f1
             best_epoch = epoch
             stale_epochs = 0
             save_checkpoint(
@@ -358,6 +437,8 @@ def train(config: CaptionerTrainConfig) -> dict[str, Any]:
                 config=config,
                 metrics=record,
                 train_dataset=train_dataset,
+                class_counts=counts,
+                class_weights=class_weights,
             )
         else:
             stale_epochs += 1
@@ -369,13 +450,13 @@ def train(config: CaptionerTrainConfig) -> dict[str, Any]:
         best_model,
         test_loader,
         device=device,
-        criterion=criterion,
+        criteria=eval_criteria,
         max_batches=config.max_test_batches,
         desc="test",
     )
     summary = {
         "best_epoch": best_epoch,
-        "best_val_macro_f1": best_macro_f1,
+        "best_val_mean_macro_f1": best_mean_macro_f1,
         "test": test_metrics,
         "run_dir": str(run_dir),
         "best_checkpoint": str(best_path),
@@ -400,6 +481,11 @@ def evaluate_checkpoint(
     if dataset_dir is None:
         dataset_dir = checkpoint["config"]["dataset_dir"]
     dataset = TactileCaptionerDataset(dataset_dir, split=split, balanced=False, normalize=normalize)
+    checkpoint_window = int(checkpoint["dataset_meta"]["window_size"])
+    if dataset.window_size != checkpoint_window:
+        raise ValueError(
+            f"Dataset window_size={dataset.window_size} does not match checkpoint window_size={checkpoint_window}"
+        )
     loader = make_dataloader(
         dataset,
         batch_size=batch_size,
@@ -407,12 +493,18 @@ def evaluate_checkpoint(
         num_workers=num_workers,
         device=resolved_device,
     )
-    criterion = nn.CrossEntropyLoss()
+    criteria = _make_criteria(
+        {
+            field: torch.ones((len(LABEL_MAPS[field]),), dtype=torch.float32, device=resolved_device)
+            for field in LABEL_FIELDS
+        },
+        label_smoothing=0.0,
+    )
     return _run_epoch(
         model,
         loader,
         device=resolved_device,
-        criterion=criterion,
+        criteria=criteria,
         max_batches=max_batches,
         desc=f"eval {split}",
     )

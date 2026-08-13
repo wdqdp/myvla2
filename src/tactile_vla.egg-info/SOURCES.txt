@@ -31,3 +31,4 @@ src/tactile_vla/vla/torch_utils.py
 tests/test_import_raw_episodes.py
 tests/test_state_history.py
 tests/test_vla_index.py
+tests/test_vla_prompts.py

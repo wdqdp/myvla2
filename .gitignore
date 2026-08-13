@@ -12,6 +12,8 @@
 **/checkpoints/
 **/wandb/
 **/data/
+!src/tactile_vla/data/
+!src/tactile_vla/data/*.py
 *.pt
 *.pth
 *.ckpt

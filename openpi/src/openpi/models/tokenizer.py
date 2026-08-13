@@ -19,6 +19,79 @@ class PaligemmaTokenizer:
         with path.open("rb") as f:
             self._tokenizer = sentencepiece.SentencePieceProcessor(model_proto=f.read())
 
+    @property
+    def pad_id(self) -> int:
+        pad_id = int(self._tokenizer.pad_id())
+        return max(pad_id, 0)
+
+    @property
+    def eos_id(self) -> int:
+        return int(self._tokenizer.eos_id())
+
+    def encode_text(
+        self,
+        text: str,
+        *,
+        add_bos: bool = False,
+        add_eos: bool = False,
+    ) -> list[int]:
+        return list(
+            self._tokenizer.encode(
+                text,
+                add_bos=add_bos,
+                add_eos=add_eos,
+            )
+        )
+
+    def decode_tokens(self, tokens: np.ndarray | list[int]) -> str:
+        if isinstance(tokens, np.ndarray):
+            tokens = tokens.astype(np.int32).tolist()
+        return str(self._tokenizer.decode(tokens))
+
+    def tokenize_structured_response(
+        self,
+        prompt: str,
+        state: np.ndarray,
+        target_tokens: np.ndarray | list[int] | None,
+        *,
+        max_len: int | None = None,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, int]:
+        """Tokenize a pi0.5 prompt and optional causal structured answer.
+
+        Returns tokens, valid-token mask, AR-block mask, answer loss mask and
+        the unpadded prefix length. Unlike ``tokenize``, this path fails on
+        truncation because silently dropping a reasoning-memory suffix or a
+        target token would corrupt language supervision.
+        """
+
+        max_len = self._max_len if max_len is None else int(max_len)
+        if max_len <= 0:
+            raise ValueError(f"max_len must be positive, got {max_len}")
+        cleaned_text = prompt.strip().replace("_", " ").replace("\n", " ")
+        discretized_state = np.digitize(state, bins=np.linspace(-1, 1, 256 + 1)[:-1]) - 1
+        state_str = " ".join(map(str, discretized_state))
+        prefix = f"Task: {cleaned_text}, State: {state_str};\nAnswer: "
+        prefix_tokens = self.encode_text(prefix, add_bos=True)
+        answer_tokens = [] if target_tokens is None else [int(token) for token in target_tokens]
+        tokens = prefix_tokens + answer_tokens
+        if len(tokens) > max_len:
+            raise ValueError(
+                "Structured prompt/target exceeds max token length: "
+                f"tokens={len(tokens)}, max_len={max_len}. Increase --max-token-len."
+            )
+        padding_length = max_len - len(tokens)
+        padding = [self.pad_id] * padding_length
+        valid_mask = [True] * len(tokens) + [False] * padding_length
+        ar_mask = [False] * len(prefix_tokens) + [True] * len(answer_tokens) + [False] * padding_length
+        loss_mask = [False] * len(prefix_tokens) + [True] * len(answer_tokens) + [False] * padding_length
+        return (
+            np.asarray(tokens + padding, dtype=np.int32),
+            np.asarray(valid_mask, dtype=np.bool_),
+            np.asarray(ar_mask, dtype=np.int32),
+            np.asarray(loss_mask, dtype=np.bool_),
+            len(prefix_tokens),
+        )
+
     def tokenize(self, prompt: str, state: np.ndarray | None = None) -> tuple[np.ndarray, np.ndarray]:
         cleaned_text = prompt.strip().replace("_", " ").replace("\n", " ")
         if state is not None:

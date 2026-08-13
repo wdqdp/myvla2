@@ -11,8 +11,8 @@ from typing import Any
 
 import numpy as np
 
+from tactile_vla.common.labels import DEFAULT_TACTILE_CAPTION
 
-DEFAULT_TACTILE_CAPTION = "Tactile: no rotation."
 GRID_SHAPE = (35, 20, 3)
 WINDOW_SIZE = 30
 
@@ -184,7 +184,7 @@ class TactileWindowBuffer:
         return TactileFrame(mesh_motion=frame.mesh_motion, force=frame.force, timestamp=timestamp)
 
     def latest_window(self) -> tuple[np.ndarray, np.ndarray] | None:
-        """Return ``(mesh_motion, force)`` with shapes ``[30,35,20,12]`` and ``[30,35,20,6]``."""
+        """Return the latest ``(mesh_motion, force)`` fixed-length window."""
 
         with self._lock:
             if len(self._frames) < self.window_size:
@@ -277,4 +277,3 @@ def load_attempt_tactile_window(
     if window is None:
         raise ValueError(f"Attempt {attempt_dir} has fewer than {window_size} tactile frames after start={start}")
     return window
-

@@ -14,9 +14,13 @@ OPENPI_ROOT = PROJECT_ROOT / "openpi"
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 sys.path.insert(0, str(OPENPI_ROOT / "src"))
 
-DEFAULT_DATASET_DIR = Path("/data1/tac_data/lerobot_data/tactile_vla_expanded")
-DEFAULT_SPLIT_FILE = Path("/data1/outputs/vla/indices/splits_h30_state_memory_expanded.json")
-DEFAULT_OUTPUT_DIR = Path("/data1/outputs/vla/assets/tactile_vla_h30_state_memory_expanded")
+DEFAULT_DATASET_DIR = Path("/data1/tac_data/lerobot_data/tactile_vla_v3")
+DEFAULT_PROFILE_DIR = Path("/data1/outputs/vla/rotation_moderately_success_v1")
+DEFAULT_INDEX_FILE = DEFAULT_PROFILE_DIR / "vla_indices_v3.json"
+DEFAULT_SPLIT_FILE = DEFAULT_PROFILE_DIR / "splits.json"
+DEFAULT_OUTPUT_DIR = Path(
+    "/data1/outputs/vla/assets/tactile_vla_rotation_moderately_success_v1"
+)
 
 os.environ.setdefault("HF_HOME", str(PROJECT_ROOT / ".cache" / "huggingface"))
 os.environ.setdefault("HF_DATASETS_CACHE", str(PROJECT_ROOT / ".cache" / "huggingface" / "datasets"))
@@ -27,17 +31,16 @@ import pyarrow.parquet as pq
 import tqdm
 
 from openpi.shared import normalize
-from tactile_vla.vla.index import SplitConfig
-from tactile_vla.vla.index import execution_indices
-from tactile_vla.vla.index import load_or_create_splits
-from tactile_vla.vla.index import records_for_split
-from tactile_vla.vla.index import scan_lerobot_frames
+from tactile_vla.vla.artifacts import artifact_identity
+from tactile_vla.vla.data_profiles import ROTATION_MODERATELY_SUCCESS_V1
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     parser.add_argument("--dataset-dir", type=Path, default=DEFAULT_DATASET_DIR)
     parser.add_argument("--split-file", type=Path, default=DEFAULT_SPLIT_FILE)
+    parser.add_argument("--index-file", type=Path, default=DEFAULT_INDEX_FILE)
+    parser.add_argument("--data-profile", default=ROTATION_MODERATELY_SUCCESS_V1)
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--action-horizon", type=int, default=30)
@@ -49,17 +52,25 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    records = scan_lerobot_frames(args.dataset_dir)
-    splits = load_or_create_splits(
-        records,
-        args.split_file,
-        SplitConfig(seed=args.seed),
-        overwrite=args.overwrite_splits,
-    )
-    train_records = records_for_split(records, splits["train"])
-    indices = execution_indices(train_records, action_horizon=args.action_horizon)
+    if args.overwrite_splits:
+        raise ValueError("Versioned norm stats never overwrite or regenerate split files")
     if args.max_frames is not None:
-        indices = indices[: args.max_frames]
+        raise ValueError("Profile-bound norm stats must use every persisted train action index")
+    if not args.index_file.is_file():
+        raise FileNotFoundError(args.index_file)
+    index = json.loads(args.index_file.read_text())
+    if int(index.get("action_horizon", -1)) != args.action_horizon:
+        raise ValueError(
+            f"Index action_horizon={index.get('action_horizon')!r}, "
+            f"requested={args.action_horizon}"
+        )
+    identity = artifact_identity(
+        index,
+        index_path=args.index_file,
+        prompt_profile="not_applicable",
+        requested_data_profile=args.data_profile,
+    )
+    indices = [int(value) for value in index["splits"]["train"]["execution_indices"]]
 
     selected = set(indices)
     stats = {"state": normalize.RunningStats(), "actions": normalize.RunningStats()}
@@ -84,11 +95,19 @@ def main() -> None:
             stats["actions"].update(delta_chunk)
             seen += 1
 
+    if seen != len(indices):
+        raise ValueError(
+            f"Norm stats consumed {seen} frames, but the persisted train action index has {len(indices)}"
+        )
+
     norm_stats = {key: value.get_statistics() for key, value in stats.items()}
     normalize.save(args.output_dir, norm_stats)
     payload = {
         "dataset_dir": str(args.dataset_dir),
         "split_file": str(args.split_file),
+        "index_file": str(args.index_file),
+        "data_profile": args.data_profile,
+        "artifact_identity": identity,
         "num_frames": seen,
         "action_horizon": args.action_horizon,
         "action_space": "delta_joint_position",
