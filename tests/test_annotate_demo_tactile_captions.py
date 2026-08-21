@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -104,6 +105,57 @@ def test_discover_and_load_attempts(tmp_path: Path) -> None:
     data = annotation.load_attempt_tactile_data(attempts[0])
     assert data.mesh_motion.shape == (4, 35, 20, 12)
     assert data.force.shape == (4, 35, 20, 6)
+
+
+def test_discover_attempts_uses_strict_v4_selection(tmp_path: Path) -> None:
+    write_attempt_hdf5(tmp_path / "episode1/attempt1/data.hdf5")
+    write_attempt_hdf5(tmp_path / "episode2/attempt1/data.hdf5")
+    for episode_id in (1, 2):
+        meta_path = tmp_path / f"episode{episode_id}/attempt1/meta.json"
+        meta = {"episode_id": episode_id, "attempt_id": 1}
+        meta_path.write_text(json.dumps(meta), encoding="utf-8")
+
+    selected_meta = tmp_path / "episode2/attempt1/meta.json"
+    digest = hashlib.sha256(selected_meta.read_bytes()).hexdigest()
+    selection = {
+        "schema_version": "tactile_vla_v4_rotation_selection_v1",
+        "selected_episode_ids": [2],
+        "selected_attempt_count": 1,
+        "attempts": [
+            {
+                "episode_id": 2,
+                "attempt_id": 1,
+                "task": "one_success",
+                "subgroup": ["horizontal_layout"],
+                "meta_path": "episode2/attempt1/meta.json",
+                "meta_sha256": digest,
+            }
+        ],
+        "excluded": [],
+    }
+    canonical = json.dumps(
+        selection,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+    selection["selection_hash"] = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    selection_file = tmp_path / "selection.json"
+    selection_file.write_text(json.dumps(selection), encoding="utf-8")
+
+    selected = annotation.discover_attempts(tmp_path, selection_file=selection_file)
+    assert [(item.episode_id, item.attempt_id) for item in selected] == [(2, 1)]
+    assert len(annotation.discover_attempts(tmp_path)) == 2
+    with pytest.raises(ValueError, match="cannot be combined"):
+        annotation.discover_attempts(
+            tmp_path,
+            episode_start=2,
+            selection_file=selection_file,
+        )
+
+    selected_meta.unlink()
+    with pytest.raises(FileNotFoundError, match="metadata is missing"):
+        annotation.discover_attempts(tmp_path, selection_file=selection_file)
 
 
 def test_label_payload_preserves_unrelated_overrides(tmp_path: Path) -> None:

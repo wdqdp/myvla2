@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 import json
 from pathlib import Path
+import re
 from typing import Any, Literal
 
 import numpy as np
@@ -18,10 +19,23 @@ from tactile_vla.vla.prompts import build_monitor_prompt
 from tactile_vla.vla.prompts import build_recovery_prompt
 from tactile_vla.vla.prompts import build_reasoning_prompt
 from tactile_vla.vla.structured_text import ConstrainedTokenGrammar
+from tactile_vla.vla.structured_text import legal_failure_reasons
+from tactile_vla.vla.structured_text import legal_recovery_plans
+from tactile_vla.vla.artifacts import sha256_file
+from tactile_vla.vla.v4_data import V4_NEED_SCHEMA
+from tactile_vla.vla.v4_data import V4_REASONING_SCHEMA
 
 
 StageName = Literal["execution", "status", "reasoning"]
 V3StageBTask = Literal["need_recovery", "failure_reason"]
+V4StageBTask = Literal["need", "failure", "plan"]
+_V4_FAILURE_RE = re.compile(
+    r"^failure_reason=rotate (right|left|front|back),grasp appropriate\.$"
+)
+_V4_PLAN_RE = re.compile(
+    r"^recovery_plan=move horizontally (right|left|front|back) "
+    r"(slightly|moderately), move vertically none moderately\.$"
+)
 
 
 def _ensure_openpi_imports() -> None:
@@ -60,6 +74,10 @@ def _scalar(value: Any) -> int | float | bool:
     if isinstance(value, np.ndarray):
         value = value.item()
     return value
+
+
+def _text(value: Any) -> str:
+    return str(_scalar(value))
 
 
 @dataclass(frozen=True)
@@ -260,6 +278,7 @@ class TactileVLAFrameDataset(torch.utils.data.Dataset):
         fps: float = 30.0,
         video_backend: str = "pyav",
         prompt_profile: str | None = None,
+        dataset_repo_id: str = "tactile_vla",
         lerobot_dataset: Any | None = None,
     ) -> None:
         _ensure_openpi_imports()
@@ -289,7 +308,7 @@ class TactileVLAFrameDataset(torch.utils.data.Dataset):
         if stage == "execution":
             delta_timestamps["action"] = [step / self.fps for step in range(action_horizon)]
         self._dataset = lerobot_dataset or LeRobotDataset(
-            "tactile_vla",
+            dataset_repo_id,
             root=self.dataset_dir,
             delta_timestamps=delta_timestamps or None,
             download_videos=False,
@@ -395,6 +414,7 @@ class V3StageBFrameDataset(torch.utils.data.Dataset):
         task: V3StageBTask,
         video_backend: str = "pyav",
         prompt_profile: str | None = None,
+        dataset_repo_id: str = "tactile_vla_v3",
         lerobot_dataset: Any | None = None,
     ) -> None:
         _ensure_openpi_imports()
@@ -404,7 +424,7 @@ class V3StageBFrameDataset(torch.utils.data.Dataset):
         self.task = task
         self.prompt_profile = prompt_profile
         self._dataset = lerobot_dataset or LeRobotDataset(
-            "tactile_vla_v3",
+            dataset_repo_id,
             root=Path(dataset_dir),
             download_videos=False,
             video_backend=video_backend,
@@ -474,6 +494,7 @@ class V3RecoveryManifestDataset(torch.utils.data.Dataset):
         training: bool,
         video_backend: str = "pyav",
         prompt_profile: str | None = None,
+        dataset_repo_id: str = "tactile_vla_v3",
         lerobot_dataset: Any | None = None,
     ) -> None:
         _ensure_openpi_imports()
@@ -510,7 +531,7 @@ class V3RecoveryManifestDataset(torch.utils.data.Dataset):
         self.samples = expanded
         self.prompt_profile = prompt_profile
         self._dataset = lerobot_dataset or LeRobotDataset(
-            "tactile_vla_v3",
+            dataset_repo_id,
             root=Path(dataset_dir),
             download_videos=False,
             video_backend=video_backend,
@@ -541,6 +562,283 @@ class V3RecoveryManifestDataset(torch.utils.data.Dataset):
             "attempt_id": int(_scalar(item["attempt_id"])),
             "frame_index": int(_scalar(item["frame_index"])),
         }
+
+
+class V4DirectManifestDataset(torch.utils.data.Dataset):
+    """Read exactly one V4 manifest row and one LeRobot frame per sample.
+
+    V4 failure/reasoning manifests are already expanded to one row per real
+    frame.  In contrast to :class:`V3RecoveryManifestDataset`, this dataset
+    never expands a row into a time window.
+    """
+
+    def __init__(
+        self,
+        *,
+        dataset_dir: str | Path,
+        manifest_file: str | Path,
+        manifest_row_indices: Sequence[int],
+        global_indices: Sequence[int],
+        task: V4StageBTask,
+        expected_manifest_sha256: str | None = None,
+        expected_split: str | None = None,
+        video_backend: str = "pyav",
+        prompt_profile: str | None = None,
+        dataset_repo_id: str = "tactile_vla_rotation_v4",
+        lerobot_dataset: Any | None = None,
+    ) -> None:
+        if task not in {"need", "failure", "plan"}:
+            raise ValueError(f"Unsupported V4 direct manifest task: {task!r}")
+        manifest_file = Path(manifest_file)
+        if expected_manifest_sha256 is not None:
+            actual = sha256_file(manifest_file)
+            if actual != expected_manifest_sha256:
+                raise ValueError(
+                    f"V4 {task} manifest hash mismatch: expected={expected_manifest_sha256}, actual={actual}"
+                )
+        all_rows = [
+            json.loads(line)
+            for line in manifest_file.read_text().splitlines()
+            if line.strip()
+        ]
+        row_indices = [int(value) for value in manifest_row_indices]
+        indices = [int(value) for value in global_indices]
+        if len(row_indices) != len(indices):
+            raise ValueError("V4 manifest_row_indices and global_indices lengths differ")
+        samples: list[tuple[dict[str, Any], int, int]] = []
+        for row_index, global_index in zip(row_indices, indices, strict=True):
+            if not 0 <= row_index < len(all_rows):
+                raise ValueError(f"V4 {task} manifest row index is out of range: {row_index}")
+            row = all_rows[row_index]
+            if not isinstance(row, dict):
+                raise ValueError(f"V4 {task} manifest row {row_index} is not an object")
+            split = str(row.get("split", ""))
+            if expected_split is not None and split != expected_split:
+                raise ValueError(
+                    f"V4 {task} row {row_index} split={split!r}, expected={expected_split!r}"
+                )
+            if task == "need":
+                if row.get("schema_version") != V4_NEED_SCHEMA:
+                    raise ValueError(f"V4 need row {row_index} has wrong schema")
+                if int(row.get("global_index", -1)) != global_index:
+                    raise ValueError(f"V4 need row {row_index} global index mismatch")
+                if not isinstance(row.get("need_recovery"), bool):
+                    raise ValueError(f"V4 need row {row_index} lacks a boolean target")
+            else:
+                if row.get("schema_version") != V4_REASONING_SCHEMA:
+                    raise ValueError(f"V4 {task} row {row_index} has wrong schema")
+                expected_type = "failure_reason" if task == "failure" else "recovery_plan"
+                if row.get("sample_type") != expected_type:
+                    raise ValueError(f"V4 {task} row {row_index} has wrong sample_type")
+                observation = row.get("current_observation")
+                if not isinstance(observation, Mapping) or observation.get("source_type") != "real":
+                    raise ValueError(f"V4 {task} row {row_index} lacks real observation identity")
+                if int(row.get("frame_index", -1)) != int(observation.get("frame_index", -2)):
+                    raise ValueError(f"V4 {task} row {row_index} has inconsistent frame identity")
+                offset = int(row.get("frame_offset", -1))
+                if (
+                    int(observation.get("frame_offset", -2)) != offset
+                    or int(row.get("window_start", -1)) + offset != int(row["frame_index"])
+                ):
+                    raise ValueError(f"V4 {task} row {row_index} has inconsistent window identity")
+                if task == "failure":
+                    target = str(row.get("target_failure_reason", ""))
+                    if target not in legal_failure_reasons():
+                        raise ValueError(f"V4 failure row {row_index} target is outside full V3 grammar")
+                    if target != str(observation.get("failure_reason", "")):
+                        raise ValueError(f"V4 failure row {row_index} target differs from real observation")
+                else:
+                    target = str(row.get("target_recovery_plan", ""))
+                    if target not in legal_recovery_plans():
+                        raise ValueError(f"V4 plan row {row_index} target is outside full V3 grammar")
+                    target_match = _V4_PLAN_RE.fullmatch(target)
+                    if target_match is None:
+                        raise ValueError(f"V4 plan row {row_index} target is outside the rotation subset")
+                    memory = row.get("failure_recovery_memory")
+                    if not isinstance(memory, list) or len(memory) != int(row.get("memory_length", -1)):
+                        raise ValueError(f"V4 plan row {row_index} has invalid memory length")
+                    if not 1 <= len(memory) <= 4:
+                        raise ValueError(f"V4 plan row {row_index} memory length is outside [1,4]")
+                    if (target_match.group(2) == "moderately" and len(memory) != 1) or (
+                        target_match.group(2) == "slightly" and len(memory) not in {2, 3, 4}
+                    ):
+                        raise ValueError(f"V4 plan row {row_index} target/memory length mismatch")
+                    variant_id = str(row.get("variant_id", ""))
+                    rule_version = str(row.get("rule_version", ""))
+                    seed = int(row.get("seed", -1))
+                    if not variant_id or not rule_version or seed < 0:
+                        raise ValueError(f"V4 plan row {row_index} lacks synthetic provenance")
+                    failure_directions: list[str] = []
+                    for pair_index, pair in enumerate(memory):
+                        if not isinstance(pair, Mapping) or pair.get("source_type") != "synthetic":
+                            raise ValueError(f"V4 plan row {row_index} contains non-synthetic memory")
+                        if {"donor_episode_id", "donor_attempt_id"} & set(pair):
+                            raise ValueError(f"V4 plan row {row_index} contains fake donor provenance")
+                        if (
+                            pair.get("variant_id") != variant_id
+                            or pair.get("rule_version") != rule_version
+                            or int(pair.get("seed", -1)) != seed
+                            or int(pair.get("pair_index", -1)) != pair_index
+                        ):
+                            raise ValueError(f"V4 plan row {row_index} pair provenance mismatch")
+                        failure_match = _V4_FAILURE_RE.fullmatch(str(pair.get("failure_reason", "")))
+                        if failure_match is None:
+                            raise ValueError(f"V4 plan row {row_index} pair failure is outside V4 grammar")
+                        failure_directions.append(failure_match.group(1))
+                        plan_text = str(pair.get("recovery_plan", ""))
+                        if pair_index == 0:
+                            if plan_text != "initial plan":
+                                raise ValueError(f"V4 plan row {row_index} first pair is not initial plan")
+                        else:
+                            pair_plan = _V4_PLAN_RE.fullmatch(plan_text)
+                            expected_magnitude = "moderately" if pair_index == 1 else "slightly"
+                            if (
+                                pair_plan is None
+                                or pair_plan.group(1) != failure_directions[pair_index - 1]
+                                or pair_plan.group(2) != expected_magnitude
+                            ):
+                                raise ValueError(f"V4 plan row {row_index} memory chain is incompatible")
+                    real_failure = str(observation.get("failure_reason", ""))
+                    if str(memory[-1]["failure_reason"]) != real_failure:
+                        raise ValueError(f"V4 plan row {row_index} terminal failure differs from observation")
+                    if target_match.group(1) != failure_directions[-1]:
+                        raise ValueError(f"V4 plan row {row_index} target direction differs from terminal failure")
+                    target_source = row.get("target_source")
+                    if not isinstance(target_source, Mapping) or target_source.get("source_type") != "real":
+                        raise ValueError(f"V4 plan row {row_index} target is not real")
+                    if (
+                        int(target_source.get("episode_id", -1)) != int(observation["episode_id"])
+                        or int(target_source.get("failed_attempt_id", -1)) != int(observation["attempt_id"])
+                        or int(target_source.get("plan_attempt_id", -1)) != int(observation["attempt_id"]) + 1
+                    ):
+                        raise ValueError(f"V4 plan row {row_index} target is not from the adjacent real attempt")
+            samples.append((row, global_index, row_index))
+
+        self.samples = samples
+        self.task = task
+        self.prompt_profile = prompt_profile
+        if lerobot_dataset is None:
+            _ensure_openpi_imports()
+            from lerobot.common.datasets.lerobot_dataset import LeRobotDataset
+
+            lerobot_dataset = LeRobotDataset(
+                dataset_repo_id,
+                root=Path(dataset_dir),
+                download_videos=False,
+                video_backend=video_backend,
+            )
+        self._dataset = lerobot_dataset
+
+    def __len__(self) -> int:
+        return len(self.samples)
+
+    @staticmethod
+    def _identity(item: Mapping[str, Any]) -> tuple[int, int, int, int]:
+        return (
+            int(_scalar(item["index"])),
+            int(_scalar(item["episode_id"])),
+            int(_scalar(item["attempt_id"])),
+            int(_scalar(item["frame_index"])),
+        )
+
+    def __getitem__(self, dataset_index: int) -> dict:
+        row, global_index, row_index = self.samples[dataset_index]
+        item = self._dataset[global_index]
+        item_identity = self._identity(item)
+        if item_identity[0] != global_index:
+            raise ValueError(
+                f"V4 {self.task} row {row_index} retrieved LeRobot index {item_identity[0]}, expected {global_index}"
+            )
+        if self.task == "need":
+            row_identity = (
+                int(row["global_index"]),
+                int(row["episode_id"]),
+                int(row["attempt_id"]),
+                int(row["frame_index"]),
+            )
+        else:
+            observation = row["current_observation"]
+            row_identity = (
+                global_index,
+                int(observation["episode_id"]),
+                int(observation["attempt_id"]),
+                int(observation["frame_index"]),
+            )
+            if _text(item["tactile_caption"]) != str(observation["tactile_caption"]):
+                raise ValueError(f"V4 {self.task} row {row_index} tactile caption mismatch")
+        if row_identity != item_identity:
+            raise ValueError(
+                f"V4 {self.task} row {row_index} identity mismatch: manifest={row_identity}, LeRobot={item_identity}"
+            )
+
+        instruction = _text(item["instruction"])
+        tactile_caption = _text(item["tactile_caption"])
+        input_recovery_plan = _text(item["input_recovery_plan"])
+        result = {
+            "observation/image": item["observation.images.front"],
+            "observation/wrist_image": item["observation.images.left"],
+            "observation/state": item["observation.state"],
+            "global_index": item_identity[0],
+            "episode_id": item_identity[1],
+            "attempt_id": item_identity[2],
+            "frame_index": item_identity[3],
+        }
+        if self.task == "need":
+            target = bool(row["need_recovery"])
+            stored = bool(_scalar(item["need_recovery"]))
+            if target != stored:
+                raise ValueError(
+                    f"V4 need row {row_index} target={target} differs from LeRobot label={stored}"
+                )
+            result.update(
+                {
+                    "prompt": build_monitor_prompt(
+                        instruction=instruction,
+                        tactile_caption=tactile_caption,
+                        input_recovery_plan=input_recovery_plan,
+                        prompt_profile=self.prompt_profile,
+                    ),
+                    "need_recovery_label": int(target),
+                }
+            )
+            return result
+
+        if not bool(_scalar(item["need_recovery"])):
+            raise ValueError(f"V4 {self.task} row {row_index} maps to a non-failure-active frame")
+        if self.task == "failure":
+            target = str(row["target_failure_reason"])
+            stored_target = _text(item["failure_reason"])
+            if target != stored_target or not bool(_scalar(item["failure_reason_mask"])):
+                raise ValueError(f"V4 failure row {row_index} target/mask differs from LeRobot")
+            result.update(
+                {
+                    "prompt": build_failure_prompt(
+                        instruction=instruction,
+                        tactile_caption=tactile_caption,
+                        input_recovery_plan=input_recovery_plan,
+                        prompt_profile=self.prompt_profile,
+                    ),
+                    "target_text": target,
+                }
+            )
+            return result
+
+        target = str(row["target_recovery_plan"])
+        stored_target = _text(item["recovery_plan"])
+        if target != stored_target or not bool(_scalar(item["recovery_plan_mask"])):
+            raise ValueError(f"V4 plan row {row_index} target/mask differs from LeRobot")
+        result.update(
+            {
+                "prompt": build_recovery_prompt(
+                    instruction=instruction,
+                    failed_tactile_caption=tactile_caption,
+                    failure_recovery_memory=row["failure_recovery_memory"],
+                    prompt_profile=self.prompt_profile,
+                ),
+                "target_text": target,
+            }
+        )
+        return result
 
 
 def build_transform(

@@ -62,17 +62,45 @@ def _parse_index(path: Path, prefix: str) -> int:
     return int(match.group(1))
 
 
+def _selected_attempt_directories(selection_file: Path, dataset_dir: Path) -> list[Path]:
+    """Lazily load the sibling V4 schema only for selection-based annotation."""
+    scripts_dir = PROJECT_ROOT.parent / "tac_ws" / "src" / "data_tools" / "scripts_new"
+    schema_path = scripts_dir / "v4_data_schema.py"
+    if not schema_path.is_file():
+        raise FileNotFoundError(
+            f"--selection-file requires the sibling tac_ws V4 schema: {schema_path}"
+        )
+    sys.path.insert(0, str(scripts_dir))
+    from v4_data_schema import selected_attempt_directories
+
+    return selected_attempt_directories(selection_file, dataset_dir)
+
+
 def discover_attempts(
     dataset_dir: Path,
     *,
     episode_start: int | None = None,
     episode_end: int | None = None,
     attempt_ids: set[int] | None = None,
+    selection_file: Path | None = None,
 ) -> list[AttemptRef]:
     if not dataset_dir.is_dir():
         raise FileNotFoundError(f"Demo dataset directory not found: {dataset_dir}")
     if episode_start is not None and episode_end is not None and episode_start > episode_end:
         raise ValueError("episode-start cannot be greater than episode-end")
+    if selection_file is not None:
+        if episode_start is not None or episode_end is not None or attempt_ids is not None:
+            raise ValueError(
+                "selection-file cannot be combined with episode range or attempt-index filters"
+            )
+        return [
+            AttemptRef(
+                episode_id=_parse_index(attempt_dir.parent, "episode"),
+                attempt_id=_parse_index(attempt_dir, "attempt"),
+                attempt_dir=attempt_dir,
+            )
+            for attempt_dir in _selected_attempt_directories(selection_file, dataset_dir)
+        ]
 
     attempts: list[AttemptRef] = []
     episode_dirs = sorted(
@@ -298,6 +326,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--label-file-name", default="labels.json")
     parser.add_argument(
+        "--selection-file",
+        type=Path,
+        help="Strict V4 selection.json; cannot be combined with range/attempt filters.",
+    )
+    parser.add_argument(
         "--report",
         type=Path,
         help="Summary JSON path (default: <dataset-dir>/tactile_caption_annotation_summary.json).",
@@ -328,6 +361,7 @@ def main() -> None:
         episode_start=args.episode_start,
         episode_end=args.episode_end,
         attempt_ids=attempt_ids,
+        selection_file=args.selection_file,
     )
     missing_hdf5 = [attempt.hdf5_path for attempt in attempts if not attempt.hdf5_path.is_file()]
     if missing_hdf5:

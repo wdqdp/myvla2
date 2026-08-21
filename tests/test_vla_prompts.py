@@ -3,6 +3,8 @@ from __future__ import annotations
 from pathlib import Path
 import sys
 
+import pytest
+
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
@@ -14,6 +16,7 @@ from tactile_vla.vla.prompts import build_recovery_prompt  # noqa: E402
 from tactile_vla.vla.prompts import build_reasoning_prompt  # noqa: E402
 from tactile_vla.vla.prompts import format_memory  # noqa: E402
 from tactile_vla.vla.prompts import MINIMAL_PROMPT_PROFILE  # noqa: E402
+from tactile_vla.vla.prompts import MAX_MEMORY_PAIRS  # noqa: E402
 from tactile_vla.vla.prompts import resolve_prompt_profile  # noqa: E402
 from tactile_vla.vla.prompts import update_failure_recovery_memory  # noqa: E402
 
@@ -168,16 +171,27 @@ def test_omitted_checkpoint_prompt_profile_falls_back_to_legacy() -> None:
     assert legacy.endswith("monitor whether recovery is needed.")
 
 
-def test_minimal_runtime_memory_replaces_the_previous_entry() -> None:
+def test_minimal_runtime_memory_accumulates_without_sliding_the_initial_pair() -> None:
     old = [{"recovery_plan": "old", "failure_reason": "old reason"}]
     latest = {"recovery_plan": "new", "failure_reason": "new reason"}
     assert update_failure_recovery_memory(
         old,
         latest,
         prompt_profile=MINIMAL_PROMPT_PROFILE,
-    ) == [latest]
+    ) == [*old, latest]
     assert update_failure_recovery_memory(
         old,
         latest,
         prompt_profile="legacy",
     ) == [*old, latest]
+
+    full = [
+        {"recovery_plan": f"plan-{index}", "failure_reason": f"reason-{index}"}
+        for index in range(MAX_MEMORY_PAIRS)
+    ]
+    with pytest.raises(ValueError, match="refusing to discard the initial pair"):
+        update_failure_recovery_memory(
+            full,
+            latest,
+            prompt_profile=MINIMAL_PROMPT_PROFILE,
+        )

@@ -304,3 +304,44 @@ def test_server_metadata_must_identify_action_ablation() -> None:
     args = argparse.Namespace(state_history_len=60, state_history_fps=30.0, chunk_size=30)
     with pytest.raises(ValueError, match="not the action-only"):
         client.validate_server_metadata(args, {"action_only_ablation": False})
+
+
+def test_server_metadata_must_match_expected_data_profile() -> None:
+    args = argparse.Namespace(
+        state_history_len=60,
+        state_history_fps=30.0,
+        chunk_size=30,
+        expected_data_profile="rotation_v4",
+    )
+    metadata = _FakePolicy().get_server_metadata() | {"data_profile": "legacy"}
+    with pytest.raises(ValueError, match="data profile mismatch"):
+        client.validate_server_metadata(args, metadata)
+
+
+def test_v4_action_warmup_uses_minimal_execution_prompt() -> None:
+    class FakePolicy:
+        def __init__(self) -> None:
+            self._config = SimpleNamespace(state_history_len=60, state_history_dim=7)
+            self.metadata = {
+                "checkpoint_kind": "stage-a",
+                "prompt_profile": "minimal_v1",
+                "data_profile": "rotation_v4",
+                "norm_stats_sha256": "a" * 64,
+                "action_noise_shape": [30, 32],
+                "state_history_len": 60,
+                "state_history_dim": 7,
+            }
+            self.prompt = ""
+
+        def infer(self, payload):
+            self.prompt = payload["prompt"]
+            return {
+                "raw_model_actions": np.zeros((30, 32), dtype=np.float32),
+                "actions": np.zeros((30, 7), dtype=np.float32),
+            }
+
+    policy = FakePolicy()
+    server.warm_up(policy)
+
+    assert policy.prompt == "Mode: execution. Task: dry run Recovery plan: none."
+    assert "Touch[" not in policy.prompt

@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import argparse
 import importlib.util
+import json
 from pathlib import Path
 import sys
 import time
+from types import SimpleNamespace
 
 import numpy as np
+import pytest
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -181,6 +184,32 @@ class _FakeV3RecoveryPolicy(_FakeV3SharedPolicy):
         raise AssertionError(f"Unexpected mode: {mode!r}")
 
 
+class _FiveFailurePolicy(_FakeV3RecoveryPolicy):
+    def __init__(self) -> None:
+        super().__init__()
+        self.reasoning_prompts: list[str] = []
+
+    def get_server_metadata(self):
+        return {
+            **super().get_server_metadata(),
+            "prompt_profile": "minimal_v1",
+            "max_memory_pairs": 4,
+            "max_supported_attempts": 5,
+        }
+
+    def infer(self, payload):
+        if payload["mode"] == "reasoning":
+            self.modes.append("reasoning")
+            self.reasoning_prompts.append(str(payload["prompt"]))
+            return {
+                "recovery_plan": (
+                    "recovery_plan=move horizontally left slightly, "
+                    "move vertically none moderately."
+                )
+            }
+        return super().infer(payload)
+
+
 def test_closed_loop_runs_monitor_in_background_with_latest_observation() -> None:
     inference.shutdown_event.clear()
     inference.published_actions_history.clear()
@@ -284,6 +313,85 @@ def test_recovery_ignore_suppresses_assessment_but_keeps_live_tactile_for_action
     assert _FakeTactile.caption_text in policy.execution_prompts[-1]
 
 
+def test_five_failures_send_four_reasoning_prompts_with_memory_lengths_1_to_4(
+    tmp_path: Path,
+) -> None:
+    inference.shutdown_event.clear()
+    inference.published_actions_history.clear()
+    args = argparse.Namespace(
+        chunk_size=2,
+        state_history_len=60,
+        state_history_fps=30.0,
+        state_history_max_gap_seconds=0.02,
+        start_immediately=True,
+        replay_attempt_dir=None,
+        max_attempts=5,
+        recovery_tactile_ignore_seconds=0.0,
+        publish_rate=30,
+        observation_poll_rate=200,
+        max_publish_step=2,
+        instruction="test",
+        case_id="test",
+        use_actions_interpolation=False,
+        arm_steps_length=[0.01] * 7,
+        gripper_offset=0.0,
+        no_publish=False,
+        memory_log=tmp_path / "runtime.jsonl",
+        quit_key="q",
+        success_key="s",
+    )
+    operator = _FakeOperator()
+    operator.tactile = _FakeTactile()
+    policy = _FiveFailurePolicy()
+
+    inference.run_closed_loop(args, operator, policy, captioner=None)
+
+    assert policy.modes.count("execution") == 5
+    assert policy.modes.count("assessment") == 5
+    assert policy.modes.count("reasoning") == 4
+    assert [prompt.count("failure_reason=") for prompt in policy.reasoning_prompts] == [1, 2, 3, 4]
+    events = [json.loads(line) for line in args.memory_log.read_text().splitlines()]
+    failures = [event for event in events if event["event"] == "need_recovery"]
+    assert [event["memory_pairs"] for event in failures] == [1, 2, 3, 4, 4]
+    assert [event["reasoning_skipped"] for event in failures] == [False, False, False, False, True]
+
+
+@pytest.mark.parametrize(
+    ("metadata_overrides", "max_attempts", "message"),
+    [
+        ({"max_memory_pairs": 3}, 5, "memory mismatch"),
+        ({"max_supported_attempts": 4}, 5, "attempt limit mismatch"),
+        ({}, 6, "supports at most"),
+    ],
+)
+def test_client_rejects_server_memory_or_attempt_limit_mismatch(
+    metadata_overrides: dict[str, int],
+    max_attempts: int,
+    message: str,
+) -> None:
+    policy = _FiveFailurePolicy()
+    original = policy.get_server_metadata
+    policy.get_server_metadata = lambda: original() | metadata_overrides
+    with pytest.raises(ValueError, match=message):
+        inference.run_closed_loop(
+            argparse.Namespace(max_attempts=max_attempts),
+            _FakeOperator(),
+            policy,
+            captioner=None,
+        )
+
+
+def test_client_rejects_unexpected_data_profile() -> None:
+    policy = _FiveFailurePolicy()
+    with pytest.raises(ValueError, match="data profile mismatch"):
+        inference.run_closed_loop(
+            argparse.Namespace(max_attempts=5, expected_data_profile="rotation_v4"),
+            _FakeOperator(),
+            policy,
+            captioner=None,
+        )
+
+
 def test_server_monitor_mode_never_samples_actions() -> None:
     policy = object.__new__(server.TactileVLAPolicy)
     policy._prepare_observation = lambda request: ("transformed", "observation")
@@ -335,3 +443,35 @@ def test_v3_server_model_config_restores_state_history_from_checkpoint_config() 
     assert model_config.state_history_len == 60
     assert model_config.state_history_dim == 7
     assert model_config.history_hidden_dim == 256
+
+
+def test_v4_server_warmup_exercises_four_pair_memory() -> None:
+    class FakePolicy:
+        def __init__(self) -> None:
+            self._config = SimpleNamespace(use_state_history=False)
+            self._prompt_profile = "minimal_v1"
+            self.metadata = {
+                "data_profile": "rotation_v4",
+                "prompt_profile": "minimal_v1",
+                "grammar_profile": "v3_full_v1",
+                "use_state_history": False,
+            }
+            self.reasoning_prompt = ""
+
+        def infer(self, payload):
+            if payload["mode"] == "execution":
+                return {"actions": np.zeros((30, 7), dtype=np.float32)}
+            if payload["mode"] == "assessment":
+                return {"need_recovery": True, "failure_reason": "failure"}
+            if payload["mode"] == "failure":
+                return {"failure_reason": "failure"}
+            if payload["mode"] == "reasoning":
+                self.reasoning_prompt = payload["prompt"]
+                return {"recovery_plan": "plan"}
+            raise AssertionError(payload["mode"])
+
+    policy = FakePolicy()
+    summary = v3_server.warm_up(policy)
+
+    assert summary["reasoning_memory_pairs"] == 4
+    assert policy.reasoning_prompt.count("failure_reason=") == 4

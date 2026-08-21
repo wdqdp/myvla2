@@ -33,6 +33,9 @@ os.environ.setdefault("HF_HOME", str(PROJECT_ROOT / ".cache" / "huggingface"))
 os.environ.setdefault("HF_DATASETS_CACHE", str(PROJECT_ROOT / ".cache" / "huggingface" / "datasets"))
 os.environ.setdefault("TORCH_HOME", str(PROJECT_ROOT / ".cache" / "torch"))
 os.environ.setdefault("OPENPI_DATA_HOME", "/data1/outputs/openpi_cache")
+# The JAX training entrypoint never uses TensorFlow.  Prevent Transformers
+# from importing an unrelated TF installation during model module discovery.
+os.environ.setdefault("USE_TF", "0")
 
 from flax import nnx
 from flax.training import common_utils
@@ -73,6 +76,9 @@ from tactile_vla.vla.openpi_bridge import build_transform
 from tactile_vla.vla.openpi_bridge import collate_numpy
 from tactile_vla.vla.prompts import MINIMAL_PROMPT_PROFILE
 from tactile_vla.vla.prompts import resolve_prompt_profile
+from tactile_vla.vla.v4_data import ROTATION_V4
+from tactile_vla.vla.v4_data import V4_TRAINING_INDEX_SCHEMA
+from tactile_vla.vla.v4_data import validate_v4_index_dataset
 
 
 def parse_args() -> argparse.Namespace:
@@ -130,15 +136,102 @@ def init_logging() -> None:
     )
 
 
+def validate_v4_args(args: argparse.Namespace) -> None:
+    if args.data_profile != ROTATION_V4:
+        return
+    if args.prompt_profile != MINIMAL_PROMPT_PROFILE:
+        raise ValueError("rotation_v4 Stage A requires prompt_profile='minimal_v1'")
+    if args.no_norm:
+        raise ValueError("rotation_v4 Stage A requires its train-index norm stats")
+
+
+V4_STAGE_A_PROTOCOL = {
+    "split": "train",
+    "batch_size": 8,
+    "num_steps": 15_000,
+    "lr": 5e-5,
+    "lr_final": 5e-7,
+    "lr_transition_steps": 7_000,
+    "save_interval": 1_000,
+    "keep_period": 5_000,
+    "action_horizon": 30,
+    "action_dim": 32,
+    "use_state_history": True,
+    "state_history_len": 60,
+    "state_history_dim": 7,
+    "history_hidden_dim": 256,
+    "max_token_len": 200,
+    "paligemma_variant": "gemma_2b_lora",
+    "action_expert_variant": "gemma_300m_lora",
+    "train_lora_only": True,
+    "allow_random_init": False,
+}
+
+
+def validate_v4_training_protocol(args: argparse.Namespace) -> None:
+    if args.data_profile != ROTATION_V4:
+        return
+    mismatches = {
+        key: {"requested": getattr(args, key), "required": expected}
+        for key, expected in V4_STAGE_A_PROTOCOL.items()
+        if getattr(args, key) != expected
+    }
+    requested_checkpoint = Path(str(args.checkpoint)).expanduser().resolve()
+    required_checkpoint = DEFAULT_BASE_CHECKPOINT.expanduser().resolve()
+    if requested_checkpoint != required_checkpoint:
+        mismatches["checkpoint"] = {
+            "requested": str(requested_checkpoint),
+            "required": str(required_checkpoint),
+        }
+    if mismatches:
+        raise ValueError(f"rotation_v4 Stage A protocol mismatch: {mismatches}")
+
+
+def validate_v4_resume_config(saved: dict[str, Any], args: argparse.Namespace) -> None:
+    if args.data_profile != ROTATION_V4:
+        return
+    keys = (
+        *V4_STAGE_A_PROTOCOL,
+        "data_profile",
+        "prompt_profile",
+        "weight_decay",
+        "grad_clip",
+        "log_interval",
+        "seed",
+        "precision",
+        "ema_decay",
+        "fsdp_devices",
+        "video_backend",
+    )
+    mismatches = {
+        key: {"saved": saved.get(key), "requested": getattr(args, key)}
+        for key in keys
+        if saved.get(key) != getattr(args, key)
+    }
+    saved_checkpoint = Path(str(saved.get("checkpoint", ""))).expanduser().resolve()
+    requested_checkpoint = Path(str(args.checkpoint)).expanduser().resolve()
+    if saved_checkpoint != requested_checkpoint:
+        mismatches["checkpoint"] = {
+            "saved": str(saved_checkpoint),
+            "requested": str(requested_checkpoint),
+        }
+    if mismatches:
+        raise ValueError(f"rotation_v4 Stage A resume config mismatch: {mismatches}")
+
+
 def ensure_index(args: argparse.Namespace) -> dict:
     if args.index_file.exists():
         payload = json.loads(args.index_file.read_text())
         validate_index_action_horizon(payload, args.action_horizon, index_path=args.index_file)
+        if args.data_profile == ROTATION_V4:
+            if payload.get("schema_version") != V4_TRAINING_INDEX_SCHEMA:
+                raise ValueError("rotation_v4 requires the dedicated V4 unified training index")
+            validate_v4_index_dataset(payload, args.dataset_dir)
         return payload
     if args.data_profile != LEGACY_DATA_PROFILE:
         raise FileNotFoundError(
             f"Versioned data profile index does not exist: {args.index_file}. "
-            "Run scripts/prepare_rotation_moderately_profile.py first."
+            "Run the matching versioned profile/index preparation command first."
         )
     records = scan_lerobot_frames(args.dataset_dir)
     splits = load_or_create_splits(records, args.split_file, SplitConfig(seed=args.seed))
@@ -174,6 +267,11 @@ def build_loader(
         state_history_len=args.state_history_len if args.use_state_history else 0,
         video_backend=args.video_backend,
         prompt_profile=args.prompt_profile,
+        dataset_repo_id=(
+            "tactile_vla_rotation_v4"
+            if args.data_profile == ROTATION_V4
+            else "tactile_vla"
+        ),
     )
     transformed = TransformedTactileVLADataset(
         dataset,
@@ -435,6 +533,8 @@ def main() -> None:
     if args.train_lora_only and "lora" not in args.paligemma_variant and "lora" not in args.action_expert_variant:
         raise ValueError("--train-lora-only requires LoRA model variants.")
     args.prompt_profile = resolve_prompt_profile(args.prompt_profile)
+    validate_v4_args(args)
+    validate_v4_training_protocol(args)
     if args.max_frames is not None and not args.dry_run:
         raise ValueError("--max-frames is only supported for --dry-run in profile-bound training")
     if args.data_profile == ROTATION_MODERATELY_SUCCESS_V1:
@@ -495,11 +595,13 @@ def main() -> None:
             "Versioned Stage A index does not contain the required 98,233 action starts"
         )
     if not args.no_norm and args.data_profile != LEGACY_DATA_PROFILE:
-        validate_norm_stats_identity(
+        norm_summary = validate_norm_stats_identity(
             args.norm_stats_dir / "summary.json",
             identity,
             context="Stage A norm stats",
         )
+        if args.data_profile == ROTATION_V4:
+            identity["norm_stats_sha256"] = norm_summary["norm_stats_sha256"]
     loader = build_loader(args, model_config, index)
     first_batch = next(iter(loader))
     if args.dry_run:
@@ -520,6 +622,7 @@ def main() -> None:
             identity,
             context="Stage A resume",
         )
+        validate_v4_resume_config(saved_config, args)
     if jax.process_index() == 0 and not resuming:
         config_payload = vars(args) | {
             "artifact_identity": identity,

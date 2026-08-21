@@ -35,6 +35,9 @@ from openpi.shared import array_typing as at
 from openpi.training import weight_loaders
 from tactile_vla.vla.artifacts import assert_identity_matches
 from tactile_vla.vla.artifacts import checkpoint_artifact_identity
+from tactile_vla.vla.artifacts import checkpoint_step_number
+from tactile_vla.vla.artifacts import selected_best_metrics_summary
+from tactile_vla.vla.artifacts import sha256_file
 from tactile_vla.vla.data_profiles import ROTATION_MODERATELY_SUCCESS_V1
 from tactile_vla.vla.stage_b_v3_checkpoint import CHECKPOINT_FORMAT
 from tactile_vla.vla.stage_b_v3_checkpoint import cast_frozen_params
@@ -42,6 +45,7 @@ from tactile_vla.vla.stage_b_v3_checkpoint import delta_params
 from tactile_vla.vla.stage_b_v3_checkpoint import merge_delta_params
 from tactile_vla.vla.stage_b_v3_checkpoint import trainable_filter
 from tactile_vla.vla.stage_b_v3_model import StageBV3Model
+from tactile_vla.vla.v4_data import ROTATION_V4
 
 
 MERGED_CHECKPOINT_FORMAT = "stage_b_v3_merged_full_v1"
@@ -93,6 +97,52 @@ def _find_config(path: Path) -> tuple[Path, dict[str, Any]]:
         if candidate.is_file():
             return candidate, json.loads(candidate.read_text())
     raise FileNotFoundError(f"Cannot find Stage B config.json near {path}")
+
+
+def validate_versioned_merge_layout(
+    *,
+    config: dict[str, Any],
+    delta_dir: Path,
+    stage_a_checkpoint: Path,
+    output: Path,
+) -> dict[str, Any] | None:
+    data_profile = str(config.get("data_profile", "legacy"))
+    if data_profile not in {ROTATION_MODERATELY_SUCCESS_V1, ROTATION_V4}:
+        return None
+    if delta_dir.parent.name != "best":
+        raise ValueError(f"{data_profile} may merge only the selected best delta")
+    if output.name != "merged_best":
+        raise ValueError(
+            f"{data_profile} merged output must be an independent merged_best directory"
+        )
+    if data_profile == ROTATION_V4:
+        checkpoint_step = checkpoint_step_number(
+            stage_a_checkpoint,
+            context="rotation_v4 merge Stage A checkpoint",
+        )
+        recorded_step = config.get("stage_a_checkpoint_step")
+        if recorded_step is not None and recorded_step != checkpoint_step:
+            raise ValueError(
+                "rotation_v4 Stage B config checkpoint step mismatch: "
+                f"recorded={recorded_step!r}, actual={checkpoint_step}"
+            )
+        identity = checkpoint_artifact_identity(config)
+        norm_sha = str(identity.get("norm_stats_sha256", ""))
+        if len(norm_sha) != 64:
+            raise ValueError("rotation_v4 Stage B delta lacks a valid norm_stats_sha256 identity")
+        metrics_path = delta_dir.parent / "metrics.json"
+        if not metrics_path.is_file():
+            raise FileNotFoundError(metrics_path)
+        metrics = json.loads(metrics_path.read_text())
+        return {
+            "summary": selected_best_metrics_summary(
+                metrics,
+                action_loss_degradation_limit=config.get("action_loss_degradation_limit"),
+                context="rotation_v4 best metrics",
+            ),
+            "sha256": sha256_file(metrics_path),
+        }
+    return None
 
 
 def _model_config(config: dict[str, Any]) -> Pi0Config:
@@ -202,15 +252,12 @@ def main() -> None:
         checkpoint_artifact_identity(config),
         context="Stage B merge Stage A checkpoint",
     )
-    if config.get("data_profile") == ROTATION_MODERATELY_SUCCESS_V1:
-        if delta_dir.parent.name != "best":
-            raise ValueError(
-                "rotation_moderately_success_v1 may merge only the selected best delta"
-            )
-        if args.output.name != "merged_best":
-            raise ValueError(
-                "rotation_moderately_success_v1 merged output must be an independent merged_best directory"
-            )
+    best_metrics_artifact = validate_versioned_merge_layout(
+        config=config,
+        delta_dir=delta_dir,
+        stage_a_checkpoint=requested_stage_a,
+        output=args.output,
+    )
     output = args.output.expanduser().resolve()
     if not args.dry_run and output.exists() and not args.overwrite:
         raise FileExistsError(f"Output already exists: {output}; use --overwrite to replace it")
@@ -256,6 +303,11 @@ def main() -> None:
         stage_a_checkpoint=str(requested_stage_a),
         stage_b_delta=str(delta_dir),
     )
+    if config.get("data_profile") == ROTATION_V4:
+        merged_config["stage_a_checkpoint_step"] = checkpoint_step_number(
+            requested_stage_a,
+            context="rotation_v4 merge Stage A checkpoint",
+        )
     (output / "config.json").write_text(
         json.dumps(merged_config, indent=2, ensure_ascii=False, default=str) + "\n"
     )
@@ -267,7 +319,15 @@ def main() -> None:
         "output_params": str(params_dir),
         "delta_parameter_count": delta_count,
         "total_parameter_count": total_count,
+        "data_profile": config.get("data_profile"),
+        "artifact_identity": checkpoint_artifact_identity(config),
+        "norm_stats_sha256": checkpoint_artifact_identity(config).get("norm_stats_sha256"),
     }
+    if merged_config.get("stage_a_checkpoint_step") is not None:
+        manifest["stage_a_checkpoint_step"] = merged_config["stage_a_checkpoint_step"]
+    if best_metrics_artifact is not None:
+        manifest["selected_best_metrics"] = best_metrics_artifact["summary"]
+        manifest["selected_best_metrics_sha256"] = best_metrics_artifact["sha256"]
     (output / "merge_manifest.json").write_text(
         json.dumps(manifest, indent=2, ensure_ascii=False) + "\n"
     )

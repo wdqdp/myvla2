@@ -53,7 +53,16 @@ from tactile_vla.vla.prompts import build_assessment_prompt
 from tactile_vla.vla.prompts import build_execution_prompt
 from tactile_vla.vla.prompts import build_failure_prompt
 from tactile_vla.vla.prompts import build_reasoning_prompt
+from tactile_vla.vla.prompts import MAX_MEMORY_PAIRS
+from tactile_vla.vla.prompts import MAX_SUPPORTED_ATTEMPTS
+from tactile_vla.vla.prompts import MINIMAL_PROMPT_PROFILE
+from tactile_vla.vla.artifacts import assert_identity_matches
+from tactile_vla.vla.artifacts import checkpoint_artifact_identity
+from tactile_vla.vla.artifacts import checkpoint_step_number
 from tactile_vla.vla.artifacts import load_checkpoint_prompt_profile
+from tactile_vla.vla.artifacts import validate_merged_best_metrics
+from tactile_vla.vla.artifacts import validate_norm_stats_identity
+from tactile_vla.vla.v4_data import ROTATION_V4
 
 
 def parse_args() -> argparse.Namespace:
@@ -88,6 +97,77 @@ def _find_config(path: Path) -> dict[str, Any]:
 def _params_dir(path: Path) -> Path:
     path = path.resolve()
     return path / "params" if (path / "params").exists() else path
+
+
+def _checkpoint_root(path: Path) -> Path:
+    root = path.expanduser().resolve()
+    return root.parent if root.name == "params" else root
+
+
+def validate_v4_serve_artifacts(
+    args: argparse.Namespace,
+    config: dict[str, Any],
+) -> dict[str, Any] | None:
+    if config.get("data_profile") != ROTATION_V4:
+        return None
+    if args.no_norm:
+        raise ValueError("rotation_v4 serving requires its versioned norm stats")
+    if load_checkpoint_prompt_profile(config) != MINIMAL_PROMPT_PROFILE:
+        raise ValueError("rotation_v4 serving requires prompt_profile='minimal_v1'")
+    if config.get("checkpoint_format") != "stage_b_v3_merged_full_v1":
+        raise ValueError("rotation_v4 serving requires a merged full Stage B checkpoint")
+    if _checkpoint_root(args.checkpoint).name != "merged_best":
+        raise ValueError("rotation_v4 serving requires the independent merged_best directory")
+
+    delta_dir = Path(str(config.get("stage_b_delta", ""))).expanduser().resolve()
+    if delta_dir.name != "delta_params" or delta_dir.parent.name != "best":
+        raise ValueError("rotation_v4 merged config must identify the selected best delta")
+    stage_a_checkpoint = Path(str(config.get("stage_a_checkpoint", ""))).expanduser().resolve()
+    stage_a_step = checkpoint_step_number(
+        stage_a_checkpoint,
+        context="rotation_v4 serving Stage A checkpoint",
+    )
+    if config.get("stage_a_checkpoint_step") != stage_a_step:
+        raise ValueError(
+            "rotation_v4 merged config Stage A checkpoint step mismatch: "
+            f"recorded={config.get('stage_a_checkpoint_step')!r}, actual={stage_a_step}"
+        )
+
+    identity = checkpoint_artifact_identity(config)
+    manifest_path = _checkpoint_root(args.checkpoint) / "merge_manifest.json"
+    if not manifest_path.is_file():
+        raise FileNotFoundError(manifest_path)
+    manifest = json.loads(manifest_path.read_text())
+    if manifest.get("stage_a_checkpoint") != str(stage_a_checkpoint):
+        raise ValueError("rotation_v4 merge manifest Stage A checkpoint mismatch")
+    if manifest.get("stage_a_checkpoint_step") != stage_a_step:
+        raise ValueError("rotation_v4 merge manifest Stage A checkpoint step mismatch")
+    if manifest.get("stage_b_delta") != str(delta_dir):
+        raise ValueError("rotation_v4 merge manifest Stage B delta mismatch")
+    assert_identity_matches(
+        manifest.get("artifact_identity", {}),
+        identity,
+        context="rotation_v4 serve merged identity",
+    )
+    if manifest.get("norm_stats_sha256") != identity.get("norm_stats_sha256"):
+        raise ValueError("rotation_v4 merge manifest norm_stats_sha256 mismatch")
+    validate_merged_best_metrics(
+        _checkpoint_root(args.checkpoint),
+        manifest,
+        config,
+        context="rotation_v4 serve",
+    )
+    summary = validate_norm_stats_identity(
+        args.norm_stats_dir / "summary.json",
+        identity,
+        context="rotation_v4 serve norm stats",
+    )
+    expected_norm_sha = str(identity.get("norm_stats_sha256", ""))
+    if len(expected_norm_sha) != 64 or summary.get("norm_stats_sha256") != expected_norm_sha:
+        raise ValueError(
+            "rotation_v4 serve norm_stats_sha256 does not match checkpoint identity"
+        )
+    return summary
 
 
 def _precision(value: str | None, config: dict[str, Any]) -> str:
@@ -216,6 +296,8 @@ class TactileVLAPolicyV3:
             "name": "tactile_vla_policy_v3",
             "stage_b_version": "v3_autoregressive",
             "prompt_profile": self._prompt_profile,
+            "data_profile": str(config.get("data_profile", "legacy")),
+            "norm_stats_sha256": checkpoint_artifact_identity(config).get("norm_stats_sha256"),
             "grammar_profile": grammar_profile,
             "checkpoint": str(args.checkpoint),
             "action_horizon": model_config.action_horizon,
@@ -232,6 +314,8 @@ class TactileVLAPolicyV3:
             "supports_recovery_generation": True,
             "reasoning_max_token_len": reasoning_max_len,
             "reasoning_window_frames": int(config.get("reasoning_window_frames", 15)),
+            "max_memory_pairs": MAX_MEMORY_PAIRS,
+            "max_supported_attempts": MAX_SUPPORTED_ATTEMPTS,
             "training_target_coverage": config.get("training_target_coverage"),
             "config": config,
         }
@@ -391,6 +475,38 @@ def warm_up(policy: TactileVLAPolicyV3) -> dict[str, Any]:
             ),
         }
     )
+    reasoning_memory = [
+        {
+            "recovery_plan": "initial plan",
+            "failure_reason": "failure_reason=rotate right,grasp appropriate.",
+        }
+    ]
+    if policy.metadata["data_profile"] == ROTATION_V4:
+        reasoning_memory.extend(
+            [
+                {
+                    "recovery_plan": (
+                        "recovery_plan=move horizontally right moderately, "
+                        "move vertically none moderately."
+                    ),
+                    "failure_reason": "failure_reason=rotate left,grasp appropriate.",
+                },
+                {
+                    "recovery_plan": (
+                        "recovery_plan=move horizontally left slightly, "
+                        "move vertically none moderately."
+                    ),
+                    "failure_reason": "failure_reason=rotate front,grasp appropriate.",
+                },
+                {
+                    "recovery_plan": (
+                        "recovery_plan=move horizontally front slightly, "
+                        "move vertically none moderately."
+                    ),
+                    "failure_reason": "failure_reason=rotate back,grasp appropriate.",
+                },
+            ]
+        )
     reasoning = policy.infer(
         base
         | {
@@ -398,12 +514,7 @@ def warm_up(policy: TactileVLAPolicyV3) -> dict[str, Any]:
             "prompt": build_reasoning_prompt(
                 instruction="dry run",
                 failed_tactile_caption="Touch[rotation=clockwise]",
-                failure_recovery_memory=[
-                    {
-                        "recovery_plan": "initial plan",
-                        "failure_reason": "failure_reason=rotate right,grasp appropriate.",
-                    }
-                ],
+                failure_recovery_memory=reasoning_memory,
                 prompt_profile=policy._prompt_profile,  # noqa: SLF001
             ),
         }
@@ -425,15 +536,21 @@ def warm_up(policy: TactileVLAPolicyV3) -> dict[str, Any]:
         "assessment_failure_reason": assessment.get("failure_reason"),
         "failure_reason": failure["failure_reason"],
         "recovery_plan": reasoning["recovery_plan"],
+        "reasoning_memory_pairs": len(reasoning_memory),
     }
 
 
 def main() -> None:
     args = parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s", force=True)
+    logging.info("Validating checkpoint and norm artifacts: %s", args.checkpoint)
     config = _find_config(args.checkpoint)
+    validate_v4_serve_artifacts(args, config)
     model_config = _model_config(args, config)
     norm_stats = None if args.no_norm else normalize.load(args.norm_stats_dir)
+    logging.info(
+        "Loading model parameters (the merged checkpoint is several GiB; this can take a while)"
+    )
     policy = TactileVLAPolicyV3(
         args=args,
         config=config,

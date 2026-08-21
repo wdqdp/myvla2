@@ -43,6 +43,8 @@ from tactile_vla.vla.prompts import build_execution_prompt
 from tactile_vla.vla.prompts import build_failure_prompt
 from tactile_vla.vla.prompts import build_monitor_prompt
 from tactile_vla.vla.prompts import build_reasoning_prompt
+from tactile_vla.vla.prompts import MAX_MEMORY_PAIRS
+from tactile_vla.vla.prompts import MAX_SUPPORTED_ATTEMPTS
 from tactile_vla.vla.prompts import resolve_prompt_profile
 from tactile_vla.vla.prompts import update_failure_recovery_memory
 
@@ -819,8 +821,32 @@ def run_failure_diagnosis(
 def run_closed_loop(args: argparse.Namespace, operator: RosOperator | ReplayOperator, policy, captioner) -> None:
     server_metadata = policy.get_server_metadata()
     print(f"Server metadata: {server_metadata}")
+    expected_data_profile = getattr(args, "expected_data_profile", None)
+    server_data_profile = str(server_metadata.get("data_profile", "legacy"))
+    if expected_data_profile is not None and server_data_profile != expected_data_profile:
+        raise ValueError(
+            "Client/server data profile mismatch: "
+            f"expected={expected_data_profile!r}, server={server_data_profile!r}"
+        )
     args.prompt_profile = resolve_prompt_profile(server_metadata.get("prompt_profile"))
     print(f"Using checkpoint prompt profile: {args.prompt_profile}")
+    server_max_memory_pairs = int(server_metadata.get("max_memory_pairs", MAX_MEMORY_PAIRS))
+    server_max_attempts = int(server_metadata.get("max_supported_attempts", MAX_SUPPORTED_ATTEMPTS))
+    if server_max_memory_pairs != MAX_MEMORY_PAIRS:
+        raise ValueError(
+            "Client/server recovery memory mismatch: "
+            f"client={MAX_MEMORY_PAIRS}, server={server_max_memory_pairs}"
+        )
+    if server_max_attempts != MAX_SUPPORTED_ATTEMPTS:
+        raise ValueError(
+            "Client/server attempt limit mismatch: "
+            f"client={MAX_SUPPORTED_ATTEMPTS}, server={server_max_attempts}"
+        )
+    if not 1 <= args.max_attempts <= MAX_SUPPORTED_ATTEMPTS:
+        raise ValueError(
+            f"Requested max_attempts={args.max_attempts}, but server supports at most "
+            f"{MAX_SUPPORTED_ATTEMPTS} attempts"
+        )
     args.v3_autoregressive = str(server_metadata.get("stage_b_version", "")).startswith("v3_")
     args.v3_shared_assessment = args.v3_autoregressive and bool(
         server_metadata.get("supports_shared_assessment", False)
@@ -1112,11 +1138,13 @@ def run_closed_loop(args: argparse.Namespace, operator: RosOperator | ReplayOper
                     "recovery_plan": memory_plan,
                     "failure_reason": failure_reason,
                 }
-                memory = update_failure_recovery_memory(
-                    memory,
-                    entry,
-                    prompt_profile=args.prompt_profile,
-                )
+                will_reason = attempt_id < args.max_attempts
+                if will_reason:
+                    memory = update_failure_recovery_memory(
+                        memory,
+                        entry,
+                        prompt_profile=args.prompt_profile,
+                    )
                 append_runtime_log(
                     args,
                     {
@@ -1126,13 +1154,15 @@ def run_closed_loop(args: argparse.Namespace, operator: RosOperator | ReplayOper
                         "captured_step": recovery_result.captured_step,
                         "lag_steps": max(0, step - recovery_result.captured_step),
                         "memory_entry": entry,
+                        "memory_pairs": len(memory),
+                        "reasoning_skipped": not will_reason,
                         "need_recovery_probs": recovery_result.response.get("need_recovery_probs"),
                         "failure_reason_probs": recovery_result.response.get("failure_reason_probs"),
                         "tactile_caption": recovery_result.tactile_caption,
                     },
                 )
                 print(f"need_recovery=true failure_reason={failure_reason}; discarding the remaining chunk")
-                if attempt_id >= args.max_attempts:
+                if not will_reason:
                     print("Reached max attempts after recovery trigger")
                     return
                 input_recovery_plan = run_reasoning(
@@ -1203,6 +1233,10 @@ def get_arguments() -> tuple[argparse.Namespace, argparse.ArgumentParser]:
     parser.add_argument("--use_actions_interpolation", action="store_true", default=False)
     parser.add_argument("--host", type=str, default="localhost")
     parser.add_argument("--port", type=int, default=8000)
+    parser.add_argument(
+        "--expected-data-profile",
+        help="Refuse to run if server metadata does not advertise this exact data profile.",
+    )
     parser.add_argument("--mock-policy", action="store_true")
     parser.add_argument("--no-publish", action="store_true")
     parser.add_argument("--replay-attempt-dir", type=Path)

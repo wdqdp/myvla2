@@ -28,6 +28,7 @@ os.environ.setdefault("HF_HOME", str(PROJECT_ROOT / ".cache" / "huggingface"))
 os.environ.setdefault("HF_DATASETS_CACHE", str(PROJECT_ROOT / ".cache" / "huggingface" / "datasets"))
 os.environ.setdefault("TORCH_HOME", str(PROJECT_ROOT / ".cache" / "torch"))
 os.environ.setdefault("OPENPI_DATA_HOME", "/data1/outputs/openpi_cache")
+os.environ.setdefault("USE_TF", "0")
 
 from flax import nnx
 from flax import traverse_util
@@ -54,6 +55,7 @@ from tactile_vla.common.metrics import classification_report
 from tactile_vla.vla.artifacts import artifact_identity
 from tactile_vla.vla.artifacts import assert_identity_matches
 from tactile_vla.vla.artifacts import checkpoint_artifact_identity
+from tactile_vla.vla.artifacts import checkpoint_step_number
 from tactile_vla.vla.artifacts import LEGACY_DATA_PROFILE
 from tactile_vla.vla.artifacts import sha256_file
 from tactile_vla.vla.artifacts import validate_norm_stats_identity
@@ -80,6 +82,7 @@ from tactile_vla.vla.openpi_bridge import TactileVLAFrameDataset
 from tactile_vla.vla.openpi_bridge import TransformedTactileVLADataset
 from tactile_vla.vla.openpi_bridge import V3RecoveryManifestDataset
 from tactile_vla.vla.openpi_bridge import V3StageBFrameDataset
+from tactile_vla.vla.openpi_bridge import V4DirectManifestDataset
 from tactile_vla.vla.stage_b_v3_model import StageBV3Model
 from tactile_vla.vla.structured_generation import constrained_greedy_generate_full_forward
 from tactile_vla.vla.structured_text import ConstrainedTokenGrammar
@@ -89,6 +92,9 @@ from tactile_vla.vla.structured_text import legal_failure_reasons
 from tactile_vla.vla.structured_text import legal_recovery_plans
 from tactile_vla.vla.prompts import MINIMAL_PROMPT_PROFILE
 from tactile_vla.vla.prompts import resolve_prompt_profile
+from tactile_vla.vla.v4_data import ROTATION_V4
+from tactile_vla.vla.v4_data import V4_TRAINING_INDEX_SCHEMA
+from tactile_vla.vla.v4_data import validate_v4_index_dataset
 
 
 DEFAULT_DATASET_DIR = Path("/data1/tac_data/lerobot_data/tactile_vla_v3")
@@ -101,7 +107,7 @@ DEFAULT_NORM_STATS_DIR = Path(
 )
 DEFAULT_OUTPUT_DIR = Path("/data1/outputs/vla/stage_b_v3")
 DEFAULT_STAGE_A_CHECKPOINT = Path(
-    "/data1/outputs/vla/stage_a_action/pi05_delta_tac_rotation_moderately_v1/10000"
+    "/data1/outputs/vla/stage_a_action/pi05_delta_tac_rotation_moderately_v1/15000"
 )
 
 
@@ -171,12 +177,152 @@ def init_logging() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s", force=True)
 
 
+def validate_v4_args(args: argparse.Namespace) -> None:
+    if args.data_profile != ROTATION_V4:
+        return
+    if args.prompt_profile != MINIMAL_PROMPT_PROFILE:
+        raise ValueError("rotation_v4 Stage B requires prompt_profile='minimal_v1'")
+    if args.no_norm:
+        raise ValueError("rotation_v4 Stage B requires its train-index norm stats")
+
+
+V4_STAGE_B_PROTOCOL = {
+    "batch_size": 8,
+    "num_steps": 4_000,
+    "lr": 1e-4,
+    "eval_interval": 500,
+    "save_interval": 1_000,
+    "keep_period": 1_000,
+    "action_horizon": 30,
+    "action_dim": 32,
+    "use_state_history": True,
+    "state_history_len": 60,
+    "state_history_dim": 7,
+    "state_history_fps": 30.0,
+    "history_hidden_dim": 256,
+    "max_token_len": 200,
+    "reasoning_max_token_len": 320,
+    "reasoning_window_frames": 15,
+    "status_negative_ratio": 3.0,
+    "need_hidden_dim": 512,
+    "need_dropout": 0.1,
+    "action_loss_weight": 1.0,
+    "need_loss_weight": 1.0,
+    "failure_loss_weight": 1.0,
+    "plan_loss_weight": 1.0,
+    "action_loss_degradation_limit": 0.10,
+    "paligemma_variant": "gemma_2b_lora",
+    "action_expert_variant": "gemma_300m_lora",
+    "grammar_profile": "v3_full_v1",
+}
+V4_STAGE_B_TRAINABLE_COMPONENTS = ("paligemma_lora", "need_head")
+V4_STAGE_B_FROZEN_COMPONENTS = ("action_expert", "paligemma_non_lora")
+
+
+def validate_v4_training_protocol(args: argparse.Namespace) -> None:
+    if args.data_profile != ROTATION_V4:
+        return
+    mismatches = {
+        key: {"requested": getattr(args, key), "required": required}
+        for key, required in V4_STAGE_B_PROTOCOL.items()
+        if getattr(args, key) != required
+    }
+    if mismatches:
+        raise ValueError(f"rotation_v4 Stage B protocol mismatch: {mismatches}")
+
+
+def validate_v4_resume_config(
+    saved: dict[str, Any],
+    args: argparse.Namespace,
+    *,
+    actual_precision: str,
+) -> None:
+    if args.data_profile != ROTATION_V4:
+        return
+    keys = (
+        *V4_STAGE_B_PROTOCOL,
+        "data_profile",
+        "prompt_profile",
+        "weight_decay",
+        "grad_clip",
+        "seed",
+        "log_interval",
+        "eval_max_need_samples",
+        "fsdp_devices",
+        "video_backend",
+    )
+    mismatches = {
+        key: {"saved": saved.get(key), "requested": getattr(args, key)}
+        for key in keys
+        if saved.get(key) != getattr(args, key)
+    }
+    if saved.get("precision") != actual_precision:
+        mismatches["precision"] = {
+            "saved": saved.get("precision"),
+            "requested": actual_precision,
+        }
+    expected_trainable = list(V4_STAGE_B_TRAINABLE_COMPONENTS)
+    expected_frozen = list(V4_STAGE_B_FROZEN_COMPONENTS)
+    if saved.get("trainable_components") != expected_trainable:
+        mismatches["trainable_components"] = {
+            "saved": saved.get("trainable_components"),
+            "requested": expected_trainable,
+        }
+    if saved.get("frozen_components") != expected_frozen:
+        mismatches["frozen_components"] = {
+            "saved": saved.get("frozen_components"),
+            "requested": expected_frozen,
+        }
+    if mismatches:
+        raise ValueError(f"rotation_v4 Stage B resume config mismatch: {mismatches}")
+
+
+def validate_stage_a_checkpoint_step(
+    data_profile: str,
+    checkpoint: Path,
+) -> int | None:
+    if data_profile not in {ROTATION_MODERATELY_SUCCESS_V1, ROTATION_V4}:
+        return None
+    context = f"{data_profile} Stage B Stage A checkpoint"
+    return checkpoint_step_number(checkpoint, context=context)
+
+
 def resolve_params_dir(path: Path) -> Path:
     path = path.resolve()
     return path / "params" if (path / "params").exists() else path
 
 
-def ensure_v3_index(args: argparse.Namespace) -> tuple[dict[str, Any], list[FrameRecord]]:
+def ensure_v3_index(args: argparse.Namespace) -> tuple[dict[str, Any], list[Any]]:
+    if args.data_profile == ROTATION_V4:
+        if args.overwrite_index:
+            raise ValueError("rotation_v4 unified indices are immutable and cannot be rebuilt by training")
+        if not args.index_file.is_file():
+            raise FileNotFoundError(
+                f"V4 unified index does not exist: {args.index_file}. "
+                "Run scripts/prepare_v4_training_index.py first."
+            )
+        payload = json.loads(args.index_file.read_text())
+        expected = {
+            "reasoning_window_frames": args.reasoning_window_frames,
+            "action_horizon": args.action_horizon,
+            "status_negative_ratio": args.status_negative_ratio,
+        }
+        actual_values = {
+            "reasoning_window_frames": payload.get("failure_window_length"),
+            "action_horizon": payload.get("action_horizon"),
+            "status_negative_ratio": payload.get("status_negative_ratio"),
+        }
+        for key, expected_value in expected.items():
+            actual = actual_values[key]
+            if float(actual) != float(expected_value):
+                raise ValueError(
+                    f"V4 index {key}={actual!r}, expected {expected_value!r}; regenerate the V4 index"
+                )
+        if payload.get("schema_version") != V4_TRAINING_INDEX_SCHEMA:
+            raise ValueError("rotation_v4 requires the dedicated V4 unified training index")
+        frames, _ = validate_v4_index_dataset(payload, args.dataset_dir)
+        return payload, frames
+
     all_records = scan_lerobot_frames(args.dataset_dir)
     records = (
         select_profile_records(all_records)
@@ -311,7 +457,7 @@ def build_loaders(
     args: argparse.Namespace,
     model_config: Pi0Config,
     index: dict[str, Any],
-    records: list[FrameRecord],
+    records: list[Any],
     tokenizer: openpi_tokenizer.PaligemmaTokenizer,
     failure_codec: ConstrainedTokenGrammar,
     plan_codec: ConstrainedTokenGrammar,
@@ -347,12 +493,21 @@ def build_loaders(
         norm_stats=norm_stats,
         use_quantile_norm=not args.no_norm,
     )
-    frame_lookup = {
-        (record.original_episode_id, record.attempt_id, record.frame_index): record.global_index
-        for record in records
-    }
+    frame_lookup = (
+        {
+            (record.original_episode_id, record.attempt_id, record.frame_index): record.global_index
+            for record in records
+        }
+        if args.data_profile != ROTATION_V4
+        else {}
+    )
+    structured_repo_id = (
+        "tactile_vla_rotation_v4"
+        if args.data_profile == ROTATION_V4
+        else "tactile_vla_v3"
+    )
     shared_structured_dataset = LeRobotDataset(
-        "tactile_vla_v3",
+        structured_repo_id,
         root=args.dataset_dir,
         download_videos=False,
         video_backend=args.video_backend,
@@ -366,7 +521,11 @@ def build_loaders(
             for step in range(-(args.state_history_len - 1), 1)
         ]
     shared_action_dataset = LeRobotDataset(
-        "tactile_vla",
+        (
+            "tactile_vla_rotation_v4"
+            if args.data_profile == ROTATION_V4
+            else "tactile_vla"
+        ),
         root=args.dataset_dir,
         delta_timestamps=action_delta_timestamps,
         download_videos=False,
@@ -389,6 +548,11 @@ def build_loaders(
                 fps=args.state_history_fps,
                 video_backend=args.video_backend,
                 prompt_profile=args.prompt_profile,
+                dataset_repo_id=(
+                    "tactile_vla_rotation_v4"
+                    if args.data_profile == ROTATION_V4
+                    else "tactile_vla"
+                ),
                 lerobot_dataset=shared_action_dataset,
             ),
             regular_transform,
@@ -397,33 +561,67 @@ def build_loaders(
         # prompt and the same structured ``Answer:`` prefix. This keeps the
         # training representation identical to the shared assessment request
         # used by the deployment server.
-        need_dataset = TransformedTactileVLADataset(
-            V3StageBFrameDataset(
+        if args.data_profile == ROTATION_V4:
+            need_raw = V4DirectManifestDataset(
+                dataset_dir=args.dataset_dir,
+                manifest_file=split_index["status_manifest_file"],
+                manifest_row_indices=split_index["status_manifest_row_indices"],
+                global_indices=split_index["status_indices"],
+                task="need",
+                expected_manifest_sha256=split_index["status_manifest_sha256"],
+                expected_split=split,
+                video_backend=args.video_backend,
+                prompt_profile=args.prompt_profile,
+                dataset_repo_id=structured_repo_id,
+                lerobot_dataset=shared_structured_dataset,
+            )
+            failure_raw = V4DirectManifestDataset(
+                dataset_dir=args.dataset_dir,
+                manifest_file=split_index["failure_reason_manifest_file"],
+                manifest_row_indices=split_index["failure_reason_manifest_row_indices"],
+                global_indices=split_index["failure_reason_indices"],
+                task="failure",
+                expected_manifest_sha256=split_index["failure_reason_manifest_sha256"],
+                expected_split=split,
+                video_backend=args.video_backend,
+                prompt_profile=args.prompt_profile,
+                dataset_repo_id=structured_repo_id,
+                lerobot_dataset=shared_structured_dataset,
+            )
+            plan_raw = V4DirectManifestDataset(
+                dataset_dir=args.dataset_dir,
+                manifest_file=split_index["reasoning_manifest_file"],
+                manifest_row_indices=split_index["reasoning_manifest_row_indices"],
+                global_indices=split_index["reasoning_indices"],
+                task="plan",
+                expected_manifest_sha256=split_index["reasoning_manifest_sha256"],
+                expected_split=split,
+                video_backend=args.video_backend,
+                prompt_profile=args.prompt_profile,
+                dataset_repo_id=structured_repo_id,
+                lerobot_dataset=shared_structured_dataset,
+            )
+        else:
+            need_raw = V3StageBFrameDataset(
                 dataset_dir=args.dataset_dir,
                 indices=split_index["status_indices"],
                 task="need_recovery",
                 video_backend=args.video_backend,
                 prompt_profile=args.prompt_profile,
                 lerobot_dataset=shared_structured_dataset,
-            ),
-            assessment_transform,
-        )
-        failure_dataset = TransformedTactileVLADataset(
-            V3StageBFrameDataset(
+            )
+            failure_raw = V3StageBFrameDataset(
                 dataset_dir=args.dataset_dir,
                 indices=split_index["failure_reason_indices"],
                 task="failure_reason",
                 video_backend=args.video_backend,
                 prompt_profile=args.prompt_profile,
                 lerobot_dataset=shared_structured_dataset,
-            ),
-            failure_transform,
-        )
-        plan_manifest = args.reasoning_manifest_dir / f"{split}.jsonl"
-        if not plan_manifest.is_file():
-            raise FileNotFoundError(plan_manifest)
-        plan_dataset = TransformedTactileVLADataset(
-            V3RecoveryManifestDataset(
+            )
+            plan_manifest = args.reasoning_manifest_dir / f"{split}.jsonl"
+            if not plan_manifest.is_file():
+                raise FileNotFoundError(plan_manifest)
+            plan_raw = V3RecoveryManifestDataset(
                 dataset_dir=args.dataset_dir,
                 manifest_file=plan_manifest,
                 frame_lookup=frame_lookup,
@@ -432,9 +630,10 @@ def build_loaders(
                 video_backend=args.video_backend,
                 prompt_profile=args.prompt_profile,
                 lerobot_dataset=shared_structured_dataset,
-            ),
-            plan_transform,
-        )
+            )
+        need_dataset = TransformedTactileVLADataset(need_raw, assessment_transform)
+        failure_dataset = TransformedTactileVLADataset(failure_raw, failure_transform)
+        plan_dataset = TransformedTactileVLADataset(plan_raw, plan_transform)
         result[split] = {
             "action": _loader(
                 action_dataset,
@@ -929,7 +1128,7 @@ def evaluate_text(
     grammar: ConstrainedTokenGrammar,
     data_sharding: jax.sharding.Sharding,
     *,
-    max_samples: int,
+    max_samples: int | None,
 ) -> dict[str, Any]:
     model = nnx.merge(state.model_def, state.params)
     model.eval()
@@ -938,6 +1137,8 @@ def evaluate_text(
     total = 0
     direction_correct: Counter[str] = Counter()
     direction_total: Counter[str] = Counter()
+    direction_magnitude_correct: Counter[str] = Counter()
+    direction_magnitude_total: Counter[str] = Counter()
 
     def direction_for(text: str) -> str:
         pattern = (
@@ -947,6 +1148,16 @@ def evaluate_text(
         )
         match = re.search(pattern, text)
         return match.group(1) if match else "unknown"
+
+    def direction_magnitude_for(text: str) -> str:
+        if task != "plan":
+            return ""
+        match = re.search(
+            r"move horizontally (left|right|front|back|none) "
+            r"(slightly|moderately|significantly)",
+            text,
+        )
+        return f"{match.group(1)}/{match.group(2)}" if match else "unknown"
 
     def result() -> dict[str, Any]:
         return {
@@ -958,6 +1169,13 @@ def evaluate_text(
                     "support": support,
                 }
                 for direction, support in sorted(direction_total.items())
+            },
+            "by_direction_magnitude": {
+                combination: {
+                    "exact_match": direction_magnitude_correct[combination] / support,
+                    "support": support,
+                }
+                for combination, support in sorted(direction_magnitude_total.items())
             },
         }
 
@@ -979,13 +1197,62 @@ def evaluate_text(
             target = grammar.texts[int(text_indices[batch_index])]
             matched = int(prediction == target)
             direction = direction_for(target)
+            direction_magnitude = direction_magnitude_for(target)
             correct += matched
             total += 1
             direction_correct[direction] += matched
             direction_total[direction] += 1
-            if total >= max_samples:
+            if direction_magnitude:
+                direction_magnitude_correct[direction_magnitude] += matched
+                direction_magnitude_total[direction_magnitude] += 1
+            if max_samples is not None and total >= max_samples:
                 return result()
     return result()
+
+
+def text_eval_sample_limit(data_profile: str, requested_limit: int) -> int | None:
+    """V4 validates every terminal manifest row; older profiles keep their cap."""
+
+    return None if data_profile == ROTATION_V4 else requested_limit
+
+
+def validate_text_eval_coverage(
+    data_profile: str,
+    failure_metrics: dict[str, Any],
+    plan_metrics: dict[str, Any],
+) -> None:
+    if data_profile not in {ROTATION_MODERATELY_SUCCESS_V1, ROTATION_V4}:
+        return
+    required_directions = {"left", "right", "front", "back"}
+    for task_name, task_metrics in (
+        ("failure", failure_metrics),
+        ("plan", plan_metrics),
+    ):
+        covered = {
+            direction
+            for direction, values in task_metrics["by_direction"].items()
+            if int(values["support"]) > 0
+        }
+        if covered != required_directions:
+            raise ValueError(
+                f"{task_name} validation direction coverage mismatch: {sorted(covered)}"
+            )
+    if data_profile == ROTATION_V4:
+        required_combinations = {
+            f"{direction}/{magnitude}"
+            for direction in required_directions
+            for magnitude in ("moderately", "slightly")
+        }
+        covered_combinations = {
+            combination
+            for combination, values in plan_metrics["by_direction_magnitude"].items()
+            if int(values["support"]) > 0
+        }
+        if covered_combinations != required_combinations:
+            raise ValueError(
+                "plan validation direction/magnitude coverage mismatch: "
+                f"{sorted(covered_combinations)}"
+            )
 
 
 def write_jsonl(path: Path, payload: dict[str, Any]) -> None:
@@ -998,6 +1265,8 @@ def main() -> None:
     args = parse_args()
     init_logging()
     args.prompt_profile = resolve_prompt_profile(args.prompt_profile)
+    validate_v4_args(args)
+    validate_v4_training_protocol(args)
     if args.overwrite and args.resume:
         raise ValueError("--overwrite and --resume are mutually exclusive")
     if args.reasoning_window_frames != 15:
@@ -1101,32 +1370,34 @@ def main() -> None:
         != EXPECTED_ACTION_COUNTS["all"]
     ):
         raise ValueError("Stage B action replay index must contain exactly 98,233 action starts")
-    reasoning_identity = validate_reasoning_manifests(
-        args.reasoning_manifest_dir,
-        require_single_memory=args.data_profile == ROTATION_MODERATELY_SUCCESS_V1,
-    )
-    identity["reasoning_manifest_identity"] = reasoning_identity
+    if args.data_profile == ROTATION_V4:
+        reasoning_identity = identity["reasoning_manifest_identity"]
+    else:
+        reasoning_identity = validate_reasoning_manifests(
+            args.reasoning_manifest_dir,
+            require_single_memory=args.data_profile == ROTATION_MODERATELY_SUCCESS_V1,
+        )
+        identity["reasoning_manifest_identity"] = reasoning_identity
 
+    if not args.no_norm:
+        norm_summary = validate_norm_stats_identity(
+            args.norm_stats_dir / "summary.json",
+            identity,
+            context="Stage B norm stats",
+        )
+        if args.data_profile == ROTATION_V4:
+            identity["norm_stats_sha256"] = norm_summary["norm_stats_sha256"]
+
+    stage_a_checkpoint_step = validate_stage_a_checkpoint_step(
+        args.data_profile,
+        args.stage_a_checkpoint,
+    )
     if not args.dry_run:
         stage_a_config_path, stage_a_config = _find_checkpoint_config(args.stage_a_checkpoint)
-        if args.data_profile == ROTATION_MODERATELY_SUCCESS_V1:
-            checkpoint_step = args.stage_a_checkpoint.resolve()
-            if checkpoint_step.name == "params":
-                checkpoint_step = checkpoint_step.parent
-            if checkpoint_step.name != "10000":
-                raise ValueError(
-                    "rotation_moderately_success_v1 Stage B must initialize from Stage A step 10000"
-                )
         assert_identity_matches(
             checkpoint_artifact_identity(stage_a_config),
             identity,
             context=f"Stage B Stage A checkpoint ({stage_a_config_path})",
-        )
-    if not args.no_norm:
-        validate_norm_stats_identity(
-            args.norm_stats_dir / "summary.json",
-            identity,
-            context="Stage B norm stats",
         )
     loaders = build_loaders(
         args,
@@ -1214,6 +1485,7 @@ def main() -> None:
                     f"Delta resume model config mismatch for {key}: "
                     f"saved={saved!r}, requested={requested!r}"
                 )
+        validate_v4_resume_config(saved_config, args, actual_precision=precision)
     if jax.process_index() == 0 and not resuming:
         run_dir.mkdir(parents=True, exist_ok=True)
         config_payload = vars(args) | {
@@ -1229,9 +1501,14 @@ def main() -> None:
                     for direction in ("right", "left", "front", "back")
                 ],
                 "recovery_plan": [
-                    f"recovery_plan=move horizontally {direction} moderately, "
+                    f"recovery_plan=move horizontally {direction} {magnitude}, "
                     "move vertically none moderately."
                     for direction in ("right", "left", "front", "back")
+                    for magnitude in (
+                        ("moderately", "slightly")
+                        if args.data_profile == ROTATION_V4
+                        else ("moderately",)
+                    )
                 ],
             },
             "artifact_identity": identity,
@@ -1248,6 +1525,9 @@ def main() -> None:
                 "loop_rng",
                 "model_rng_state",
             ],
+            "trainable_components": list(V4_STAGE_B_TRAINABLE_COMPONENTS),
+            "frozen_components": list(V4_STAGE_B_FROZEN_COMPONENTS),
+            "stage_a_checkpoint_step": stage_a_checkpoint_step,
         }
         (run_dir / "config.json").write_text(
             json.dumps(config_payload, indent=2, default=str, ensure_ascii=False) + "\n"
@@ -1397,7 +1677,10 @@ def main() -> None:
                 "failure",
                 failure_codec,
                 data_sharding,
-                max_samples=args.eval_max_text_samples,
+                max_samples=text_eval_sample_limit(
+                    args.data_profile,
+                    args.eval_max_text_samples,
+                ),
             )
             plan_metrics = evaluate_text(
                 state,
@@ -1405,23 +1688,16 @@ def main() -> None:
                 "plan",
                 plan_codec,
                 data_sharding,
-                max_samples=args.eval_max_text_samples,
+                max_samples=text_eval_sample_limit(
+                    args.data_profile,
+                    args.eval_max_text_samples,
+                ),
             )
-            if args.data_profile == ROTATION_MODERATELY_SUCCESS_V1:
-                required_directions = {"left", "right", "front", "back"}
-                for task_name, task_metrics in (
-                    ("failure", failure_metrics),
-                    ("plan", plan_metrics),
-                ):
-                    covered = {
-                        direction
-                        for direction, values in task_metrics["by_direction"].items()
-                        if int(values["support"]) > 0
-                    }
-                    if covered != required_directions:
-                        raise ValueError(
-                            f"{task_name} validation direction coverage mismatch: {sorted(covered)}"
-                        )
+            validate_text_eval_coverage(
+                args.data_profile,
+                failure_metrics,
+                plan_metrics,
+            )
             degradation = action_loss / baseline_action_loss - 1.0
             score = float(
                 (

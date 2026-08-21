@@ -168,6 +168,13 @@ def _poll_control_key(args: argparse.Namespace, keyboard: Any, *, phase: Phase) 
 def validate_server_metadata(args: argparse.Namespace, metadata: dict[str, Any]) -> None:
     if not bool(metadata.get("action_only_ablation", False)):
         raise ValueError("Connected server is not the action-only forced-recovery ablation server")
+    expected_data_profile = getattr(args, "expected_data_profile", None)
+    server_data_profile = str(metadata.get("data_profile", "legacy"))
+    if expected_data_profile is not None and server_data_profile != expected_data_profile:
+        raise ValueError(
+            "Client/server data profile mismatch: "
+            f"expected={expected_data_profile!r}, server={server_data_profile!r}"
+        )
     if not bool(metadata.get("supports_action_noise", False)):
         raise ValueError("Ablation server does not advertise supports_action_noise=true")
     noise_shape = tuple(int(value) for value in metadata.get("action_noise_shape", ()))
@@ -581,6 +588,10 @@ def get_arguments() -> tuple[argparse.Namespace, argparse.ArgumentParser]:
     parser.add_argument("--config_path", type=Path)
     parser.add_argument("--host", default="localhost")
     parser.add_argument("--port", type=int, default=8000)
+    parser.add_argument(
+        "--expected-data-profile",
+        help="Refuse to run if server metadata does not advertise this exact data profile.",
+    )
     parser.add_argument("--instruction", default=DEFAULT_INSTRUCTION)
     parser.add_argument(
         "--rotation-direction",

@@ -9,6 +9,8 @@ from typing import Any
 LEGACY_PROMPT_PROFILE = "legacy"
 MINIMAL_PROMPT_PROFILE = "minimal_v1"
 PROMPT_PROFILES = (LEGACY_PROMPT_PROFILE, MINIMAL_PROMPT_PROFILE)
+MAX_MEMORY_PAIRS = 4
+MAX_SUPPORTED_ATTEMPTS = MAX_MEMORY_PAIRS + 1
 
 
 def resolve_prompt_profile(profile: str | None) -> str:
@@ -77,7 +79,12 @@ def update_failure_recovery_memory(
 
     updated_entry = dict(entry)
     if resolve_prompt_profile(prompt_profile) == MINIMAL_PROMPT_PROFILE:
-        return [updated_entry]
+        if len(memory) >= MAX_MEMORY_PAIRS:
+            raise ValueError(
+                f"minimal_v1 recovery memory already contains the maximum "
+                f"{MAX_MEMORY_PAIRS} pairs; refusing to discard the initial pair"
+            )
+        return [*memory, updated_entry]
     return [*memory, updated_entry]
 
 

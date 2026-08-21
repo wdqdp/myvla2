@@ -40,7 +40,15 @@ from openpi.shared import normalize
 from tactile_vla.vla.openpi_bridge import build_action_output_transform
 from tactile_vla.vla.openpi_bridge import build_transform
 from tactile_vla.vla.stage_b_v3_model import StageBV3Model
+from tactile_vla.vla.artifacts import assert_identity_matches
+from tactile_vla.vla.artifacts import checkpoint_artifact_identity
+from tactile_vla.vla.artifacts import checkpoint_step_number
+from tactile_vla.vla.artifacts import validate_merged_best_metrics
+from tactile_vla.vla.artifacts import validate_norm_stats_identity
+from tactile_vla.vla.prompts import build_execution_prompt
+from tactile_vla.vla.prompts import MINIMAL_PROMPT_PROFILE
 from tactile_vla.vla.prompts import resolve_prompt_profile
+from tactile_vla.vla.v4_data import ROTATION_V4
 
 
 ACTION_HORIZON = 30
@@ -76,6 +84,73 @@ def _params_dir(path: Path) -> Path:
     if not params_dir.is_dir():
         raise FileNotFoundError(f"Checkpoint params directory not found: {params_dir}")
     return params_dir
+
+
+def validate_v4_norm_artifacts(
+    args: argparse.Namespace,
+    config: dict[str, Any],
+) -> dict[str, Any] | None:
+    if config.get("data_profile") != ROTATION_V4:
+        return None
+    if resolve_prompt_profile(config.get("prompt_profile")) != MINIMAL_PROMPT_PROFILE:
+        raise ValueError("rotation_v4 action serving requires prompt_profile='minimal_v1'")
+    checkpoint_root = args.checkpoint.expanduser().resolve()
+    if checkpoint_root.name == "params":
+        checkpoint_root = checkpoint_root.parent
+    identity = checkpoint_artifact_identity(config)
+    if args.checkpoint_kind == "stage-a":
+        checkpoint_step_number(
+            checkpoint_root,
+            context="rotation_v4 Stage A action serving checkpoint",
+        )
+    else:
+        if checkpoint_root.name != "merged_best":
+            raise ValueError("rotation_v4 Stage B action serving requires merged_best")
+        stage_a_checkpoint = Path(str(config.get("stage_a_checkpoint", ""))).expanduser().resolve()
+        stage_a_step = checkpoint_step_number(
+            stage_a_checkpoint,
+            context="rotation_v4 merged action serving Stage A checkpoint",
+        )
+        if config.get("stage_a_checkpoint_step") != stage_a_step:
+            raise ValueError(
+                "rotation_v4 merged config Stage A checkpoint step mismatch: "
+                f"recorded={config.get('stage_a_checkpoint_step')!r}, actual={stage_a_step}"
+            )
+        manifest_path = checkpoint_root / "merge_manifest.json"
+        if not manifest_path.is_file():
+            raise FileNotFoundError(manifest_path)
+        manifest = json.loads(manifest_path.read_text())
+        if manifest.get("stage_a_checkpoint") != str(stage_a_checkpoint):
+            raise ValueError("rotation_v4 merge manifest Stage A checkpoint mismatch")
+        if manifest.get("stage_a_checkpoint_step") != stage_a_step:
+            raise ValueError("rotation_v4 merge manifest Stage A checkpoint step mismatch")
+        delta_dir = Path(str(config.get("stage_b_delta", ""))).expanduser().resolve()
+        if manifest.get("stage_b_delta") != str(delta_dir):
+            raise ValueError("rotation_v4 merge manifest Stage B delta mismatch")
+        assert_identity_matches(
+            manifest.get("artifact_identity", {}),
+            identity,
+            context="rotation_v4 action serve merged identity",
+        )
+        if manifest.get("norm_stats_sha256") != identity.get("norm_stats_sha256"):
+            raise ValueError("rotation_v4 merge manifest norm_stats_sha256 mismatch")
+        validate_merged_best_metrics(
+            checkpoint_root,
+            manifest,
+            config,
+            context="rotation_v4 action serve",
+        )
+    summary = validate_norm_stats_identity(
+        args.norm_stats_dir / "summary.json",
+        identity,
+        context="rotation_v4 action serve norm stats",
+    )
+    expected_norm_sha = str(identity.get("norm_stats_sha256", ""))
+    if len(expected_norm_sha) != 64 or summary.get("norm_stats_sha256") != expected_norm_sha:
+        raise ValueError(
+            "rotation_v4 action serve norm_stats_sha256 does not match checkpoint identity"
+        )
+    return summary
 
 
 def _precision(value: str | None, config: dict[str, Any]) -> str:
@@ -202,6 +277,8 @@ class ActionOnlyAblationPolicy:
             "checkpoint_kind": args.checkpoint_kind,
             "checkpoint": str(args.checkpoint.resolve()),
             "prompt_profile": resolve_prompt_profile(config.get("prompt_profile")),
+            "data_profile": str(config.get("data_profile", "legacy")),
+            "norm_stats_sha256": checkpoint_artifact_identity(config).get("norm_stats_sha256"),
             "params_dir": str(params_dir),
             "config_path": str(config_path),
             "action_horizon": model_config.action_horizon,
@@ -302,10 +379,13 @@ def warm_up(policy: ActionOnlyAblationPolicy) -> dict[str, Any]:
                 (policy._config.state_history_len,),  # noqa: SLF001
                 dtype=np.bool_,
             ),
-            "prompt": (
-                "Mode: execution. Task: dry run. "
-                "Touch[area=none; Fx=near_zero; Fy=near_zero; Fz=near_zero; rotation=none] "
-                "Recovery plan: none. Output the next robot action chunk and monitor whether recovery is needed."
+            "prompt": build_execution_prompt(
+                instruction="dry run",
+                tactile_caption=(
+                    "Touch[area=none; Fx=near_zero; Fy=near_zero; "
+                    "Fz=near_zero; rotation=none]"
+                ),
+                prompt_profile=policy.metadata["prompt_profile"],
             ),
             "action_noise": np.zeros((ACTION_HORIZON, ACTION_DIM), dtype=np.float32),
         }
@@ -326,6 +406,7 @@ def main() -> None:
     args = parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s", force=True)
     config_path, config = _find_config(args.checkpoint)
+    validate_v4_norm_artifacts(args, config)
     model_config = _model_config(args, config)
     norm_stats = normalize.load(args.norm_stats_dir)
     policy = ActionOnlyAblationPolicy(
