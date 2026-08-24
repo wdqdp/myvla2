@@ -23,6 +23,7 @@ sys.path.insert(0, str(OPENPI_ROOT / "src"))
 os.environ.setdefault("HF_HOME", str(PROJECT_ROOT / ".cache" / "huggingface"))
 os.environ.setdefault("HF_DATASETS_CACHE", str(PROJECT_ROOT / ".cache" / "huggingface" / "datasets"))
 os.environ.setdefault("TORCH_HOME", str(PROJECT_ROOT / ".cache" / "torch"))
+os.environ.setdefault("USE_TF", "0")
 
 import jax
 import jax.numpy as jnp
@@ -47,8 +48,11 @@ from tactile_vla.vla.artifacts import validate_merged_best_metrics
 from tactile_vla.vla.artifacts import validate_norm_stats_identity
 from tactile_vla.vla.prompts import build_execution_prompt
 from tactile_vla.vla.prompts import MINIMAL_PROMPT_PROFILE
+from tactile_vla.vla.prompts import PHASE_PROMPT_PROFILE
 from tactile_vla.vla.prompts import resolve_prompt_profile
 from tactile_vla.vla.v4_data import ROTATION_V4
+from tactile_vla.vla.v5_phase_data import PHASE_EXPERIMENT_KIND
+from tactile_vla.vla.v5_phase_data import ROTATION_PHASE_V5
 
 
 ACTION_HORIZON = 30
@@ -90,10 +94,21 @@ def validate_v4_norm_artifacts(
     args: argparse.Namespace,
     config: dict[str, Any],
 ) -> dict[str, Any] | None:
-    if config.get("data_profile") != ROTATION_V4:
+    data_profile = config.get("data_profile")
+    if data_profile not in {ROTATION_V4, ROTATION_PHASE_V5}:
         return None
-    if resolve_prompt_profile(config.get("prompt_profile")) != MINIMAL_PROMPT_PROFILE:
-        raise ValueError("rotation_v4 action serving requires prompt_profile='minimal_v1'")
+    expected_prompt = (
+        PHASE_PROMPT_PROFILE if data_profile == ROTATION_PHASE_V5 else MINIMAL_PROMPT_PROFILE
+    )
+    if resolve_prompt_profile(config.get("prompt_profile")) != expected_prompt:
+        raise ValueError(
+            f"{data_profile} action serving requires prompt_profile={expected_prompt!r}"
+        )
+    if data_profile == ROTATION_PHASE_V5:
+        if config.get("experiment_kind") != PHASE_EXPERIMENT_KIND:
+            raise ValueError("rotation_phase_v5 serving requires experiment_kind='phase_prompt_only'")
+        if args.checkpoint_kind != "stage-a":
+            raise ValueError("V5 prompt-only phase validation has no Stage B checkpoint")
     checkpoint_root = args.checkpoint.expanduser().resolve()
     if checkpoint_root.name == "params":
         checkpoint_root = checkpoint_root.parent
@@ -101,7 +116,7 @@ def validate_v4_norm_artifacts(
     if args.checkpoint_kind == "stage-a":
         checkpoint_step_number(
             checkpoint_root,
-            context="rotation_v4 Stage A action serving checkpoint",
+            context=f"{data_profile} Stage A action serving checkpoint",
         )
     else:
         if checkpoint_root.name != "merged_best":
@@ -143,12 +158,17 @@ def validate_v4_norm_artifacts(
     summary = validate_norm_stats_identity(
         args.norm_stats_dir / "summary.json",
         identity,
-        context="rotation_v4 action serve norm stats",
+        context=f"{data_profile} action serve norm stats",
     )
-    expected_norm_sha = str(identity.get("norm_stats_sha256", ""))
+    expected_norm_sha = str(
+        identity.get(
+            "v4_norm_stats_sha256" if data_profile == ROTATION_PHASE_V5 else "norm_stats_sha256",
+            "",
+        )
+    )
     if len(expected_norm_sha) != 64 or summary.get("norm_stats_sha256") != expected_norm_sha:
         raise ValueError(
-            "rotation_v4 action serve norm_stats_sha256 does not match checkpoint identity"
+            f"{data_profile} action serve norm_stats_sha256 does not match checkpoint identity"
         )
     return summary
 
@@ -177,7 +197,7 @@ def _model_config(args: argparse.Namespace, config: dict[str, Any]) -> Pi0Config
     )
     if (model_config.action_horizon, model_config.action_dim) != (ACTION_HORIZON, ACTION_DIM):
         raise ValueError(
-            "Forced-recovery ablation requires action noise [30,32], but checkpoint config has "
+            "Forced-phase ablation requires action noise [30,32], but checkpoint config has "
             f"[{model_config.action_horizon},{model_config.action_dim}]"
         )
     if not model_config.use_state_history:
@@ -278,7 +298,10 @@ class ActionOnlyAblationPolicy:
             "checkpoint": str(args.checkpoint.resolve()),
             "prompt_profile": resolve_prompt_profile(config.get("prompt_profile")),
             "data_profile": str(config.get("data_profile", "legacy")),
-            "norm_stats_sha256": checkpoint_artifact_identity(config).get("norm_stats_sha256"),
+            "norm_stats_sha256": (
+                checkpoint_artifact_identity(config).get("norm_stats_sha256")
+                or checkpoint_artifact_identity(config).get("v4_norm_stats_sha256")
+            ),
             "params_dir": str(params_dir),
             "config_path": str(config_path),
             "action_horizon": model_config.action_horizon,

@@ -13,6 +13,8 @@ from typing import Any
 LEGACY_DATA_PROFILE = "legacy"
 ROTATION_V4_DATA_PROFILE = "rotation_v4"
 ROTATION_V4_INDEX_SCHEMA = "tactile_vla_v4_training_index_v1"
+ROTATION_V5_DATA_PROFILE = "rotation_phase_v5"
+ROTATION_V5_INDEX_SCHEMA = "tactile_vla_v5_prompt_training_index_v1"
 
 BASE_IDENTITY_KEYS = (
     "data_profile",
@@ -32,6 +34,19 @@ V4_IDENTITY_KEYS = (
     "reasoning_manifest_identity",
     "lerobot_identity",
     "norm_stats_sha256",
+)
+V5_IDENTITY_KEYS = (
+    "experiment_kind",
+    "selection_hash",
+    "v4_profile_config_hash",
+    "training_data_hash",
+    "source_file_hashes",
+    "phase_boundaries_identity",
+    "action_phase_manifest_identity",
+    "v4_training_data_hash",
+    "v4_lerobot_identity",
+    "h30_target_identity",
+    "v4_norm_stats_sha256",
 )
 ALL_IDENTITY_KEYS = BASE_IDENTITY_KEYS + V4_IDENTITY_KEYS
 
@@ -136,6 +151,23 @@ def artifact_identity(
         "index_sha256": sha256_file(index_path),
         "index_file": str(Path(index_path).expanduser().resolve()),
     }
+
+    def hashes_only(value: Any, *, version: str) -> Any:
+        if isinstance(value, Mapping):
+            if "sha256" in value:
+                digest = str(value["sha256"])
+                if len(digest) != 64:
+                    raise ValueError(f"Invalid {version} source SHA256: {digest!r}")
+                return digest
+            return {
+                str(key): hashes_only(child, version=version)
+                for key, child in sorted(value.items())
+            }
+        digest = str(value)
+        if len(digest) != 64:
+            raise ValueError(f"Invalid {version} source SHA256: {digest!r}")
+        return digest
+
     if data_profile == ROTATION_V4_DATA_PROFILE:
         if payload.get("schema_version") != ROTATION_V4_INDEX_SCHEMA:
             raise ValueError(
@@ -163,24 +195,47 @@ def artifact_identity(
         if not isinstance(source_files, Mapping) or not source_files:
             raise ValueError("V4 unified index lacks source file hashes")
 
-        def hashes_only(value: Any) -> Any:
-            if isinstance(value, Mapping):
-                if "sha256" in value:
-                    digest = str(value["sha256"])
-                    if len(digest) != 64:
-                        raise ValueError(f"Invalid V4 source SHA256: {digest!r}")
-                    return digest
-                return {str(key): hashes_only(child) for key, child in sorted(value.items())}
-            digest = str(value)
-            if len(digest) != 64:
-                raise ValueError(f"Invalid V4 source SHA256: {digest!r}")
-            return digest
-
         identity.update(
             {
                 **required,
                 "training_data_hash": stored_training_hash,
-                "source_file_hashes": hashes_only(source_files),
+                "source_file_hashes": hashes_only(source_files, version="V4"),
+            }
+        )
+    elif data_profile == ROTATION_V5_DATA_PROFILE:
+        if payload.get("schema_version") != ROTATION_V5_INDEX_SCHEMA:
+            raise ValueError(
+                "rotation_phase_v5 requires the dedicated prompt-only V5 index schema; "
+                f"got {payload.get('schema_version')!r}"
+            )
+        stored_training_hash = str(payload.get("training_data_hash", ""))
+        calculated_training_hash = sha256_json(
+            {key: value for key, value in payload.items() if key != "training_data_hash"}
+        )
+        if not stored_training_hash or stored_training_hash != calculated_training_hash:
+            raise ValueError("V5 training_data_hash does not match the unified index payload")
+        required = {
+            "experiment_kind": payload.get("experiment_kind"),
+            "selection_hash": payload.get("selection_hash"),
+            "v4_profile_config_hash": payload.get("v4_profile_config_hash"),
+            "phase_boundaries_identity": payload.get("phase_boundaries_identity"),
+            "action_phase_manifest_identity": payload.get("action_phase_manifest_identity"),
+            "v4_training_data_hash": payload.get("v4_training_data_hash"),
+            "v4_lerobot_identity": payload.get("v4_lerobot_identity"),
+            "h30_target_identity": payload.get("h30_target_identity"),
+            "v4_norm_stats_sha256": payload.get("v4_norm_stats_sha256"),
+        }
+        missing = sorted(key for key, value in required.items() if not value)
+        if missing:
+            raise ValueError(f"V5 unified index lacks identity fields: {missing}")
+        source_files = payload.get("source_files")
+        if not isinstance(source_files, Mapping) or not source_files:
+            raise ValueError("V5 unified index lacks source file hashes")
+        identity.update(
+            {
+                **required,
+                "training_data_hash": stored_training_hash,
+                "source_file_hashes": hashes_only(source_files, version="V5"),
             }
         )
     return identity
@@ -194,12 +249,13 @@ def assert_identity_matches(
     keys: Sequence[str] | None = None,
 ) -> None:
     if keys is None:
-        keys = (
-            ALL_IDENTITY_KEYS
-            if ROTATION_V4_DATA_PROFILE
-            in {saved.get("data_profile"), requested.get("data_profile")}
-            else BASE_IDENTITY_KEYS
-        )
+        profiles = {saved.get("data_profile"), requested.get("data_profile")}
+        if ROTATION_V4_DATA_PROFILE in profiles:
+            keys = ALL_IDENTITY_KEYS
+        elif ROTATION_V5_DATA_PROFILE in profiles:
+            keys = BASE_IDENTITY_KEYS + V5_IDENTITY_KEYS
+        else:
+            keys = BASE_IDENTITY_KEYS
     for key in keys:
         if saved.get(key) != requested.get(key):
             raise ValueError(
@@ -222,6 +278,7 @@ def checkpoint_artifact_identity(config: Mapping[str, Any]) -> dict[str, Any]:
             "index_sha256": config.get("index_sha256"),
             "index_file": config.get("index_file"),
             **{key: config.get(key) for key in V4_IDENTITY_KEYS},
+            **{key: config.get(key) for key in V5_IDENTITY_KEYS},
         }
     return dict(identity)
 
@@ -237,6 +294,34 @@ def validate_norm_stats_identity(
         raise FileNotFoundError(summary_path)
     summary = json.loads(summary_path.read_text())
     norm_identity = summary.get("artifact_identity", {})
+    if expected.get("data_profile") == ROTATION_V5_DATA_PROFILE:
+        if norm_identity.get("data_profile") != ROTATION_V4_DATA_PROFILE:
+            raise ValueError(f"{context} must reuse rotation_v4 norm stats")
+        if norm_identity.get("action_indices_identity") != expected.get("action_indices_identity"):
+            raise ValueError(f"{context} V4/V5 action indices differ")
+        v4_source_hash = (
+            expected.get("source_file_hashes", {}).get("v4_training_index")
+            if isinstance(expected.get("source_file_hashes"), Mapping)
+            else None
+        )
+        if v4_source_hash is not None and norm_identity.get("index_sha256") != v4_source_hash:
+            raise ValueError(f"{context} was computed from a different V4 training index")
+        norm_stats_path = summary_path.parent / "norm_stats.json"
+        if not norm_stats_path.is_file():
+            raise FileNotFoundError(norm_stats_path)
+        actual_norm_hash = sha256_file(norm_stats_path)
+        if (
+            summary.get("norm_stats_sha256") != actual_norm_hash
+            or expected.get("v4_norm_stats_sha256") != actual_norm_hash
+        ):
+            raise ValueError(f"{context} did not preserve the V4 norm SHA256")
+        expected_train = int(expected["action_indices_identity"]["train"]["count"])
+        if int(summary.get("num_frames", -1)) != expected_train:
+            raise ValueError(
+                f"{context} frame count mismatch: expected={expected_train}, "
+                f"actual={summary.get('num_frames')}"
+            )
+        return summary
     norm_keys = (
         tuple(
             key

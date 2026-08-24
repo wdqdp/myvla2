@@ -75,10 +75,15 @@ from tactile_vla.vla.openpi_bridge import TransformedTactileVLADataset
 from tactile_vla.vla.openpi_bridge import build_transform
 from tactile_vla.vla.openpi_bridge import collate_numpy
 from tactile_vla.vla.prompts import MINIMAL_PROMPT_PROFILE
+from tactile_vla.vla.prompts import PHASE_PROMPT_PROFILE
 from tactile_vla.vla.prompts import resolve_prompt_profile
 from tactile_vla.vla.v4_data import ROTATION_V4
 from tactile_vla.vla.v4_data import V4_TRAINING_INDEX_SCHEMA
 from tactile_vla.vla.v4_data import validate_v4_index_dataset
+from tactile_vla.vla.v5_phase_data import PHASE_EXPERIMENT_KIND
+from tactile_vla.vla.v5_phase_data import ROTATION_PHASE_V5
+from tactile_vla.vla.v5_phase_data import V5_TRAINING_INDEX_SCHEMA
+from tactile_vla.vla.v5_phase_data import validate_v5_training_index
 
 
 def parse_args() -> argparse.Namespace:
@@ -91,6 +96,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--run-name", default="pi05_delta_tac_rotation_moderately_v1")
     parser.add_argument("--data-profile", default=ROTATION_MODERATELY_SUCCESS_V1)
     parser.add_argument("--prompt-profile", default=MINIMAL_PROMPT_PROFILE)
+    parser.add_argument("--experiment-kind")
     parser.add_argument("--split", default="train", choices=("train", "val", "test"))
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--num-workers", type=int, default=2)
@@ -145,6 +151,17 @@ def validate_v4_args(args: argparse.Namespace) -> None:
         raise ValueError("rotation_v4 Stage A requires its train-index norm stats")
 
 
+def validate_v5_args(args: argparse.Namespace) -> None:
+    if args.data_profile != ROTATION_PHASE_V5:
+        return
+    if args.prompt_profile != PHASE_PROMPT_PROFILE:
+        raise ValueError("rotation_phase_v5 Stage A requires prompt_profile='phase_v1'")
+    if args.experiment_kind != PHASE_EXPERIMENT_KIND:
+        raise ValueError("rotation_phase_v5 Stage A requires experiment_kind='phase_prompt_only'")
+    if args.no_norm:
+        raise ValueError("rotation_phase_v5 Stage A must reuse the V4 norm stats")
+
+
 V4_STAGE_A_PROTOCOL = {
     "split": "train",
     "batch_size": 8,
@@ -166,14 +183,16 @@ V4_STAGE_A_PROTOCOL = {
     "train_lora_only": True,
     "allow_random_init": False,
 }
+V5_STAGE_A_PROTOCOL = {**V4_STAGE_A_PROTOCOL, "seed": 42}
 
 
 def validate_v4_training_protocol(args: argparse.Namespace) -> None:
-    if args.data_profile != ROTATION_V4:
+    if args.data_profile not in {ROTATION_V4, ROTATION_PHASE_V5}:
         return
+    protocol = V5_STAGE_A_PROTOCOL if args.data_profile == ROTATION_PHASE_V5 else V4_STAGE_A_PROTOCOL
     mismatches = {
         key: {"requested": getattr(args, key), "required": expected}
-        for key, expected in V4_STAGE_A_PROTOCOL.items()
+        for key, expected in protocol.items()
         if getattr(args, key) != expected
     }
     requested_checkpoint = Path(str(args.checkpoint)).expanduser().resolve()
@@ -184,16 +203,18 @@ def validate_v4_training_protocol(args: argparse.Namespace) -> None:
             "required": str(required_checkpoint),
         }
     if mismatches:
-        raise ValueError(f"rotation_v4 Stage A protocol mismatch: {mismatches}")
+        raise ValueError(f"{args.data_profile} Stage A protocol mismatch: {mismatches}")
 
 
 def validate_v4_resume_config(saved: dict[str, Any], args: argparse.Namespace) -> None:
-    if args.data_profile != ROTATION_V4:
+    if args.data_profile not in {ROTATION_V4, ROTATION_PHASE_V5}:
         return
+    protocol = V5_STAGE_A_PROTOCOL if args.data_profile == ROTATION_PHASE_V5 else V4_STAGE_A_PROTOCOL
     keys = (
-        *V4_STAGE_A_PROTOCOL,
+        *protocol,
         "data_profile",
         "prompt_profile",
+        *(("experiment_kind",) if args.data_profile == ROTATION_PHASE_V5 else ()),
         "weight_decay",
         "grad_clip",
         "log_interval",
@@ -216,7 +237,7 @@ def validate_v4_resume_config(saved: dict[str, Any], args: argparse.Namespace) -
             "requested": str(requested_checkpoint),
         }
     if mismatches:
-        raise ValueError(f"rotation_v4 Stage A resume config mismatch: {mismatches}")
+        raise ValueError(f"{args.data_profile} Stage A resume config mismatch: {mismatches}")
 
 
 def ensure_index(args: argparse.Namespace) -> dict:
@@ -227,6 +248,15 @@ def ensure_index(args: argparse.Namespace) -> dict:
             if payload.get("schema_version") != V4_TRAINING_INDEX_SCHEMA:
                 raise ValueError("rotation_v4 requires the dedicated V4 unified training index")
             validate_v4_index_dataset(payload, args.dataset_dir)
+        elif args.data_profile == ROTATION_PHASE_V5:
+            if payload.get("schema_version") != V5_TRAINING_INDEX_SCHEMA:
+                raise ValueError("rotation_phase_v5 requires the dedicated V5 prompt training index")
+            _, lookup = validate_v5_training_index(
+                payload,
+                index_path=args.index_file,
+                dataset_dir=args.dataset_dir,
+            )
+            args._v5_action_phase_lookup = lookup
         return payload
     if args.data_profile != LEGACY_DATA_PROFILE:
         raise FileNotFoundError(
@@ -259,6 +289,16 @@ def build_loader(
     if args.max_frames is not None:
         indices = indices[: args.max_frames]
     norm_stats = None if args.no_norm else normalize.load(args.norm_stats_dir)
+    phase_lookup = None
+    if args.data_profile == ROTATION_PHASE_V5:
+        phase_lookup = getattr(args, "_v5_action_phase_lookup", None)
+        if phase_lookup is None:
+            _, phase_lookup = validate_v5_training_index(
+                payload,
+                index_path=args.index_file,
+                dataset_dir=args.dataset_dir,
+            )
+            args._v5_action_phase_lookup = phase_lookup
     dataset = TactileVLAFrameDataset(
         dataset_dir=args.dataset_dir,
         indices=indices,
@@ -267,9 +307,10 @@ def build_loader(
         state_history_len=args.state_history_len if args.use_state_history else 0,
         video_backend=args.video_backend,
         prompt_profile=args.prompt_profile,
+        action_phase_by_global_index=phase_lookup,
         dataset_repo_id=(
             "tactile_vla_rotation_v4"
-            if args.data_profile == ROTATION_V4
+            if args.data_profile in {ROTATION_V4, ROTATION_PHASE_V5}
             else "tactile_vla"
         ),
     )
@@ -304,9 +345,27 @@ def print_batch_shapes(batch: dict) -> None:
 def print_dry_run_inputs(loader: DataLoader, batch: dict[str, Any]) -> None:
     raw_dataset = getattr(loader.dataset, "dataset", None)
     if raw_dataset is not None:
-        sample = raw_dataset[0]
         print(f"prompt_profile={raw_dataset.prompt_profile}")
-        print(f"text_prompt={sample['prompt']}")
+        phase_lookup = getattr(raw_dataset, "action_phase_by_global_index", None)
+        if phase_lookup:
+            shown: set[str] = set()
+            positions = {global_index: position for position, global_index in enumerate(raw_dataset.indices)}
+            for global_index in raw_dataset.indices:
+                phase_row = phase_lookup[global_index]
+                phase = str(phase_row["phase"])
+                if phase in shown:
+                    continue
+                sample = raw_dataset[positions[global_index]]
+                print(
+                    f"phase={phase} chunk_phase_pure={phase_row['chunk_phase_pure']} "
+                    f"text_prompt={sample['prompt']}"
+                )
+                shown.add(phase)
+                if len(shown) == 3:
+                    break
+        else:
+            sample = raw_dataset[0]
+            print(f"text_prompt={sample['prompt']}")
     print_batch_shapes(batch)
 
 
@@ -534,6 +593,7 @@ def main() -> None:
         raise ValueError("--train-lora-only requires LoRA model variants.")
     args.prompt_profile = resolve_prompt_profile(args.prompt_profile)
     validate_v4_args(args)
+    validate_v5_args(args)
     validate_v4_training_protocol(args)
     if args.max_frames is not None and not args.dry_run:
         raise ValueError("--max-frames is only supported for --dry-run in profile-bound training")

@@ -16,8 +16,11 @@ from tactile_vla.vla import labels as vla_labels
 from tactile_vla.vla.prompts import build_execution_prompt
 from tactile_vla.vla.prompts import build_failure_prompt
 from tactile_vla.vla.prompts import build_monitor_prompt
+from tactile_vla.vla.prompts import build_phase_prompt
 from tactile_vla.vla.prompts import build_recovery_prompt
 from tactile_vla.vla.prompts import build_reasoning_prompt
+from tactile_vla.vla.prompts import PHASE_PROMPT_PROFILE
+from tactile_vla.vla.prompts import resolve_prompt_profile
 from tactile_vla.vla.structured_text import ConstrainedTokenGrammar
 from tactile_vla.vla.structured_text import legal_failure_reasons
 from tactile_vla.vla.structured_text import legal_recovery_plans
@@ -278,6 +281,7 @@ class TactileVLAFrameDataset(torch.utils.data.Dataset):
         fps: float = 30.0,
         video_backend: str = "pyav",
         prompt_profile: str | None = None,
+        action_phase_by_global_index: Mapping[int, Mapping[str, Any]] | None = None,
         dataset_repo_id: str = "tactile_vla",
         lerobot_dataset: Any | None = None,
     ) -> None:
@@ -298,6 +302,19 @@ class TactileVLAFrameDataset(torch.utils.data.Dataset):
             raise ValueError(f"state_history_len must be non-negative, got {self.state_history_len}")
         self.fps = float(fps)
         self.prompt_profile = prompt_profile
+        self.action_phase_by_global_index = (
+            {int(index): dict(row) for index, row in action_phase_by_global_index.items()}
+            if action_phase_by_global_index is not None
+            else None
+        )
+        if stage == "execution" and resolve_prompt_profile(prompt_profile) == PHASE_PROMPT_PROFILE:
+            if self.action_phase_by_global_index is None:
+                raise ValueError("phase_v1 execution requires the V5 action-phase manifest")
+            missing_phase = sorted(set(self.indices) - set(self.action_phase_by_global_index))
+            if missing_phase:
+                raise ValueError(
+                    f"V5 action-phase manifest lacks requested global indices: {missing_phase[:20]}"
+                )
         if self.fps <= 0:
             raise ValueError(f"fps must be positive, got {self.fps}")
         delta_timestamps = {}
@@ -327,6 +344,32 @@ class TactileVLAFrameDataset(torch.utils.data.Dataset):
                 case_id=str(item["case_id"]),
                 failed_attempt_id=int(_scalar(item["reasoning_failed_attempt_id"])),
                 prompt_profile=getattr(self, "prompt_profile", None),
+            )
+        if resolve_prompt_profile(getattr(self, "prompt_profile", None)) == PHASE_PROMPT_PROFILE:
+            global_index = int(_scalar(item["index"]))
+            if self.action_phase_by_global_index is None or global_index not in self.action_phase_by_global_index:
+                raise ValueError(f"No V5 phase label for global_index={global_index}")
+            phase_row = self.action_phase_by_global_index[global_index]
+            frame_identity = (
+                int(_scalar(item["episode_id"])),
+                int(_scalar(item["attempt_id"])),
+                int(_scalar(item["frame_index"])),
+            )
+            manifest_identity = (
+                int(phase_row["episode_id"]),
+                int(phase_row["attempt_id"]),
+                int(phase_row["frame_index"]),
+            )
+            if frame_identity != manifest_identity:
+                raise ValueError(
+                    f"V5 phase/LeRobot frame identity mismatch at global_index={global_index}: "
+                    f"manifest={manifest_identity}, lerobot={frame_identity}"
+                )
+            return build_phase_prompt(
+                phase=str(phase_row["phase"]),
+                instruction=str(item["instruction"]),
+                recovery_plan=str(item["input_recovery_plan"]),
+                prompt_profile=self.prompt_profile,
             )
         return build_execution_prompt(
             instruction=str(item["instruction"]),

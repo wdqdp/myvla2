@@ -8,7 +8,13 @@ from typing import Any
 
 LEGACY_PROMPT_PROFILE = "legacy"
 MINIMAL_PROMPT_PROFILE = "minimal_v1"
-PROMPT_PROFILES = (LEGACY_PROMPT_PROFILE, MINIMAL_PROMPT_PROFILE)
+PHASE_PROMPT_PROFILE = "phase_v1"
+PROMPT_PROFILES = (
+    LEGACY_PROMPT_PROFILE,
+    MINIMAL_PROMPT_PROFILE,
+    PHASE_PROMPT_PROFILE,
+)
+ACTION_PHASES = ("execution", "reposition", "adjustment")
 MAX_MEMORY_PAIRS = 4
 MAX_SUPPORTED_ATTEMPTS = MAX_MEMORY_PAIRS + 1
 
@@ -78,10 +84,13 @@ def update_failure_recovery_memory(
     """Apply the checkpoint-specific runtime memory retention policy."""
 
     updated_entry = dict(entry)
-    if resolve_prompt_profile(prompt_profile) == MINIMAL_PROMPT_PROFILE:
+    if resolve_prompt_profile(prompt_profile) in {
+        MINIMAL_PROMPT_PROFILE,
+        PHASE_PROMPT_PROFILE,
+    }:
         if len(memory) >= MAX_MEMORY_PAIRS:
             raise ValueError(
-                f"minimal_v1 recovery memory already contains the maximum "
+                f"{resolve_prompt_profile(prompt_profile)} recovery memory already contains the maximum "
                 f"{MAX_MEMORY_PAIRS} pairs; refusing to discard the initial pair"
             )
         return [*memory, updated_entry]
@@ -98,6 +107,13 @@ def build_execution_prompt(
     prompt_profile: str | None = None,
 ) -> str:
     profile = resolve_prompt_profile(prompt_profile)
+    if profile == PHASE_PROMPT_PROFILE:
+        return build_phase_prompt(
+            phase="execution",
+            instruction=instruction,
+            recovery_plan=input_recovery_plan,
+            prompt_profile=profile,
+        )
     if profile == MINIMAL_PROMPT_PROFILE:
         return " ".join(
             [
@@ -120,6 +136,42 @@ def build_execution_prompt(
     return " ".join(parts)
 
 
+def build_phase_prompt(
+    *,
+    phase: str,
+    instruction: str,
+    recovery_plan: str | None = "",
+    prompt_profile: str | None = PHASE_PROMPT_PROFILE,
+) -> str:
+    """Build one of the three tactile-free V5 action prompts.
+
+    The explicit profile check prevents a V4 checkpoint from silently being
+    driven with prompts it never saw.  V4 manual ablations should keep using
+    :func:`build_execution_prompt` for both recovery phases.
+    """
+
+    profile = resolve_prompt_profile(prompt_profile)
+    if profile != PHASE_PROMPT_PROFILE:
+        raise ValueError(
+            f"Phase prompts require prompt_profile={PHASE_PROMPT_PROFILE!r}, got {profile!r}"
+        )
+    phase = phase.strip()
+    if phase not in ACTION_PHASES:
+        raise ValueError(f"Unknown action phase {phase!r}; expected one of {ACTION_PHASES}")
+    task = f"Task: {_with_period(instruction.strip())}"
+    if phase == "execution":
+        return f"Mode: execution. {task}"
+    if phase == "reposition":
+        return (
+            f"Mode: reposition. {task} "
+            "Description: Put the object back to its original position."
+        )
+    return (
+        f"Mode: adjustment. {task} "
+        f"Recovery plan: {_with_period(plan_text(recovery_plan))}"
+    )
+
+
 def build_assessment_prompt(
     *,
     instruction: str,
@@ -135,7 +187,8 @@ def build_assessment_prompt(
         tactile_caption.strip(),
         (
             f"Recovery plan: {_with_period(plan_text(input_recovery_plan))}"
-            if resolve_prompt_profile(prompt_profile) == MINIMAL_PROMPT_PROFILE
+            if resolve_prompt_profile(prompt_profile)
+            in {MINIMAL_PROMPT_PROFILE, PHASE_PROMPT_PROFILE}
             else f"Recovery plan: {plan_text(input_recovery_plan)}."
         ),
     ]
@@ -198,7 +251,7 @@ def build_reasoning_prompt(
         failed_tactile_caption.strip(),
         (
             f"Failure-recovery memory: {_with_period(memory_text)}"
-            if profile == MINIMAL_PROMPT_PROFILE
+            if profile in {MINIMAL_PROMPT_PROFILE, PHASE_PROMPT_PROFILE}
             else f"Failure-recovery memory: {memory_text}."
         ),
     ]
