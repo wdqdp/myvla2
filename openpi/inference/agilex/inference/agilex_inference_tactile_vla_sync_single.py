@@ -206,6 +206,12 @@ class RosOperator:
             history_fps=args.state_history_fps,
             max_sample_gap_seconds=args.state_history_max_gap_seconds,
         )
+        # The forced-recovery ablation can pause for an arbitrary amount of
+        # operator inspection time between chunks.  Keep that wall-clock pause
+        # out of the model history instead of filling the 30 Hz window with a
+        # stationary robot.  Normal inference never enables this gate.
+        self._state_history_gate_lock = threading.Lock()
+        self._state_history_paused = False
         self.puppet_arm_publisher = None
         self.tactile = None
         self._init_ros()
@@ -313,16 +319,68 @@ class RosOperator:
         if len(self.puppet_arm_deque) >= 2000:
             self.puppet_arm_deque.popleft()
         self.puppet_arm_deque.append(msg)
-        self.state_history.push(msg.header.stamp.to_sec(), np.asarray(msg.position, dtype=np.float32))
+        with self._state_history_gate_lock:
+            if not self._state_history_paused:
+                self.state_history.push(
+                    msg.header.stamp.to_sec(),
+                    np.asarray(msg.position, dtype=np.float32),
+                )
 
     def reset_state_history(self) -> None:
-        self.state_history.clear()
+        with self._state_history_gate_lock:
+            self.state_history.clear()
+
+    def pause_state_history(self) -> None:
+        """Stop accepting ROS qpos callbacks into the model history."""
+
+        with self._state_history_gate_lock:
+            self._state_history_paused = True
+
+    def resume_state_history(
+        self,
+        history: np.ndarray,
+        mask: np.ndarray,
+        *,
+        current_timestamp: float,
+    ) -> None:
+        """Restore a frozen snapshot on a fresh time grid and resume callbacks."""
+
+        history = np.asarray(history, dtype=np.float32)
+        mask = np.asarray(mask, dtype=np.bool_)
+        expected_history_shape = (self.state_history.history_len, self.state_history.state_dim)
+        if history.shape != expected_history_shape:
+            raise ValueError(
+                f"Expected frozen history {expected_history_shape}, got {history.shape}"
+            )
+        if mask.shape != (self.state_history.history_len,):
+            raise ValueError(
+                f"Expected frozen history mask [{self.state_history.history_len}], got {mask.shape}"
+            )
+        current_timestamp = float(current_timestamp)
+        if not np.isfinite(current_timestamp):
+            raise ValueError("Frozen history resume timestamp must be finite")
+        target_timestamps = current_timestamp + (
+            np.arange(self.state_history.history_len, dtype=np.float64)
+            - (self.state_history.history_len - 1)
+        ) / self.state_history.history_fps
+        with self._state_history_gate_lock:
+            self.state_history.clear()
+            for timestamp, state, valid in zip(
+                target_timestamps,
+                history,
+                mask,
+                strict=True,
+            ):
+                if valid:
+                    self.state_history.push(float(timestamp), state)
+            self._state_history_paused = False
 
     def get_state_history(self, puppet_arm) -> tuple[np.ndarray, np.ndarray]:
-        return self.state_history.snapshot(
-            current_timestamp=puppet_arm.header.stamp.to_sec(),
-            current_state=np.asarray(puppet_arm.position, dtype=np.float32),
-        )
+        with self._state_history_gate_lock:
+            return self.state_history.snapshot(
+                current_timestamp=puppet_arm.header.stamp.to_sec(),
+                current_state=np.asarray(puppet_arm.position, dtype=np.float32),
+            )
 
 
 @dataclass
@@ -397,6 +455,20 @@ class ReplayOperator:
     def reset_state_history(self) -> None:
         # One replay file is one attempt/episode, so its frame index already defines the boundary.
         pass
+
+    def pause_state_history(self) -> None:
+        # Replay frames advance only when get_frame is called, so waiting is
+        # already history-neutral.
+        pass
+
+    def resume_state_history(
+        self,
+        history: np.ndarray,
+        mask: np.ndarray,
+        *,
+        current_timestamp: float,
+    ) -> None:
+        del history, mask, current_timestamp
 
     def get_state_history(self, puppet_arm: ReplayJointState) -> tuple[np.ndarray, np.ndarray]:
         start = max(0, puppet_arm.index - self.args.state_history_len + 1)

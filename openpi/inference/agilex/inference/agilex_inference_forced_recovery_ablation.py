@@ -126,7 +126,7 @@ class FrozenObservation:
 
 @dataclass(frozen=True)
 class ControlSignal:
-    kind: Literal["trigger", "success", "quit"]
+    kind: Literal["trigger", "continue", "quit"]
     key: str
 
 
@@ -152,16 +152,22 @@ def _latest_feedback(operator: Any) -> tuple[np.ndarray | None, float | None]:
     return None, None
 
 
-def _poll_control_key(args: argparse.Namespace, keyboard: Any, *, phase: Phase) -> ControlSignal | None:
+def _poll_control_key(
+    args: argparse.Namespace,
+    keyboard: Any,
+    *,
+    phase: Phase,
+    chunk_paused: bool = False,
+) -> ControlSignal | None:
     key = keyboard.get_key()
     if key is None:
         return None
     if key == args.quit_key:
         return ControlSignal("quit", key)
-    if key == args.success_key:
-        return ControlSignal("success", key)
     if key == " " and phase == "normal":
         return ControlSignal("trigger", key)
+    if key == args.continue_key and chunk_paused:
+        return ControlSignal("continue", key)
     return None
 
 
@@ -232,6 +238,61 @@ def _capture_observation(
     )
 
 
+def _single_frame_history(args: argparse.Namespace, qpos: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    qpos = np.asarray(qpos, dtype=np.float32)
+    if qpos.shape != (7,):
+        raise ValueError(f"Expected qpos [7], got {qpos.shape}")
+    history = np.repeat(qpos[None, :], args.state_history_len, axis=0)
+    mask = np.zeros((args.state_history_len,), dtype=np.bool_)
+    mask[-1] = True
+    return history, mask
+
+
+def _pause_state_history(operator: Any) -> None:
+    pause = getattr(operator, "pause_state_history", None)
+    if not callable(pause):
+        raise RuntimeError("Operator does not support locking state history between chunks")
+    pause()
+
+
+def _resume_state_history(
+    args: argparse.Namespace,
+    operator: Any,
+    observation: FrozenObservation,
+) -> float:
+    """Discard pause-time callbacks and re-anchor the frozen snapshot to now."""
+
+    resume = getattr(operator, "resume_state_history", None)
+    if not callable(resume):
+        raise RuntimeError("Operator does not support restoring locked state history")
+    _, latest_timestamp = _latest_feedback(operator)
+    anchor_timestamp = latest_timestamp if latest_timestamp is not None else observation.timestamp
+    if anchor_timestamp is None or not np.isfinite(anchor_timestamp):
+        raise ValueError("Cannot resume a frozen history without a finite joint timestamp")
+    resume(
+        observation.state_history,
+        observation.state_history_mask,
+        current_timestamp=float(anchor_timestamp),
+    )
+    return float(anchor_timestamp)
+
+
+def _as_new_attempt_observation(
+    args: argparse.Namespace,
+    observation: FrozenObservation,
+) -> FrozenObservation:
+    history, mask = _single_frame_history(args, observation.qpos)
+    return FrozenObservation(
+        img_front=observation.img_front,
+        img_left=observation.img_left,
+        qpos=observation.qpos,
+        timestamp=observation.timestamp,
+        state_history=history,
+        state_history_mask=mask,
+        tactile_caption=observation.tactile_caption,
+    )
+
+
 def _start_forced_recovery(
     *,
     args: argparse.Namespace,
@@ -240,15 +301,21 @@ def _start_forced_recovery(
     logger: TrialLogger,
     published_steps: int,
     discarded_raw_actions: int,
+    locked_observation: FrozenObservation | None = None,
 ) -> FrozenObservation:
     # Capture only after the old NORMAL chunk has been stopped. Resetting the
     # history before snapshotting makes this qpos the sole valid new-attempt sample.
-    frozen = _capture_observation(
-        args,
-        operator,
-        captioner,
-        reset_history=True,
-    )
+    if locked_observation is None:
+        frozen = _capture_observation(
+            args,
+            operator,
+            captioner,
+            reset_history=True,
+        )
+    else:
+        operator.reset_state_history()
+        frozen = _as_new_attempt_observation(args, locked_observation)
+        _resume_state_history(args, operator, frozen)
     image_paths = logger.save_trigger_images(frozen.img_front, frozen.img_left)
     logger.record(
         {
@@ -416,10 +483,6 @@ def _handle_terminal_signal(
     phase: Phase,
     published_steps: int,
 ) -> bool:
-    if signal_value.kind == "success":
-        print("Operator confirmed success")
-        logger.record({"event": "operator_success", "phase": phase, "published_steps": published_steps})
-        return True
     if signal_value.kind == "quit":
         print("Operator requested safety stop")
         runtime.shutdown_event.set()
@@ -433,6 +496,83 @@ def _handle_terminal_signal(
         )
         return True
     return False
+
+
+def _wait_for_chunk_continue(
+    *,
+    args: argparse.Namespace,
+    operator: Any,
+    keyboard: Any,
+    logger: TrialLogger,
+    phase: Phase,
+    phase_index: int,
+    published_steps: int,
+    locked_observation: FrozenObservation,
+) -> ControlSignal:
+    """Pause after a complete chunk without advancing the model history."""
+
+    _pause_state_history(operator)
+    pause_started = time.monotonic()
+    logger.record(
+        {
+            "event": "chunk_pause",
+            "phase": phase,
+            "phase_index": phase_index,
+            "published_steps": published_steps,
+            "observation_timestamp": locked_observation.timestamp,
+            "locked_qpos": locked_observation.qpos,
+            "locked_state_history": locked_observation.state_history,
+            "locked_state_history_mask": locked_observation.state_history_mask,
+            "locked_state_history_valid_frames": int(
+                locked_observation.state_history_mask.sum()
+            ),
+        }
+    )
+    controls = f"Press {args.continue_key!r} for the next chunk"
+    if phase == "normal":
+        controls += ", SPACE for forced recovery"
+    controls += f", or {args.quit_key!r} to quit."
+    print(f"[{phase.upper()}] chunk={phase_index} complete; history locked. {controls}")
+    pause_rate = operator.rate(args.observation_poll_rate)
+    while not operator.is_shutdown() and not runtime.shutdown_event.is_set():
+        signal_value = _poll_control_key(
+            args,
+            keyboard,
+            phase=phase,
+            chunk_paused=True,
+        )
+        if signal_value is None:
+            pause_rate.sleep()
+            continue
+        paused_seconds = time.monotonic() - pause_started
+        if signal_value.kind == "continue":
+            anchor_timestamp = _resume_state_history(args, operator, locked_observation)
+            logger.record(
+                {
+                    "event": "chunk_continue",
+                    "phase": phase,
+                    "phase_index": phase_index,
+                    "published_steps": published_steps,
+                    "paused_seconds": paused_seconds,
+                    "history_resume_timestamp": anchor_timestamp,
+                    "state_history_valid_frames": int(
+                        locked_observation.state_history_mask.sum()
+                    ),
+                }
+            )
+            return signal_value
+        logger.record(
+            {
+                "event": "chunk_pause_signal",
+                "phase": phase,
+                "phase_index": phase_index,
+                "published_steps": published_steps,
+                "paused_seconds": paused_seconds,
+                "signal": signal_value.kind,
+            }
+        )
+        return signal_value
+    return ControlSignal("quit", "shutdown")
 
 
 def run_ablation(
@@ -463,7 +603,11 @@ def run_ablation(
         "Connected to action-only server: "
         f"kind={metadata['checkpoint_kind']} checkpoint={metadata['checkpoint']}"
     )
-    print("NORMAL: press SPACE to discard the current chunk and start forced RECOVERY; s=success, q=quit")
+    print(
+        "Each complete chunk pauses with its observation/history frozen; "
+        f"{args.continue_key}=next chunk, q=quit. During NORMAL, SPACE discards the "
+        "remaining chunk and starts forced RECOVERY."
+    )
 
     phase: Phase = "normal"
     phase_indices: dict[Phase, int] = {"normal": 0, "recovery": 0}
@@ -554,6 +698,53 @@ def run_ablation(
         )
 
         if control_signal is None:
+            if published_steps >= args.max_publish_step:
+                continue
+            # Snapshot immediately after the final command, then stop accepting
+            # qpos callbacks into the model history for the entire operator wait.
+            locked_observation = _capture_observation(
+                args,
+                operator,
+                captioner,
+                reset_history=False,
+            )
+            pause_signal = _wait_for_chunk_continue(
+                args=args,
+                operator=operator,
+                keyboard=keyboard,
+                logger=logger,
+                phase=phase,
+                phase_index=phase_index,
+                published_steps=published_steps,
+                locked_observation=locked_observation,
+            )
+            if _handle_terminal_signal(
+                pause_signal,
+                logger=logger,
+                phase=phase,
+                published_steps=published_steps,
+            ):
+                return
+            if pause_signal.kind == "continue":
+                pending_observation = locked_observation
+                pre_action = locked_observation.qpos.copy()
+                continue
+            if pause_signal.kind != "trigger" or phase != "normal":
+                raise AssertionError(
+                    f"Unexpected paused control signal {pause_signal} in phase={phase}"
+                )
+            frozen = _start_forced_recovery(
+                args=args,
+                operator=operator,
+                captioner=captioner,
+                logger=logger,
+                published_steps=published_steps,
+                discarded_raw_actions=0,
+                locked_observation=locked_observation,
+            )
+            phase = "recovery"
+            pre_action = frozen.qpos.copy()
+            pending_observation = frozen
             continue
         if _handle_terminal_signal(
             control_signal,
@@ -634,7 +825,16 @@ def get_arguments() -> tuple[argparse.Namespace, argparse.ArgumentParser]:
     parser.add_argument("--captioner_device", default="auto")
     parser.add_argument("--no-captioner", action="store_true")
     parser.add_argument("--start-immediately", action="store_true")
-    parser.add_argument("--success-key", default="s")
+    parser.add_argument(
+        "--continue-key",
+        "--success-key",
+        dest="continue_key",
+        default="s",
+        help=(
+            "Continue from the frozen pause into the next chunk. "
+            "--success-key is retained as a deprecated command-line alias."
+        ),
+    )
     parser.add_argument("--quit-key", default="q")
     parser.add_argument("--no-publish", action="store_true")
     parser.add_argument("--replay-attempt-dir", type=Path)
@@ -691,10 +891,10 @@ def validate_args(args: argparse.Namespace, parser: argparse.ArgumentParser) -> 
         parser.error("--state-history-len must be 60 for this V3 ablation")
     if args.state_history_fps <= 0 or args.state_history_max_gap_seconds <= 0:
         parser.error("state-history fps and max gap must be positive")
-    if len(args.success_key) != 1 or len(args.quit_key) != 1:
-        parser.error("success/quit keys must each be one character")
-    if args.success_key == args.quit_key or " " in {args.success_key, args.quit_key}:
-        parser.error("success/quit keys must be distinct and cannot be SPACE")
+    if len(args.continue_key) != 1 or len(args.quit_key) != 1:
+        parser.error("continue/quit keys must each be one character")
+    if args.continue_key == args.quit_key or " " in {args.continue_key, args.quit_key}:
+        parser.error("continue/quit keys must be distinct and cannot be SPACE")
 
 
 def main() -> None:

@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import argparse
+from collections import deque
 import importlib.util
 import json
 from pathlib import Path
 import sys
+import threading
 from types import SimpleNamespace
 
 import numpy as np
@@ -47,12 +49,22 @@ class _FakeJointState:
         self.timestamp = timestamp
 
 
+def _ros_joint_state(value: float, timestamp: float) -> SimpleNamespace:
+    return SimpleNamespace(
+        position=np.full((7,), value, dtype=np.float32),
+        header=SimpleNamespace(stamp=SimpleNamespace(to_sec=lambda: timestamp)),
+    )
+
+
 class _FakeOperator:
     tactile = None
 
     def __init__(self) -> None:
         self.frame_index = 0
         self.reset_count = 0
+        self.pause_count = 0
+        self.history_paused = False
+        self.resumed_histories: list[tuple[np.ndarray, np.ndarray, float]] = []
         self.published: list[np.ndarray] = []
         self.feedback: _FakeJointState | None = None
 
@@ -72,6 +84,20 @@ class _FakeOperator:
 
     def reset_state_history(self) -> None:
         self.reset_count += 1
+
+    def pause_state_history(self) -> None:
+        self.pause_count += 1
+        self.history_paused = True
+
+    def resume_state_history(self, history, mask, *, current_timestamp: float) -> None:
+        self.resumed_histories.append(
+            (
+                np.asarray(history, dtype=np.float32).copy(),
+                np.asarray(mask, dtype=np.bool_).copy(),
+                float(current_timestamp),
+            )
+        )
+        self.history_paused = False
 
     def get_state_history(self, puppet_arm):
         history = np.repeat(np.asarray(puppet_arm.position)[None, :], 60, axis=0).astype(np.float32)
@@ -147,7 +173,7 @@ def _args(tmp_path: Path, *, max_publish_step: int) -> argparse.Namespace:
         forced_recovery_plan=RECOVERY_PLAN,
         noise_seed=42,
         quit_key="q",
-        success_key="s",
+        continue_key="s",
         use_actions_interpolation=True,
         arm_steps_length=[0.01] * 7,
         gripper_offset=0.0,
@@ -298,6 +324,134 @@ def test_space_at_chunk_boundary_switches_before_another_normal_request(tmp_path
     assert RECOVERY_PLAN in policy.requests[0]["prompt"]
     assert "Recovery plan: none." not in policy.requests[0]["prompt"]
     assert operator.reset_count == 1
+
+
+def test_complete_chunk_waits_for_s_and_reuses_locked_observation(tmp_path: Path) -> None:
+    client.runtime.shutdown_event.clear()
+    client.runtime.published_actions_history.clear()
+    args = _args(tmp_path, max_publish_step=2)
+    args.chunk_size = 1
+    operator = _FakeOperator()
+    policy = _FakePolicy()
+    # Initial boundary, first action, paused continue, next boundary, second action.
+    keyboard = _FakeKeyboard([None, None, "s", None, None])
+    logger = client.TrialLogger(tmp_path, trial_id=None)
+
+    client.run_ablation(args, operator, policy, captioner=None, keyboard=keyboard, logger=logger)
+
+    assert len(policy.requests) == 2
+    assert len(operator.published) == 2
+    assert operator.pause_count == 1
+    assert not operator.history_paused
+    assert len(operator.resumed_histories) == 1
+    resumed_history, resumed_mask, resume_timestamp = operator.resumed_histories[0]
+    np.testing.assert_array_equal(
+        resumed_history,
+        policy.requests[1]["observation/state_history"],
+    )
+    np.testing.assert_array_equal(
+        resumed_mask,
+        policy.requests[1]["observation/state_history_mask"],
+    )
+    # No observation is captured while waiting: the second request reuses the
+    # single chunk-end frame (value=1) frozen before the pause.
+    np.testing.assert_array_equal(
+        policy.requests[1]["observation/state"],
+        np.ones((7,), dtype=np.float32),
+    )
+    assert resume_timestamp == pytest.approx(201.0)
+
+    events = _events(logger)
+    assert sum(event["event"] == "chunk_pause" for event in events) == 1
+    assert sum(event["event"] == "chunk_continue" for event in events) == 1
+
+
+def test_ros_history_gate_discards_pause_callbacks_and_restores_frozen_grid() -> None:
+    operator = object.__new__(client.runtime.RosOperator)
+    operator.puppet_arm_deque = deque()
+    operator.state_history = client.runtime.StateHistoryBuffer(
+        history_len=4,
+        state_dim=7,
+        history_fps=30.0,
+        max_sample_gap_seconds=0.02,
+    )
+    operator._state_history_gate_lock = threading.Lock()
+    operator._state_history_paused = False
+    frozen_history = np.repeat(np.arange(4, dtype=np.float32)[:, None], 7, axis=1)
+    frozen_mask = np.ones((4,), dtype=np.bool_)
+
+    operator.pause_state_history()
+    operator.puppet_arm_callback(_ros_joint_state(99.0, 50.0))
+    assert operator._state_history_paused
+    operator.resume_state_history(
+        frozen_history,
+        frozen_mask,
+        current_timestamp=100.0,
+    )
+    history, mask = operator.state_history.snapshot(
+        current_timestamp=100.0,
+        current_state=frozen_history[-1],
+    )
+
+    np.testing.assert_array_equal(history, frozen_history)
+    np.testing.assert_array_equal(mask, frozen_mask)
+    assert not np.any(history == 99.0)
+    assert not operator._state_history_paused
+
+
+def test_complete_chunk_does_not_continue_without_s(tmp_path: Path) -> None:
+    client.runtime.shutdown_event.clear()
+    client.runtime.published_actions_history.clear()
+    args = _args(tmp_path, max_publish_step=2)
+    args.chunk_size = 1
+    operator = _FakeOperator()
+    policy = _FakePolicy()
+    # q is handled only after the first chunk has reached its locked pause.
+    keyboard = _FakeKeyboard([None, None, "q"])
+    logger = client.TrialLogger(tmp_path, trial_id=None)
+
+    client.run_ablation(args, operator, policy, captioner=None, keyboard=keyboard, logger=logger)
+
+    assert len(policy.requests) == 1
+    assert len(operator.published) == 1
+    assert operator.pause_count == 1
+    assert operator.history_paused
+    assert not operator.resumed_histories
+    assert any(event["event"] == "chunk_pause" for event in _events(logger))
+
+
+def test_space_from_locked_normal_pause_starts_recovery_without_refresh(tmp_path: Path) -> None:
+    client.runtime.shutdown_event.clear()
+    client.runtime.published_actions_history.clear()
+    args = _args(tmp_path, max_publish_step=2)
+    args.chunk_size = 1
+    operator = _FakeOperator()
+    policy = _FakePolicy()
+    # Initial boundary, first NORMAL action, paused SPACE, RECOVERY boundary/action.
+    keyboard = _FakeKeyboard([None, None, " ", None, None])
+    logger = client.TrialLogger(tmp_path, trial_id=None)
+
+    client.run_ablation(args, operator, policy, captioner=None, keyboard=keyboard, logger=logger)
+
+    assert len(policy.requests) == 2
+    normal_request, recovery_request = policy.requests
+    assert "Recovery plan: none." in normal_request["prompt"]
+    assert RECOVERY_PLAN in recovery_request["prompt"]
+    # The pause locked frame value=1; SPACE must not capture a later frame.
+    np.testing.assert_array_equal(
+        recovery_request["observation/state"],
+        np.ones((7,), dtype=np.float32),
+    )
+    expected_mask = np.r_[np.zeros(59, dtype=np.bool_), np.ones(1, dtype=np.bool_)]
+    np.testing.assert_array_equal(
+        recovery_request["observation/state_history_mask"],
+        expected_mask,
+    )
+    assert operator.pause_count == 1
+    assert operator.reset_count == 1
+    assert len(operator.resumed_histories) == 1
+    np.testing.assert_array_equal(operator.resumed_histories[0][1], expected_mask)
+    assert not operator.history_paused
 
 
 def test_server_metadata_must_identify_action_ablation() -> None:
