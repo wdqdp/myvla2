@@ -20,7 +20,9 @@ from tactile_vla.vla.prompts import build_phase_prompt
 from tactile_vla.vla.prompts import build_recovery_prompt
 from tactile_vla.vla.prompts import build_reasoning_prompt
 from tactile_vla.vla.prompts import PHASE_PROMPT_PROFILE
+from tactile_vla.vla.prompts import PHASE_PROMPT_PROFILE_V2
 from tactile_vla.vla.prompts import resolve_prompt_profile
+from tactile_vla.vla.v5_targets import apply_h30_terminal_hold
 from tactile_vla.vla.structured_text import ConstrainedTokenGrammar
 from tactile_vla.vla.structured_text import legal_failure_reasons
 from tactile_vla.vla.structured_text import legal_recovery_plans
@@ -307,9 +309,12 @@ class TactileVLAFrameDataset(torch.utils.data.Dataset):
             if action_phase_by_global_index is not None
             else None
         )
-        if stage == "execution" and resolve_prompt_profile(prompt_profile) == PHASE_PROMPT_PROFILE:
+        if stage == "execution" and resolve_prompt_profile(prompt_profile) in {
+            PHASE_PROMPT_PROFILE,
+            PHASE_PROMPT_PROFILE_V2,
+        }:
             if self.action_phase_by_global_index is None:
-                raise ValueError("phase_v1 execution requires the V5 action-phase manifest")
+                raise ValueError("Phase-profile execution requires an action-phase manifest")
             missing_phase = sorted(set(self.indices) - set(self.action_phase_by_global_index))
             if missing_phase:
                 raise ValueError(
@@ -345,7 +350,10 @@ class TactileVLAFrameDataset(torch.utils.data.Dataset):
                 failed_attempt_id=int(_scalar(item["reasoning_failed_attempt_id"])),
                 prompt_profile=getattr(self, "prompt_profile", None),
             )
-        if resolve_prompt_profile(getattr(self, "prompt_profile", None)) == PHASE_PROMPT_PROFILE:
+        if resolve_prompt_profile(getattr(self, "prompt_profile", None)) in {
+            PHASE_PROMPT_PROFILE,
+            PHASE_PROMPT_PROFILE_V2,
+        }:
             global_index = int(_scalar(item["index"]))
             if self.action_phase_by_global_index is None or global_index not in self.action_phase_by_global_index:
                 raise ValueError(f"No V5 phase label for global_index={global_index}")
@@ -442,7 +450,19 @@ class TactileVLAFrameDataset(torch.utils.data.Dataset):
             result["observation/state_history"] = state_history
             result["observation/state_history_mask"] = np.logical_not(history_is_pad)
         if self.stage == "execution":
-            result["actions"] = item["action"]
+            terminal_hold_from_offset = None
+            phase_lookup = getattr(self, "action_phase_by_global_index", None)
+            if phase_lookup is not None:
+                phase_row = phase_lookup.get(result["global_index"])
+                if phase_row is not None:
+                    terminal_hold_from_offset = phase_row.get("terminal_hold_from_offset")
+            result["actions"] = (
+                apply_h30_terminal_hold(
+                    item["action"], terminal_hold_from_offset=terminal_hold_from_offset
+                )
+                if terminal_hold_from_offset is not None
+                else item["action"]
+            )
         return result
 
 

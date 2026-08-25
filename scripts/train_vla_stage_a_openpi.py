@@ -76,6 +76,7 @@ from tactile_vla.vla.openpi_bridge import build_transform
 from tactile_vla.vla.openpi_bridge import collate_numpy
 from tactile_vla.vla.prompts import MINIMAL_PROMPT_PROFILE
 from tactile_vla.vla.prompts import PHASE_PROMPT_PROFILE
+from tactile_vla.vla.prompts import PHASE_PROMPT_PROFILE_V2
 from tactile_vla.vla.prompts import resolve_prompt_profile
 from tactile_vla.vla.v4_data import ROTATION_V4
 from tactile_vla.vla.v4_data import V4_TRAINING_INDEX_SCHEMA
@@ -84,6 +85,13 @@ from tactile_vla.vla.v5_phase_data import PHASE_EXPERIMENT_KIND
 from tactile_vla.vla.v5_phase_data import ROTATION_PHASE_V5
 from tactile_vla.vla.v5_phase_data import V5_TRAINING_INDEX_SCHEMA
 from tactile_vla.vla.v5_phase_data import validate_v5_training_index
+from tactile_vla.vla.v5_adjustment_data import ROTATION_PHASE_V5_ADJUSTMENT_V2
+from tactile_vla.vla.v5_adjustment_data import V2_EXPERIMENT_KIND
+from tactile_vla.vla.v5_adjustment_data import V2_TRAINING_INDEX_SCHEMA
+from tactile_vla.vla.v5_adjustment_data import validate_v5_adjustment_training_index
+
+
+PHASE_DATA_PROFILES = {ROTATION_PHASE_V5, ROTATION_PHASE_V5_ADJUSTMENT_V2}
 
 
 def parse_args() -> argparse.Namespace:
@@ -152,14 +160,24 @@ def validate_v4_args(args: argparse.Namespace) -> None:
 
 
 def validate_v5_args(args: argparse.Namespace) -> None:
-    if args.data_profile != ROTATION_PHASE_V5:
+    if args.data_profile not in PHASE_DATA_PROFILES:
         return
-    if args.prompt_profile != PHASE_PROMPT_PROFILE:
-        raise ValueError("rotation_phase_v5 Stage A requires prompt_profile='phase_v1'")
-    if args.experiment_kind != PHASE_EXPERIMENT_KIND:
-        raise ValueError("rotation_phase_v5 Stage A requires experiment_kind='phase_prompt_only'")
+    expected_prompt = (
+        PHASE_PROMPT_PROFILE_V2
+        if args.data_profile == ROTATION_PHASE_V5_ADJUSTMENT_V2
+        else PHASE_PROMPT_PROFILE
+    )
+    expected_experiment = (
+        V2_EXPERIMENT_KIND
+        if args.data_profile == ROTATION_PHASE_V5_ADJUSTMENT_V2
+        else PHASE_EXPERIMENT_KIND
+    )
+    if args.prompt_profile != expected_prompt:
+        raise ValueError(f"{args.data_profile} Stage A requires prompt_profile={expected_prompt!r}")
+    if args.experiment_kind != expected_experiment:
+        raise ValueError(f"{args.data_profile} Stage A requires experiment_kind={expected_experiment!r}")
     if args.no_norm:
-        raise ValueError("rotation_phase_v5 Stage A must reuse the V4 norm stats")
+        raise ValueError(f"{args.data_profile} Stage A must reuse the V4 norm stats")
 
 
 V4_STAGE_A_PROTOCOL = {
@@ -187,9 +205,9 @@ V5_STAGE_A_PROTOCOL = {**V4_STAGE_A_PROTOCOL, "seed": 42}
 
 
 def validate_v4_training_protocol(args: argparse.Namespace) -> None:
-    if args.data_profile not in {ROTATION_V4, ROTATION_PHASE_V5}:
+    if args.data_profile not in {ROTATION_V4, *PHASE_DATA_PROFILES}:
         return
-    protocol = V5_STAGE_A_PROTOCOL if args.data_profile == ROTATION_PHASE_V5 else V4_STAGE_A_PROTOCOL
+    protocol = V5_STAGE_A_PROTOCOL if args.data_profile in PHASE_DATA_PROFILES else V4_STAGE_A_PROTOCOL
     mismatches = {
         key: {"requested": getattr(args, key), "required": expected}
         for key, expected in protocol.items()
@@ -207,14 +225,14 @@ def validate_v4_training_protocol(args: argparse.Namespace) -> None:
 
 
 def validate_v4_resume_config(saved: dict[str, Any], args: argparse.Namespace) -> None:
-    if args.data_profile not in {ROTATION_V4, ROTATION_PHASE_V5}:
+    if args.data_profile not in {ROTATION_V4, *PHASE_DATA_PROFILES}:
         return
-    protocol = V5_STAGE_A_PROTOCOL if args.data_profile == ROTATION_PHASE_V5 else V4_STAGE_A_PROTOCOL
+    protocol = V5_STAGE_A_PROTOCOL if args.data_profile in PHASE_DATA_PROFILES else V4_STAGE_A_PROTOCOL
     keys = (
         *protocol,
         "data_profile",
         "prompt_profile",
-        *(("experiment_kind",) if args.data_profile == ROTATION_PHASE_V5 else ()),
+        *(("experiment_kind",) if args.data_profile in PHASE_DATA_PROFILES else ()),
         "weight_decay",
         "grad_clip",
         "log_interval",
@@ -257,6 +275,15 @@ def ensure_index(args: argparse.Namespace) -> dict:
                 dataset_dir=args.dataset_dir,
             )
             args._v5_action_phase_lookup = lookup
+        elif args.data_profile == ROTATION_PHASE_V5_ADJUSTMENT_V2:
+            if payload.get("schema_version") != V2_TRAINING_INDEX_SCHEMA:
+                raise ValueError("rotation_phase_v5_adjustment_v2 requires its dedicated V2 index")
+            _, lookup = validate_v5_adjustment_training_index(
+                payload,
+                index_path=args.index_file,
+                dataset_dir=args.dataset_dir,
+            )
+            args._v5_action_phase_lookup = lookup
         return payload
     if args.data_profile != LEGACY_DATA_PROFILE:
         raise FileNotFoundError(
@@ -290,13 +317,16 @@ def build_loader(
         indices = indices[: args.max_frames]
     norm_stats = None if args.no_norm else normalize.load(args.norm_stats_dir)
     phase_lookup = None
-    if args.data_profile == ROTATION_PHASE_V5:
+    if args.data_profile in PHASE_DATA_PROFILES:
         phase_lookup = getattr(args, "_v5_action_phase_lookup", None)
         if phase_lookup is None:
-            _, phase_lookup = validate_v5_training_index(
-                payload,
-                index_path=args.index_file,
-                dataset_dir=args.dataset_dir,
+            validator = (
+                validate_v5_adjustment_training_index
+                if args.data_profile == ROTATION_PHASE_V5_ADJUSTMENT_V2
+                else validate_v5_training_index
+            )
+            _, phase_lookup = validator(
+                payload, index_path=args.index_file, dataset_dir=args.dataset_dir
             )
             args._v5_action_phase_lookup = phase_lookup
     dataset = TactileVLAFrameDataset(
@@ -310,7 +340,7 @@ def build_loader(
         action_phase_by_global_index=phase_lookup,
         dataset_repo_id=(
             "tactile_vla_rotation_v4"
-            if args.data_profile in {ROTATION_V4, ROTATION_PHASE_V5}
+            if args.data_profile in {ROTATION_V4, *PHASE_DATA_PROFILES}
             else "tactile_vla"
         ),
     )

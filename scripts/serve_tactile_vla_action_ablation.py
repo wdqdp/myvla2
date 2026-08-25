@@ -59,6 +59,49 @@ ACTION_HORIZON = 30
 ACTION_DIM = 32
 OUTPUT_ACTION_DIM = 7
 
+_METADATA_CONFIG_KEYS = (
+    "run_name",
+    "data_profile",
+    "prompt_profile",
+    "experiment_kind",
+    "checkpoint_format",
+    "num_steps",
+    "seed",
+    "action_horizon",
+    "action_dim",
+    "use_state_history",
+    "state_history_len",
+    "state_history_dim",
+    "state_history_fps",
+    "history_hidden_dim",
+    "max_token_len",
+    "paligemma_variant",
+    "action_expert_variant",
+    "precision",
+    "train_lora_only",
+)
+_METADATA_IDENTITY_KEYS = (
+    "selection_hash",
+    "training_data_hash",
+    "index_sha256",
+    "v4_norm_stats_sha256",
+    "norm_stats_sha256",
+    "data_config_hash",
+    "v4_profile_config_hash",
+    "action_frame_manifest_hash",
+)
+
+
+def metadata_config_summary(config: dict[str, Any]) -> dict[str, Any]:
+    """Keep websocket metadata small even when training config has per-frame sidecars."""
+
+    summary = {key: config[key] for key in _METADATA_CONFIG_KEYS if key in config}
+    identity = checkpoint_artifact_identity(config)
+    compact_identity = {key: identity[key] for key in _METADATA_IDENTITY_KEYS if key in identity}
+    if compact_identity:
+        summary["artifact_identity"] = compact_identity
+    return summary
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -315,7 +358,10 @@ class ActionOnlyAblationPolicy:
             "supports_action_noise": True,
             "requires_action_noise": True,
             "action_noise_shape": [model_config.action_horizon, model_config.action_dim],
-            "config": config,
+            # V5 training config contains a 405k-entry phase lookup and is about
+            # 178 MB.  Sending it in the websocket handshake also duplicates it
+            # into every trial log, while none of those rows are inference inputs.
+            "config": metadata_config_summary(config),
         }
 
     @property
@@ -439,6 +485,10 @@ def main() -> None:
         model_config=model_config,
         norm_stats=norm_stats,
     )
+    # The V5 training config owns a large per-frame lookup.  The policy keeps
+    # only its compact metadata summary, so release the parsed training config
+    # before warm-up instead of pinning it for the full server lifetime.
+    del config
     logging.info("Warming up deterministic action-only inference")
     summary = warm_up(policy)
     logging.info("Action-only warm-up complete: %s", json.dumps(summary, ensure_ascii=False))

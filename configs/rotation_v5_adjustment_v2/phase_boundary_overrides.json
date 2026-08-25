@@ -1,0 +1,23 @@
+{
+  "schema_version": "tactile_vla_v5_phase_boundary_overrides_v2",
+  "version": 2,
+  "overrides": [
+    {"episode_id": 51, "attempt_id": 2, "release_frame": 1785658887.767702, "regrasp_frame": 1785658895.206583},
+    {"episode_id": 62, "attempt_id": 2, "release_frame": 1785739446.880941, "regrasp_frame": 1785739453.485548},
+    {"episode_id": 63, "attempt_id": 2, "release_frame": 1785739602.928137, "regrasp_frame": 1785739609.199507},
+    {"episode_id": 69, "attempt_id": 2, "release_frame": 1785740261.674629, "regrasp_frame": 1785740269.847085},
+    {"episode_id": 70, "attempt_id": 2, "release_frame": 1785740331.192036, "regrasp_frame": 1785740337.930184},
+    {"episode_id": 84, "attempt_id": 2, "release_frame": 1785741924.967619, "regrasp_frame": 1785741932.172906},
+    {"episode_id": 117, "attempt_id": 2, "release_frame": 1785681590.269272, "regrasp_frame": 1785681598.708788},
+    {"episode_id": 118, "attempt_id": 2, "release_frame": 1785681660.820925, "regrasp_frame": 1785681668.359612},
+    {"episode_id": 120, "attempt_id": 2, "release_frame": 1785682096.438473, "regrasp_frame": 1785682106.512676},
+    {"episode_id": 136, "attempt_id": 2, "release_frame": 1785811891.172012, "regrasp_frame": 1785811898.177545},
+    {"episode_id": 171, "attempt_id": 2, "release_frame": 1785828723.720480, "regrasp_frame": 1785828729.858260},
+    {"episode_id": 289, "attempt_id": 2, "release_frame": 1786622905.586926, "regrasp_frame": 1786622912.925550},
+    {"episode_id": 341, "attempt_id": 2, "release_frame": 1786632878.349023, "regrasp_frame": 1786632887.254970},
+    {"episode_id": 381, "attempt_id": 2, "release_frame": 1786868816.333303, "regrasp_frame": 1786868824.172071},
+    {"episode_id": 473, "attempt_id": 2, "release_frame": 1786949929.976894, "regrasp_frame": 1786949938.215925},
+    {"episode_id": 474, "attempt_id": 2, "release_frame": 1786950544.121234, "regrasp_frame": 1786950552.160348},
+    {"episode_id": 476, "attempt_id": 2, "release_frame": 1786950705.571243, "regrasp_frame": 1786950714.177547}
+  ]
+}

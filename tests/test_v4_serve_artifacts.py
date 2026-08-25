@@ -229,6 +229,40 @@ def test_v4_stage_a_action_server_validates_actual_norm_sha(
         serve.validate_v4_norm_artifacts(args, config)
 
 
+def test_action_server_metadata_excludes_v5_per_frame_training_lookup() -> None:
+    serve = _load_script(
+        "serve_v5_metadata_summary_test_module",
+        "scripts/serve_tactile_vla_action_ablation.py",
+    )
+    config = {
+        "run_name": "phase-v5",
+        "data_profile": "rotation_phase_v5",
+        "prompt_profile": "phase_v1",
+        "experiment_kind": "phase_prompt_only",
+        "num_steps": 15_000,
+        "artifact_identity": {
+            "selection_hash": "a" * 64,
+            "v4_norm_stats_sha256": "b" * 64,
+            "source_file_hashes": {"large": ["must", "not", "be", "served"]},
+        },
+        "_v5_action_phase_lookup": {
+            str(index): {"phase": "execution"} for index in range(100)
+        },
+    }
+
+    summary = serve.metadata_config_summary(config)
+
+    assert summary["data_profile"] == "rotation_phase_v5"
+    assert summary["prompt_profile"] == "phase_v1"
+    assert summary["artifact_identity"] == {
+        "selection_hash": "a" * 64,
+        "v4_norm_stats_sha256": "b" * 64,
+    }
+    assert "_v5_action_phase_lookup" not in summary
+    assert "source_file_hashes" not in summary["artifact_identity"]
+    assert len(json.dumps(summary)) < 2_000
+
+
 def test_v4_merged_action_server_uses_recorded_stage_a_step(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

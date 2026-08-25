@@ -9,12 +9,15 @@ from typing import Any
 LEGACY_PROMPT_PROFILE = "legacy"
 MINIMAL_PROMPT_PROFILE = "minimal_v1"
 PHASE_PROMPT_PROFILE = "phase_v1"
+PHASE_PROMPT_PROFILE_V2 = "phase_v2"
 PROMPT_PROFILES = (
     LEGACY_PROMPT_PROFILE,
     MINIMAL_PROMPT_PROFILE,
     PHASE_PROMPT_PROFILE,
+    PHASE_PROMPT_PROFILE_V2,
 )
 ACTION_PHASES = ("execution", "reposition", "adjustment")
+V2_ACTION_PHASES = ("execution", "adjustment")
 MAX_MEMORY_PAIRS = 4
 MAX_SUPPORTED_ATTEMPTS = MAX_MEMORY_PAIRS + 1
 
@@ -87,6 +90,7 @@ def update_failure_recovery_memory(
     if resolve_prompt_profile(prompt_profile) in {
         MINIMAL_PROMPT_PROFILE,
         PHASE_PROMPT_PROFILE,
+        PHASE_PROMPT_PROFILE_V2,
     }:
         if len(memory) >= MAX_MEMORY_PAIRS:
             raise ValueError(
@@ -107,7 +111,7 @@ def build_execution_prompt(
     prompt_profile: str | None = None,
 ) -> str:
     profile = resolve_prompt_profile(prompt_profile)
-    if profile == PHASE_PROMPT_PROFILE:
+    if profile in {PHASE_PROMPT_PROFILE, PHASE_PROMPT_PROFILE_V2}:
         return build_phase_prompt(
             phase="execution",
             instruction=instruction,
@@ -151,16 +155,23 @@ def build_phase_prompt(
     """
 
     profile = resolve_prompt_profile(prompt_profile)
-    if profile != PHASE_PROMPT_PROFILE:
+    if profile not in {PHASE_PROMPT_PROFILE, PHASE_PROMPT_PROFILE_V2}:
         raise ValueError(
-            f"Phase prompts require prompt_profile={PHASE_PROMPT_PROFILE!r}, got {profile!r}"
+            "Phase prompts require prompt_profile="
+            f"{PHASE_PROMPT_PROFILE!r} or {PHASE_PROMPT_PROFILE_V2!r}, got {profile!r}"
         )
     phase = phase.strip()
-    if phase not in ACTION_PHASES:
-        raise ValueError(f"Unknown action phase {phase!r}; expected one of {ACTION_PHASES}")
+    expected_phases = V2_ACTION_PHASES if profile == PHASE_PROMPT_PROFILE_V2 else ACTION_PHASES
+    if phase not in expected_phases:
+        raise ValueError(f"Unknown action phase {phase!r}; expected one of {expected_phases}")
     task = f"Task: {_with_period(instruction.strip())}"
     if phase == "execution":
         return f"Mode: execution. {task}"
+    if profile == PHASE_PROMPT_PROFILE_V2:
+        return (
+            f"Mode: adjustment. {task}\nPut the object back, and follow this recovery plan: "
+            f"{_with_period(plan_text(recovery_plan))}"
+        )
     if phase == "reposition":
         return (
             f"Mode: reposition. {task} "

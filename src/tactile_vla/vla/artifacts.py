@@ -15,6 +15,8 @@ ROTATION_V4_DATA_PROFILE = "rotation_v4"
 ROTATION_V4_INDEX_SCHEMA = "tactile_vla_v4_training_index_v1"
 ROTATION_V5_DATA_PROFILE = "rotation_phase_v5"
 ROTATION_V5_INDEX_SCHEMA = "tactile_vla_v5_prompt_training_index_v1"
+ROTATION_V5_ADJUSTMENT_V2_DATA_PROFILE = "rotation_phase_v5_adjustment_v2"
+ROTATION_V5_ADJUSTMENT_V2_INDEX_SCHEMA = "tactile_vla_v5_adjustment_training_index_v2"
 
 BASE_IDENTITY_KEYS = (
     "data_profile",
@@ -47,6 +49,11 @@ V5_IDENTITY_KEYS = (
     "v4_lerobot_identity",
     "h30_target_identity",
     "v4_norm_stats_sha256",
+)
+V5_ADJUSTMENT_V2_IDENTITY_KEYS = V5_IDENTITY_KEYS + (
+    "terminal_hold_schema",
+    "v4_h30_target_identity",
+    "v4_h30_source_identity",
 )
 ALL_IDENTITY_KEYS = BASE_IDENTITY_KEYS + V4_IDENTITY_KEYS
 
@@ -238,6 +245,45 @@ def artifact_identity(
                 "source_file_hashes": hashes_only(source_files, version="V5"),
             }
         )
+    elif data_profile == ROTATION_V5_ADJUSTMENT_V2_DATA_PROFILE:
+        if payload.get("schema_version") != ROTATION_V5_ADJUSTMENT_V2_INDEX_SCHEMA:
+            raise ValueError(
+                "rotation_phase_v5_adjustment_v2 requires its dedicated V2 index schema; "
+                f"got {payload.get('schema_version')!r}"
+            )
+        stored_training_hash = str(payload.get("training_data_hash", ""))
+        calculated_training_hash = sha256_json(
+            {key: value for key, value in payload.items() if key != "training_data_hash"}
+        )
+        if not stored_training_hash or stored_training_hash != calculated_training_hash:
+            raise ValueError("V5.2 training_data_hash does not match the index payload")
+        required = {
+            "experiment_kind": payload.get("experiment_kind"),
+            "terminal_hold_schema": payload.get("terminal_hold_schema"),
+            "selection_hash": payload.get("selection_hash"),
+            "v4_profile_config_hash": payload.get("v4_profile_config_hash"),
+            "phase_boundaries_identity": payload.get("phase_boundaries_identity"),
+            "action_phase_manifest_identity": payload.get("action_phase_manifest_identity"),
+            "v4_training_data_hash": payload.get("v4_training_data_hash"),
+            "v4_lerobot_identity": payload.get("v4_lerobot_identity"),
+            "h30_target_identity": payload.get("h30_target_identity"),
+            "v4_h30_target_identity": payload.get("v4_h30_target_identity"),
+            "v4_h30_source_identity": payload.get("v4_h30_source_identity"),
+            "v4_norm_stats_sha256": payload.get("v4_norm_stats_sha256"),
+        }
+        missing = sorted(key for key, value in required.items() if not value)
+        if missing:
+            raise ValueError(f"V5.2 unified index lacks identity fields: {missing}")
+        source_files = payload.get("source_files")
+        if not isinstance(source_files, Mapping) or not source_files:
+            raise ValueError("V5.2 unified index lacks source file hashes")
+        identity.update(
+            {
+                **required,
+                "training_data_hash": stored_training_hash,
+                "source_file_hashes": hashes_only(source_files, version="V5.2"),
+            }
+        )
     return identity
 
 
@@ -252,6 +298,8 @@ def assert_identity_matches(
         profiles = {saved.get("data_profile"), requested.get("data_profile")}
         if ROTATION_V4_DATA_PROFILE in profiles:
             keys = ALL_IDENTITY_KEYS
+        elif ROTATION_V5_ADJUSTMENT_V2_DATA_PROFILE in profiles:
+            keys = BASE_IDENTITY_KEYS + V5_ADJUSTMENT_V2_IDENTITY_KEYS
         elif ROTATION_V5_DATA_PROFILE in profiles:
             keys = BASE_IDENTITY_KEYS + V5_IDENTITY_KEYS
         else:
@@ -279,6 +327,7 @@ def checkpoint_artifact_identity(config: Mapping[str, Any]) -> dict[str, Any]:
             "index_file": config.get("index_file"),
             **{key: config.get(key) for key in V4_IDENTITY_KEYS},
             **{key: config.get(key) for key in V5_IDENTITY_KEYS},
+            **{key: config.get(key) for key in V5_ADJUSTMENT_V2_IDENTITY_KEYS},
         }
     return dict(identity)
 
@@ -294,7 +343,10 @@ def validate_norm_stats_identity(
         raise FileNotFoundError(summary_path)
     summary = json.loads(summary_path.read_text())
     norm_identity = summary.get("artifact_identity", {})
-    if expected.get("data_profile") == ROTATION_V5_DATA_PROFILE:
+    if expected.get("data_profile") in {
+        ROTATION_V5_DATA_PROFILE,
+        ROTATION_V5_ADJUSTMENT_V2_DATA_PROFILE,
+    }:
         if norm_identity.get("data_profile") != ROTATION_V4_DATA_PROFILE:
             raise ValueError(f"{context} must reuse rotation_v4 norm stats")
         if norm_identity.get("action_indices_identity") != expected.get("action_indices_identity"):

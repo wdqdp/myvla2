@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass
+from dataclasses import replace
 from datetime import datetime
 import hashlib
 import json
@@ -79,6 +80,19 @@ def noise_sha256(noise: np.ndarray) -> str:
     return hashlib.sha256(value.tobytes(order="C")).hexdigest()
 
 
+def gripper_command_with_safety_floor(
+    raw_command: float,
+    *,
+    gripper_offset: float,
+    gripper_min: float,
+) -> tuple[float, float, bool]:
+    """Apply the calibration offset, then floor the final published command."""
+
+    offset_command = float(raw_command) - float(gripper_offset)
+    published_command = max(float(gripper_min), offset_command)
+    return offset_command, published_command, published_command > offset_command
+
+
 def _jsonable(value: Any) -> Any:
     if isinstance(value, np.ndarray):
         return value.tolist()
@@ -139,6 +153,7 @@ class ControlSignal:
     kind: Literal["trigger", "continue", "select", "quit"]
     key: str
     selected_phase: Phase | None = None
+    observation: FrozenObservation | None = None
 
 
 def _joint_timestamp(joint_state: Any) -> float | None:
@@ -246,8 +261,13 @@ def _capture_observation(
     captioner: Any,
     *,
     reset_history: bool,
+    after_timestamp: float | None = None,
 ) -> FrozenObservation:
-    img_front, img_left, puppet_arm = runtime.get_ros_observation(args, operator)
+    img_front, img_left, puppet_arm = runtime.get_ros_observation(
+        args,
+        operator,
+        after_timestamp=after_timestamp,
+    )
     qpos = np.asarray(puppet_arm.position, dtype=np.float32)
     if qpos.shape != (7,) or not np.isfinite(qpos).all():
         raise ValueError(f"Expected finite qpos [7], got {qpos.shape}")
@@ -263,6 +283,32 @@ def _capture_observation(
         state_history=np.asarray(state_history, dtype=np.float32),
         state_history_mask=np.asarray(state_history_mask, dtype=np.bool_),
         tactile_caption=str(tactile_caption),
+    )
+
+
+def _capture_delayed_history_snapshot(
+    args: argparse.Namespace,
+    operator: Any,
+    captioner: Any,
+    *,
+    chunk_completed_timestamp: float,
+) -> FrozenObservation:
+    """Let post-command feedback enter history, then snapshot only its values.
+
+    The images and qpos in this object are diagnostic.  They are not reused for
+    the next model request; pressing the continue key captures those fields
+    again from a frame newer than the key press.
+    """
+
+    delay = float(args.history_freeze_delay_seconds)
+    if delay > 0.0:
+        time.sleep(delay)
+    return _capture_observation(
+        args,
+        operator,
+        captioner,
+        reset_history=False,
+        after_timestamp=chunk_completed_timestamp,
     )
 
 
@@ -339,11 +385,12 @@ def _start_forced_recovery(
             operator,
             captioner,
             reset_history=True,
+            after_timestamp=time.time(),
         )
     else:
         operator.reset_state_history()
         frozen = _as_new_attempt_observation(args, locked_observation)
-        _resume_state_history(args, operator, frozen)
+    _resume_state_history(args, operator, frozen)
     image_paths = logger.save_trigger_images(frozen.img_front, frozen.img_left)
     logger.record(
         {
@@ -487,7 +534,14 @@ def _publish_raw_action(
             return pre_action, published_count, ControlSignal("quit", "shutdown")
 
         published_action = np.asarray(action, dtype=np.float32).copy()
-        published_action[6] = max(0.0, float(published_action[6]) - args.gripper_offset)
+        gripper_after_offset, gripper_command, gripper_min_applied = (
+            gripper_command_with_safety_floor(
+                float(published_action[6]),
+                gripper_offset=args.gripper_offset,
+                gripper_min=args.gripper_min,
+            )
+        )
+        published_action[6] = gripper_command
         if args.no_publish:
             runtime.published_actions_history.append(published_action.copy())
             command_timestamp = None
@@ -507,6 +561,9 @@ def _publish_raw_action(
                 "interpolation_count": len(interpolated),
                 "raw_action": raw_action,
                 "published_action": published_action,
+                "gripper_after_offset": gripper_after_offset,
+                "gripper_min": args.gripper_min,
+                "gripper_min_applied": gripper_min_applied,
                 "command_timestamp": command_timestamp,
                 "feedback_qpos": feedback_qpos,
                 "feedback_timestamp": feedback_timestamp,
@@ -542,14 +599,15 @@ def _wait_for_chunk_continue(
     *,
     args: argparse.Namespace,
     operator: Any,
+    captioner: Any,
     keyboard: Any,
     logger: TrialLogger,
     phase: Phase,
     phase_index: int,
     published_steps: int,
-    locked_observation: FrozenObservation,
+    locked_history: FrozenObservation,
 ) -> ControlSignal:
-    """Pause after a chunk; phase selection never advances frozen history."""
+    """Pause with history locked, then capture live image/qpos on continue."""
 
     _pause_state_history(operator)
     pause_started = time.monotonic()
@@ -559,13 +617,15 @@ def _wait_for_chunk_continue(
             "phase": phase,
             "phase_index": phase_index,
             "published_steps": published_steps,
-            "observation_timestamp": locked_observation.timestamp,
-            "locked_qpos": locked_observation.qpos,
-            "locked_state_history": locked_observation.state_history,
-            "locked_state_history_mask": locked_observation.state_history_mask,
+            "history_freeze_delay_seconds": args.history_freeze_delay_seconds,
+            "history_freeze_timestamp": locked_history.timestamp,
+            "history_freeze_qpos": locked_history.qpos,
+            "locked_state_history": locked_history.state_history,
+            "locked_state_history_mask": locked_history.state_history_mask,
             "locked_state_history_valid_frames": int(
-                locked_observation.state_history_mask.sum()
+                locked_history.state_history_mask.sum()
             ),
+            "observation_frozen": False,
         }
     )
     selected_phase: Phase = phase
@@ -607,7 +667,20 @@ def _wait_for_chunk_continue(
             )
             continue
         if signal_value.kind == "continue":
-            anchor_timestamp = _resume_state_history(args, operator, locked_observation)
+            continue_requested_timestamp = time.time()
+            realtime_observation = _capture_observation(
+                args,
+                operator,
+                captioner,
+                reset_history=False,
+                after_timestamp=continue_requested_timestamp,
+            )
+            realtime_observation = replace(
+                realtime_observation,
+                state_history=locked_history.state_history.copy(),
+                state_history_mask=locked_history.state_history_mask.copy(),
+            )
+            anchor_timestamp = _resume_state_history(args, operator, realtime_observation)
             logger.record(
                 {
                     "event": "chunk_continue",
@@ -615,14 +688,22 @@ def _wait_for_chunk_continue(
                     "phase_index": phase_index,
                     "published_steps": published_steps,
                     "paused_seconds": paused_seconds,
+                    "continue_requested_timestamp": continue_requested_timestamp,
+                    "realtime_observation_timestamp": realtime_observation.timestamp,
+                    "realtime_qpos": realtime_observation.qpos,
                     "history_resume_timestamp": anchor_timestamp,
                     "state_history_valid_frames": int(
-                        locked_observation.state_history_mask.sum()
+                        locked_history.state_history_mask.sum()
                     ),
                     "selected_phase": selected_phase,
                 }
             )
-            return ControlSignal("continue", signal_value.key, selected_phase)
+            return ControlSignal(
+                "continue",
+                signal_value.key,
+                selected_phase,
+                realtime_observation,
+            )
         logger.record(
             {
                 "event": "chunk_pause_signal",
@@ -666,7 +747,13 @@ def run_ablation(
         f"kind={metadata['checkpoint_kind']} checkpoint={metadata['checkpoint']}"
     )
     print(
-        "Each complete chunk pauses with its observation/history frozen; "
+        "Gripper safety floor enabled on the final published joint-7 command: "
+        f"min={args.gripper_min:.6f} m (offset={args.gripper_offset:.6f} m)"
+    )
+    print(
+        "Each complete chunk records "
+        f"{args.history_freeze_delay_seconds:g} more seconds of feedback, then pauses with "
+        "history frozen; pressing s captures live images/qpos for the next request. "
         f"1/2/3 selects the next phase and {args.continue_key} executes it; q=quit. "
         "During EXECUTION, SPACE discards the remaining chunk, starts a new attempt, "
         "resets history, and enters REPOSITION."
@@ -767,23 +854,26 @@ def run_ablation(
         if control_signal is None:
             if published_steps >= args.max_publish_step:
                 continue
-            # Snapshot immediately after the final command, then stop accepting
-            # qpos callbacks into the model history for the entire operator wait.
-            locked_observation = _capture_observation(
+            # Keep accepting callbacks for the configured post-command window.
+            # Only history from the resulting snapshot is retained; image/qpos
+            # for the next request are captured live after the operator presses s.
+            chunk_completed_timestamp = time.time()
+            locked_history = _capture_delayed_history_snapshot(
                 args,
                 operator,
                 captioner,
-                reset_history=False,
+                chunk_completed_timestamp=chunk_completed_timestamp,
             )
             pause_signal = _wait_for_chunk_continue(
                 args=args,
                 operator=operator,
+                captioner=captioner,
                 keyboard=keyboard,
                 logger=logger,
                 phase=phase,
                 phase_index=phase_index,
                 published_steps=published_steps,
-                locked_observation=locked_observation,
+                locked_history=locked_history,
             )
             if _handle_terminal_signal(
                 pause_signal,
@@ -794,6 +884,8 @@ def run_ablation(
                 return
             if pause_signal.kind == "continue":
                 next_phase = pause_signal.selected_phase or phase
+                if pause_signal.observation is None:
+                    raise AssertionError("Continue signal lacks its realtime observation")
                 if next_phase != phase:
                     logger.record(
                         {
@@ -806,8 +898,8 @@ def run_ablation(
                         }
                     )
                 phase = next_phase
-                pending_observation = locked_observation
-                pre_action = locked_observation.qpos.copy()
+                pending_observation = pause_signal.observation
+                pre_action = pause_signal.observation.qpos.copy()
                 continue
             if pause_signal.kind != "trigger" or phase != "execution":
                 raise AssertionError(
@@ -820,7 +912,6 @@ def run_ablation(
                 logger=logger,
                 published_steps=published_steps,
                 discarded_raw_actions=0,
-                locked_observation=locked_observation,
             )
             phase = "reposition"
             pre_action = frozen.qpos.copy()
@@ -892,6 +983,16 @@ def get_arguments() -> tuple[argparse.Namespace, argparse.ArgumentParser]:
     parser.add_argument("--chunk_size", type=int, default=30)
     parser.add_argument("--publish_rate", type=int, default=30)
     parser.add_argument("--observation-poll-rate", type=int, default=200)
+    parser.add_argument(
+        "--history-freeze-delay-seconds",
+        type=float,
+        default=1.0,
+        help=(
+            "After the final action in each complete chunk, keep recording state history for "
+            "this many seconds before locking it for the operator pause. Images and current "
+            "qpos are always captured live after the continue key is pressed."
+        ),
+    )
     parser.add_argument("--state-history-len", type=int, default=60)
     parser.add_argument("--state-history-fps", type=float, default=runtime.DEFAULT_STATE_HISTORY_FPS)
     parser.add_argument("--state-history-max-gap-seconds", type=float, default=0.02)
@@ -916,7 +1017,7 @@ def get_arguments() -> tuple[argparse.Namespace, argparse.ArgumentParser]:
         dest="continue_key",
         default="s",
         help=(
-            "Continue from the frozen pause into the next chunk. "
+            "Capture a live observation and continue with the history frozen after the prior chunk. "
             "--success-key is retained as a deprecated command-line alias."
         ),
     )
@@ -934,6 +1035,17 @@ def get_arguments() -> tuple[argparse.Namespace, argparse.ArgumentParser]:
         default=[0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.2],
     )
     parser.add_argument("--gripper_offset", type=float, default=0.001)
+    parser.add_argument(
+        "--gripper-min",
+        "--gripper_min",
+        dest="gripper_min",
+        type=float,
+        required=True,
+        help=(
+            "Safety floor in metres for the final published joint-7 gripper command. "
+            "The floor is applied after --gripper_offset."
+        ),
+    )
     args = parser.parse_args()
     return args, parser
 
@@ -968,10 +1080,19 @@ def validate_args(args: argparse.Namespace, parser: argparse.ArgumentParser) -> 
         parser.error("--max_publish_step must be positive")
     if args.noise_seed < 0:
         parser.error("--noise-seed must be non-negative")
+    if not np.isfinite(args.gripper_offset) or args.gripper_offset < 0:
+        parser.error("--gripper_offset must be finite and non-negative")
+    if not np.isfinite(args.gripper_min) or not 0.0 <= args.gripper_min <= 0.08:
+        parser.error("--gripper-min must be finite and in the physical command range [0, 0.08]")
     if not 1 <= args.chunk_size <= ACTION_NOISE_SHAPE[0]:
         parser.error("--chunk_size must be in [1, 30]")
     if args.publish_rate <= 0 or args.observation_poll_rate <= 0:
         parser.error("publish and observation polling rates must be positive")
+    if (
+        not np.isfinite(args.history_freeze_delay_seconds)
+        or args.history_freeze_delay_seconds < 0
+    ):
+        parser.error("--history-freeze-delay-seconds must be finite and non-negative")
     if args.state_history_len != 60:
         parser.error("--state-history-len must be 60 for this V3 ablation")
     if args.state_history_fps <= 0 or args.state_history_max_gap_seconds <= 0:

@@ -50,6 +50,41 @@ class _Keyboard:
         return self.keys.pop(0) if self.keys else None
 
 
+class _Operator:
+    def is_shutdown(self):
+        return False
+
+
+class _ControlRate:
+    def sleep(self):
+        pass
+
+
+class _PauseOperator:
+    def __init__(self):
+        self.history_paused = False
+        self.resumed = []
+
+    def is_shutdown(self):
+        return False
+
+    def rate(self, _hz):
+        return _ControlRate()
+
+    def pause_state_history(self):
+        self.history_paused = True
+
+    def resume_state_history(self, history, mask, *, current_timestamp):
+        self.resumed.append(
+            (
+                np.asarray(history).copy(),
+                np.asarray(mask).copy(),
+                float(current_timestamp),
+            )
+        )
+        self.history_paused = False
+
+
 def _args(profile: str):
     return argparse.Namespace(
         instruction="Pick object",
@@ -60,6 +95,7 @@ def _args(profile: str):
         rotation_direction="right",
         quit_key="q",
         continue_key="s",
+        history_freeze_delay_seconds=1.0,
     )
 
 
@@ -126,6 +162,88 @@ def test_phase_selection_is_pause_only_and_does_not_execute() -> None:
     ) is None
 
 
+def test_history_snapshot_waits_then_requires_a_post_chunk_frame(monkeypatch) -> None:
+    args = _args("phase_v1")
+    args.history_freeze_delay_seconds = 1.0
+    sleep_calls = []
+    capture_calls = []
+    expected = _observation()
+
+    monkeypatch.setattr(client.time, "sleep", sleep_calls.append)
+
+    def capture(args, operator, captioner, *, reset_history, after_timestamp=None):
+        capture_calls.append((args, operator, captioner, reset_history, after_timestamp))
+        return expected
+
+    monkeypatch.setattr(client, "_capture_observation", capture)
+    operator = _Operator()
+    result = client._capture_delayed_history_snapshot(
+        args,
+        operator,
+        None,
+        chunk_completed_timestamp=12.5,
+    )
+
+    assert result is expected
+    assert sleep_calls == [1.0]
+    assert capture_calls == [(args, operator, None, False, 12.5)]
+
+
+def test_continue_uses_live_observation_with_frozen_history(monkeypatch, tmp_path: Path) -> None:
+    args = _args("phase_v1")
+    args.observation_poll_rate = 200
+    locked_history = _observation()
+    locked_history = client.replace(
+        locked_history,
+        qpos=np.full(7, 1.0, dtype=np.float32),
+        state_history=np.full((60, 7), 3.0, dtype=np.float32),
+    )
+    realtime = client.replace(
+        _observation(),
+        qpos=np.full(7, 8.0, dtype=np.float32),
+        timestamp=51.0,
+        state_history=np.full((60, 7), 9.0, dtype=np.float32),
+    )
+    capture_after = []
+
+    monkeypatch.setattr(client.time, "time", lambda: 50.0)
+
+    def capture(_args, _operator, _captioner, *, reset_history, after_timestamp=None):
+        assert not reset_history
+        capture_after.append(after_timestamp)
+        return realtime
+
+    monkeypatch.setattr(client, "_capture_observation", capture)
+    operator = _PauseOperator()
+    logger = client.TrialLogger(tmp_path, trial_id=None)
+    signal = client._wait_for_chunk_continue(
+        args=args,
+        operator=operator,
+        captioner=None,
+        keyboard=_Keyboard(["3", "s"]),
+        logger=logger,
+        phase="reposition",
+        phase_index=4,
+        published_steps=30,
+        locked_history=locked_history,
+    )
+
+    assert signal.kind == "continue"
+    assert signal.selected_phase == "adjustment"
+    assert signal.observation is not None
+    np.testing.assert_array_equal(signal.observation.qpos, realtime.qpos)
+    np.testing.assert_array_equal(signal.observation.state_history, locked_history.state_history)
+    np.testing.assert_array_equal(
+        signal.observation.state_history_mask,
+        locked_history.state_history_mask,
+    )
+    assert capture_after == [50.0]
+    assert not operator.history_paused
+    assert len(operator.resumed) == 1
+    np.testing.assert_array_equal(operator.resumed[0][0], locked_history.state_history)
+    assert operator.resumed[0][2] == realtime.timestamp
+
+
 def test_noise_is_stable_for_same_phase_chunk_and_seed() -> None:
     for phase in ("execution", "reposition", "adjustment"):
         first = client.deterministic_action_noise(9, phase=phase, index=4)
@@ -135,6 +253,61 @@ def test_noise_is_stable_for_same_phase_chunk_and_seed() -> None:
         client.deterministic_action_noise(9, phase="reposition", index=4),
         client.deterministic_action_noise(9, phase="adjustment", index=4),
     )
+
+
+def test_gripper_safety_floor_applies_after_offset() -> None:
+    after_offset, published, was_clamped = client.gripper_command_with_safety_floor(
+        0.020,
+        gripper_offset=0.001,
+        gripper_min=0.024,
+    )
+    assert after_offset == 0.019
+    assert published == 0.024
+    assert was_clamped
+
+    after_offset, published, was_clamped = client.gripper_command_with_safety_floor(
+        0.030,
+        gripper_offset=0.001,
+        gripper_min=0.024,
+    )
+    assert after_offset == 0.028999999999999998
+    assert published == after_offset
+    assert not was_clamped
+
+
+def test_published_action_cannot_go_below_gripper_safety_floor(tmp_path: Path) -> None:
+    args = argparse.Namespace(
+        use_actions_interpolation=False,
+        quit_key="q",
+        gripper_offset=0.001,
+        gripper_min=0.024,
+        no_publish=True,
+    )
+    raw_action = np.zeros(7, dtype=np.float32)
+    raw_action[6] = 0.020
+    client.runtime.shutdown_event.clear()
+    client.runtime.published_actions_history.clear()
+    logger = client.TrialLogger(tmp_path, trial_id=None)
+
+    _, published_count, control = client._publish_raw_action(
+        args=args,
+        operator=_Operator(),
+        keyboard=_Keyboard([]),
+        logger=logger,
+        phase="execution",
+        phase_index=0,
+        action_index=0,
+        raw_action=raw_action,
+        pre_action=np.zeros(7, dtype=np.float32),
+        control_rate=_ControlRate(),
+    )
+
+    assert published_count == 1
+    assert control is None
+    assert np.isclose(client.runtime.published_actions_history[-1][6], 0.024)
+    event = logger.events_path.read_text().strip()
+    assert '"gripper_min_applied":true' in event
+    client.runtime.published_actions_history.clear()
 
 
 def test_rotation_targets_support_all_directions_and_both_magnitudes() -> None:
