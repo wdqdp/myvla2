@@ -6,6 +6,7 @@ from pathlib import Path
 import sys
 
 import numpy as np
+import pytest
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -132,6 +133,39 @@ def test_v5_uses_three_distinct_prompts_and_execution_mode(tmp_path: Path) -> No
     assert all("Touch[" not in prompt for prompt in prompts)
 
 
+def test_v52_uses_two_prompts_and_never_sends_reposition(tmp_path: Path) -> None:
+    args = _args("phase_v2")
+    policy = _Policy()
+    logger = client.TrialLogger(tmp_path, trial_id=None)
+    for phase in ("execution", "adjustment"):
+        client._request_action_chunk(
+            args=args,
+            policy=policy,
+            logger=logger,
+            observation=_observation(),
+            phase=phase,
+            phase_index=0,
+        )
+    prompts = [request["prompt"] for request in policy.requests]
+    assert prompts == [
+        "Mode: execution. Task: Pick object.",
+        (
+            "Mode: adjustment. Task: Pick object.\n"
+            "Put the object back, and follow this recovery plan: " + PLAN
+        ),
+    ]
+    assert all(request["mode"] == "execution" for request in policy.requests)
+    with pytest.raises(ValueError, match="reposition"):
+        client._request_action_chunk(
+            args=args,
+            policy=policy,
+            logger=logger,
+            observation=_observation(),
+            phase="reposition",
+            phase_index=0,
+        )
+
+
 def test_v4_reposition_and_adjustment_use_same_old_recovery_prompt(tmp_path: Path) -> None:
     args = _args("minimal_v1")
     policy = _Policy()
@@ -160,6 +194,62 @@ def test_phase_selection_is_pause_only_and_does_not_execute() -> None:
     assert client._poll_control_key(
         args, _Keyboard(["3"]), phase="execution", chunk_paused=False
     ) is None
+
+
+def test_v52_phase_controls_start_attempt2_in_adjustment() -> None:
+    args = _args("phase_v2")
+    selected = client._poll_control_key(
+        args,
+        _Keyboard(["2"]),
+        phase="execution",
+        chunk_paused=True,
+    )
+    assert selected.kind == "select"
+    assert selected.selected_phase == "adjustment"
+    assert client._poll_control_key(
+        args,
+        _Keyboard(["3"]),
+        phase="execution",
+        chunk_paused=True,
+    ) is None
+    assert client.forced_attempt_start_phase("phase_v2") == "adjustment"
+    assert client.forced_attempt_start_phase("phase_v1") == "reposition"
+
+
+def test_v52_server_metadata_pair_is_strict() -> None:
+    args = argparse.Namespace(
+        expected_data_profile="rotation_phase_v5_adjustment_v2",
+        state_history_len=60,
+        state_history_fps=30.0,
+        chunk_size=30,
+    )
+    metadata = {
+        "action_only_ablation": True,
+        "supports_action_noise": True,
+        "action_noise_shape": [30, 32],
+        "action_horizon": 30,
+        "action_dim": 32,
+        "output_action_dim": 7,
+        "use_state_history": True,
+        "state_history_len": 60,
+        "state_history_dim": 7,
+        "state_history_fps": 30.0,
+        "checkpoint_kind": "stage-a",
+        "data_profile": "rotation_phase_v5_adjustment_v2",
+        "prompt_profile": "phase_v2",
+        "experiment_kind": "phase_prompt_h30_terminal_hold",
+    }
+    client.validate_server_metadata(args, metadata)
+    with pytest.raises(ValueError, match="experiment/prompt profile mismatch"):
+        client.validate_server_metadata(
+            args,
+            metadata | {"experiment_kind": "phase_prompt_only"},
+        )
+    with pytest.raises(ValueError, match="requires a Stage A checkpoint"):
+        client.validate_server_metadata(
+            args,
+            metadata | {"checkpoint_kind": "stage-b"},
+        )
 
 
 def test_history_snapshot_waits_then_requires_a_post_chunk_frame(monkeypatch) -> None:

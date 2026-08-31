@@ -86,7 +86,7 @@ def test_generic_fk_applies_revolute_joint_before_child_offset(tmp_path: Path) -
     np.testing.assert_allclose(positions[1], [0.0, 1.0, 0.0], atol=1e-12)
 
 
-def test_rexecution_detector_finds_stable_horizontal_endpoint(
+def test_rexecution_detector_finds_first_sustained_post_apex_descent(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     frames = 220
@@ -124,10 +124,16 @@ def test_rexecution_detector_finds_stable_horizontal_endpoint(
         fk_chain=fake_chain,
     )
     assert isinstance(detected, DetectedRexecution)
-    assert 115 <= detected.rexecution_frame <= 130
-    assert detected.rexecution_frame < detected.close_start_frame
+    assert 125 <= detected.rexecution_frame <= 140
+    assert detected.last_effective_translation_frame == detected.rexecution_frame - 1
+    assert detected.apex_frame <= detected.rexecution_frame
+    assert detected.boundary_trigger == "sustained_descent_10mm"
     assert detected.horizontal_displacement_m == pytest.approx(0.050, abs=0.002)
     assert detected.lift_height_m >= 0.055
+    assert detected.z_drop_over_confirmation_window_m <= -0.010
+    assert detected.downward_velocity_fraction >= 0.80
+    assert detected.descent_confirmation_frames == 10
+    assert detected.minimum_z_drop_m == 0.010
 
 
 def test_rexecution_detector_rejects_small_horizontal_displacement(
@@ -161,7 +167,7 @@ def test_rexecution_detector_rejects_small_horizontal_displacement(
         )
 
 
-def test_rexecution_detector_preempts_endpoint_when_safe_closing_starts(
+def test_rexecution_detector_rejects_when_no_sustained_descent_exists(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     frames = 200
@@ -187,16 +193,14 @@ def test_rexecution_detector_preempts_endpoint_when_safe_closing_starts(
         joints=(),
         revolute_joint_count=6,
     )
-    detected = detect_rexecution_frame(
-        puppet_right=qpos,
-        timestamp=np.arange(frames, dtype=np.float64) / 30.0,
-        release_frame=release,
-        regrasp_frame=regrasp,
-        fk_chain=fake_chain,
-    )
-    assert detected.boundary_trigger == "closing_preempted_endpoint"
-    assert detected.rexecution_frame == detected.close_start_frame
-    assert detected.rexecution_frame < detected.horizontal_endpoint_frame
+    with pytest.raises(PhaseBoundaryError, match="No sustained post-apex descent"):
+        detect_rexecution_frame(
+            puppet_right=qpos,
+            timestamp=np.arange(frames, dtype=np.float64) / 30.0,
+            release_frame=release,
+            regrasp_frame=regrasp,
+            fk_chain=fake_chain,
+        )
 
 
 def test_v2_override_preserves_contact_values_and_accepts_rexecution_timestamp(

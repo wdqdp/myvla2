@@ -229,6 +229,56 @@ def test_v4_stage_a_action_server_validates_actual_norm_sha(
         serve.validate_v4_norm_artifacts(args, config)
 
 
+def test_v52_stage_a_action_server_validates_profile_experiment_and_v4_norm(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    serve = _load_script(
+        "serve_v52_action_validation_test_module",
+        "scripts/serve_tactile_vla_action_ablation.py",
+    )
+    identity = {
+        "data_profile": "rotation_phase_v5_adjustment_v2",
+        "prompt_profile": "phase_v2",
+        "v4_norm_stats_sha256": "a" * 64,
+    }
+    config = {
+        "data_profile": "rotation_phase_v5_adjustment_v2",
+        "prompt_profile": "phase_v2",
+        "experiment_kind": "phase_prompt_h30_terminal_hold",
+        "artifact_identity": identity,
+    }
+    monkeypatch.setattr(
+        serve,
+        "validate_norm_stats_identity",
+        lambda *_args, **_kwargs: {"norm_stats_sha256": identity["v4_norm_stats_sha256"]},
+    )
+    args = argparse.Namespace(
+        checkpoint=tmp_path / "stage_a" / "15000",
+        checkpoint_kind="stage-a",
+        norm_stats_dir=tmp_path / "norm",
+    )
+    assert serve.validate_v4_norm_artifacts(args, config) == {
+        "norm_stats_sha256": identity["v4_norm_stats_sha256"]
+    }
+    with pytest.raises(ValueError, match="prompt_profile='phase_v2'"):
+        serve.validate_v4_norm_artifacts(args, config | {"prompt_profile": "phase_v1"})
+    with pytest.raises(ValueError, match="phase_prompt_h30_terminal_hold"):
+        serve.validate_v4_norm_artifacts(
+            args,
+            config | {"experiment_kind": "phase_prompt_only"},
+        )
+    with pytest.raises(ValueError, match="has no Stage B checkpoint"):
+        serve.validate_v4_norm_artifacts(
+            argparse.Namespace(
+                checkpoint=tmp_path / "stage_a" / "15000",
+                checkpoint_kind="stage-b",
+                norm_stats_dir=tmp_path / "norm",
+            ),
+            config,
+        )
+
+
 def test_action_server_metadata_excludes_v5_per_frame_training_lookup() -> None:
     serve = _load_script(
         "serve_v5_metadata_summary_test_module",

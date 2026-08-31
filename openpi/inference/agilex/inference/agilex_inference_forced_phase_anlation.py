@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: UTF-8 -*-
-"""Manual execution/reposition/adjustment prompt ablation for V4 and V5."""
+"""Manual phase-prompt ablation for V4, V5, and two-phase V5.2."""
 
 # ruff: noqa: E402
 
@@ -30,10 +30,11 @@ import agilex_inference_tactile_vla_sync_single as runtime
 import cv2
 import numpy as np
 from openpi_client import websocket_client_policy
-from tactile_vla.vla.prompts import build_execution_prompt
-from tactile_vla.vla.prompts import build_phase_prompt
 from tactile_vla.vla.prompts import MINIMAL_PROMPT_PROFILE
 from tactile_vla.vla.prompts import PHASE_PROMPT_PROFILE
+from tactile_vla.vla.prompts import PHASE_PROMPT_PROFILE_V2
+from tactile_vla.vla.prompts import build_execution_prompt
+from tactile_vla.vla.prompts import build_phase_prompt
 from tactile_vla.vla.prompts import resolve_prompt_profile
 from tactile_vla.vla.structured_text import failure_reason_text
 from tactile_vla.vla.structured_text import legal_failure_reasons
@@ -46,11 +47,43 @@ DEFAULT_LOG_ROOT = PROJECT_ROOT / "outputs" / "runtime" / "forced_phase_ablation
 ACTION_NOISE_SHAPE = (30, 32)
 ROTATION_DIRECTIONS = ("right", "left", "front", "back")
 Phase = Literal["execution", "reposition", "adjustment"]
-PHASE_KEYS: dict[str, Phase] = {
+LEGACY_PHASE_KEYS: dict[str, Phase] = {
     "1": "execution",
     "2": "reposition",
     "3": "adjustment",
 }
+V2_PHASE_KEYS: dict[str, Phase] = {
+    "1": "execution",
+    "2": "adjustment",
+}
+ALL_PHASE_CONTROL_KEYS = frozenset(LEGACY_PHASE_KEYS) | frozenset(V2_PHASE_KEYS)
+PROFILE_SPECS = {
+    MINIMAL_PROMPT_PROFILE: ("rotation_v4", None),
+    PHASE_PROMPT_PROFILE: ("rotation_phase_v5", "phase_prompt_only"),
+    PHASE_PROMPT_PROFILE_V2: (
+        "rotation_phase_v5_adjustment_v2",
+        "phase_prompt_h30_terminal_hold",
+    ),
+}
+
+
+def phase_key_bindings(prompt_profile: str) -> dict[str, Phase]:
+    profile = resolve_prompt_profile(prompt_profile)
+    return V2_PHASE_KEYS if profile == PHASE_PROMPT_PROFILE_V2 else LEGACY_PHASE_KEYS
+
+
+def forced_attempt_start_phase(prompt_profile: str) -> Phase:
+    return (
+        "adjustment"
+        if resolve_prompt_profile(prompt_profile) == PHASE_PROMPT_PROFILE_V2
+        else "reposition"
+    )
+
+
+def phase_control_description(prompt_profile: str) -> str:
+    if resolve_prompt_profile(prompt_profile) == PHASE_PROMPT_PROFILE_V2:
+        return "1=execution, 2=adjustment"
+    return "1=execution, 2=reposition, 3=adjustment"
 
 
 def rotation_targets(direction: str, magnitude: str) -> tuple[str, str]:
@@ -192,8 +225,9 @@ def _poll_control_key(
         return ControlSignal("quit", key)
     if key == " " and phase == "execution":
         return ControlSignal("trigger", key)
-    if key in PHASE_KEYS and chunk_paused:
-        return ControlSignal("select", key, PHASE_KEYS[key])
+    phase_keys = phase_key_bindings(args.prompt_profile)
+    if key in phase_keys and chunk_paused:
+        return ControlSignal("select", key, phase_keys[key])
     if key == args.continue_key and chunk_paused:
         return ControlSignal("continue", key)
     return None
@@ -239,20 +273,27 @@ def validate_server_metadata(args: argparse.Namespace, metadata: dict[str, Any])
     if args.chunk_size > ACTION_NOISE_SHAPE[0]:
         raise ValueError(f"--chunk_size must be at most 30, got {args.chunk_size}")
     profile = resolve_prompt_profile(metadata.get("prompt_profile"))
-    if profile not in {MINIMAL_PROMPT_PROFILE, PHASE_PROMPT_PROFILE}:
+    if profile not in PROFILE_SPECS:
         raise ValueError(
-            "Forced phase ablation supports only V4 minimal_v1 or V5 phase_v1 checkpoints"
+            "Forced phase ablation supports only V4 minimal_v1, V5 phase_v1, "
+            "or V5.2 phase_v2 checkpoints"
         )
     data_profile = str(metadata.get("data_profile", "legacy"))
-    expected_pair = {
-        MINIMAL_PROMPT_PROFILE: "rotation_v4",
-        PHASE_PROMPT_PROFILE: "rotation_phase_v5",
-    }[profile]
-    if data_profile != expected_pair:
+    expected_data_profile, expected_experiment = PROFILE_SPECS[profile]
+    if data_profile != expected_data_profile:
         raise ValueError(
             f"Checkpoint data/prompt profile mismatch: data_profile={data_profile!r}, "
             f"prompt_profile={profile!r}"
         )
+    if expected_experiment is not None:
+        experiment_kind = metadata.get("experiment_kind")
+        if experiment_kind != expected_experiment:
+            raise ValueError(
+                "Checkpoint experiment/prompt profile mismatch: "
+                f"experiment_kind={experiment_kind!r}, prompt_profile={profile!r}"
+            )
+        if metadata.get("checkpoint_kind") != "stage-a":
+            raise ValueError(f"{data_profile} forced phase inference requires a Stage A checkpoint")
 
 
 def _capture_observation(
@@ -392,11 +433,12 @@ def _start_forced_recovery(
         frozen = _as_new_attempt_observation(args, locked_observation)
     _resume_state_history(args, operator, frozen)
     image_paths = logger.save_trigger_images(frozen.img_front, frozen.img_left)
+    start_phase = forced_attempt_start_phase(args.prompt_profile)
     logger.record(
         {
             "event": "forced_recovery_trigger",
             "previous_phase": "execution",
-            "phase": "reposition",
+            "phase": start_phase,
             "published_steps": published_steps,
             "discarded_raw_actions": discarded_raw_actions,
             "rotation_direction": args.rotation_direction,
@@ -411,7 +453,7 @@ def _start_forced_recovery(
         }
     )
     print(
-        "REPOSITION started: discarded the remaining EXECUTION chunk; "
+        f"{start_phase.upper()} started: discarded the remaining EXECUTION chunk; "
         f"rotation_direction={args.rotation_direction} plan={args.forced_recovery_plan}"
     )
     return frozen
@@ -427,7 +469,7 @@ def _request_action_chunk(
     phase_index: int,
 ) -> tuple[np.ndarray, np.ndarray]:
     recovery_plan = "" if phase == "execution" else (args.forced_recovery_plan or "")
-    if args.prompt_profile == PHASE_PROMPT_PROFILE:
+    if args.prompt_profile in {PHASE_PROMPT_PROFILE, PHASE_PROMPT_PROFILE_V2}:
         if phase == "adjustment" and not recovery_plan:
             raise ValueError("adjustment requires a forced recovery plan")
         prompt = build_phase_prompt(
@@ -629,7 +671,10 @@ def _wait_for_chunk_continue(
         }
     )
     selected_phase: Phase = phase
-    controls = f"Press 1/2/3 to select execution/reposition/adjustment, then {args.continue_key!r}"
+    controls = (
+        f"Press {phase_control_description(args.prompt_profile)} to select the next phase, "
+        f"then {args.continue_key!r}"
+    )
     if phase == "execution":
         controls += ", SPACE for a new forced-recovery attempt"
     controls += f", or {args.quit_key!r} to quit."
@@ -754,9 +799,10 @@ def run_ablation(
         "Each complete chunk records "
         f"{args.history_freeze_delay_seconds:g} more seconds of feedback, then pauses with "
         "history frozen; pressing s captures live images/qpos for the next request. "
-        f"1/2/3 selects the next phase and {args.continue_key} executes it; q=quit. "
+        f"{phase_control_description(args.prompt_profile)} selects the next phase and "
+        f"{args.continue_key} executes it; q=quit. "
         "During EXECUTION, SPACE discards the remaining chunk, starts a new attempt, "
-        "resets history, and enters REPOSITION."
+        f"resets history, and enters {forced_attempt_start_phase(args.prompt_profile).upper()}."
     )
 
     phase: Phase = "execution"
@@ -791,7 +837,7 @@ def run_ablation(
                 published_steps=published_steps,
                 discarded_raw_actions=0,
             )
-            phase = "reposition"
+            phase = forced_attempt_start_phase(args.prompt_profile)
             pre_action = pending_observation.qpos.copy()
 
         observation = pending_observation or _capture_observation(
@@ -913,7 +959,7 @@ def run_ablation(
                 published_steps=published_steps,
                 discarded_raw_actions=0,
             )
-            phase = "reposition"
+            phase = forced_attempt_start_phase(args.prompt_profile)
             pre_action = frozen.qpos.copy()
             pending_observation = frozen
             continue
@@ -937,7 +983,7 @@ def run_ablation(
             published_steps=published_steps,
             discarded_raw_actions=max(0, limit - completed_actions),
         )
-        phase = "reposition"
+        phase = forced_attempt_start_phase(args.prompt_profile)
         pre_action = frozen.qpos.copy()
         pending_observation = frozen
 
@@ -1101,7 +1147,7 @@ def validate_args(args: argparse.Namespace, parser: argparse.ArgumentParser) -> 
         parser.error("continue/quit keys must each be one character")
     if args.continue_key == args.quit_key or " " in {args.continue_key, args.quit_key}:
         parser.error("continue/quit keys must be distinct and cannot be SPACE")
-    if args.continue_key in PHASE_KEYS or args.quit_key in PHASE_KEYS:
+    if args.continue_key in ALL_PHASE_CONTROL_KEYS or args.quit_key in ALL_PHASE_CONTROL_KEYS:
         parser.error("continue/quit keys cannot be one of the fixed phase keys 1/2/3")
 
 

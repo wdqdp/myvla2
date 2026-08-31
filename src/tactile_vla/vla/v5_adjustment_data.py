@@ -21,7 +21,6 @@ from tactile_vla.vla.v5_phase_data import ALLOWED_TASKS
 from tactile_vla.vla.v5_phase_data import EXPECTED_ATTEMPT_COUNT, EXPECTED_EPISODE_COUNT
 from tactile_vla.vla.v5_phase_data import PhaseBoundaryError
 from tactile_vla.vla.v5_phase_data import _selected_stream_hash
-from tactile_vla.vla.v5_phase_data import _true_runs
 from tactile_vla.vla.v5_phase_data import detect_phase_boundaries
 from tactile_vla.vla.v5_targets import apply_h30_terminal_hold
 
@@ -35,6 +34,12 @@ V2_TRAINING_INDEX_SCHEMA = "tactile_vla_v5_adjustment_training_index_v2"
 V2_SUMMARY_SCHEMA = "tactile_vla_v5_adjustment_summary_v2"
 V2_TERMINAL_HOLD_SCHEMA = "tactile_vla_v5_h30_terminal_hold_v1"
 V2_H30_CONTENT_SCHEMA = "tactile_vla_h30_float32_content_v1"
+V2_REXECUTION_DETECTOR_SCHEMA = "tactile_vla_v5_2_sustained_descent_rexecution_v1"
+V2_REXECUTION_SMOOTHING_FRAMES = 9
+V2_REXECUTION_DESCENT_CONFIRMATION_FRAMES = 10
+V2_REXECUTION_MINIMUM_Z_DROP_M = 0.010
+V2_REXECUTION_MINIMUM_DOWNWARD_VELOCITY_M_PER_S = 0.005
+V2_REXECUTION_MINIMUM_DOWNWARD_VELOCITY_FRACTION = 0.80
 V2_EXPECTED_MODIFIED_CHUNKS = 11_832
 V2_EXPECTED_MODIFIED_ACTION_STEPS = 177_480
 V2Phase = Literal["execution", "adjustment"]
@@ -91,17 +96,21 @@ class PiperFKChain:
 class DetectedRexecution:
     rexecution_frame: int
     rexecution_timestamp: float
-    horizontal_endpoint_frame: int
+    last_effective_translation_frame: int
+    apex_frame: int
+    apex_timestamp: float
     boundary_trigger: str
     horizontal_start_xy: tuple[float, float]
     horizontal_target_xy: tuple[float, float]
     horizontal_displacement_m: float
-    endpoint_tolerance_m: float
-    endpoint_stable_frames: int
-    remaining_stability_fraction: float
     lift_height_m: float
-    close_start_frame: int
+    z_drop_over_confirmation_window_m: float
+    downward_velocity_fraction: float
     smoothing_frames: int
+    descent_confirmation_frames: int
+    minimum_z_drop_m: float
+    minimum_downward_velocity_m_per_s: float
+    minimum_downward_velocity_fraction: float
 
 
 def _require_dataset(handle: h5py.File, logical_name: str) -> tuple[str, h5py.Dataset]:
@@ -322,6 +331,25 @@ def _moving_average(values: np.ndarray, frames: int) -> np.ndarray:
     return (cumulative[frames:] - cumulative[:-frames]) / frames
 
 
+def v2_rexecution_detector_identity() -> dict[str, Any]:
+    payload = {
+        "schema_version": V2_REXECUTION_DETECTOR_SCHEMA,
+        "fk_smoothing_frames": V2_REXECUTION_SMOOTHING_FRAMES,
+        "apex_search_window": "release_frame_through_regrasp_frame_inclusive",
+        "descent_confirmation_frames": V2_REXECUTION_DESCENT_CONFIRMATION_FRAMES,
+        "minimum_z_drop_m": V2_REXECUTION_MINIMUM_Z_DROP_M,
+        "minimum_downward_velocity_m_per_s": (
+            V2_REXECUTION_MINIMUM_DOWNWARD_VELOCITY_M_PER_S
+        ),
+        "minimum_downward_velocity_fraction": (
+            V2_REXECUTION_MINIMUM_DOWNWARD_VELOCITY_FRACTION
+        ),
+        "boundary_trigger": "sustained_descent_10mm",
+    }
+    payload["sha256"] = sha256_json(payload)
+    return payload
+
+
 def detect_rexecution_frame(
     *,
     puppet_right: Sequence[Sequence[float]],
@@ -329,10 +357,13 @@ def detect_rexecution_frame(
     release_frame: int,
     regrasp_frame: int,
     fk_chain: PiperFKChain,
-    smoothing_frames: int = 9,
-    endpoint_stable_frames: int = 10,
+    smoothing_frames: int = V2_REXECUTION_SMOOTHING_FRAMES,
+    descent_confirmation_frames: int = V2_REXECUTION_DESCENT_CONFIRMATION_FRAMES,
+    minimum_z_drop_m: float = V2_REXECUTION_MINIMUM_Z_DROP_M,
+    minimum_downward_velocity_m_per_s: float = V2_REXECUTION_MINIMUM_DOWNWARD_VELOCITY_M_PER_S,
+    minimum_downward_velocity_fraction: float = V2_REXECUTION_MINIMUM_DOWNWARD_VELOCITY_FRACTION,
 ) -> DetectedRexecution:
-    """Detect the final stable horizontal target entry before re-execution."""
+    """Detect the first sustained descent after the post-release lift apex."""
 
     qpos = np.asarray(puppet_right, dtype=np.float64)
     timestamps = np.asarray(timestamp, dtype=np.float64)
@@ -342,7 +373,15 @@ def detect_rexecution_frame(
         raise PhaseBoundaryError(
             f"Rexecution search has invalid contact window {release_frame}..{regrasp_frame}"
         )
-    if regrasp_frame - release_frame < endpoint_stable_frames + 20:
+    if np.any(np.diff(timestamps) <= 0):
+        raise PhaseBoundaryError("Rexecution detector requires strictly increasing timestamps")
+    if descent_confirmation_frames <= 0:
+        raise ValueError("descent_confirmation_frames must be positive")
+    if minimum_z_drop_m <= 0 or minimum_downward_velocity_m_per_s <= 0:
+        raise ValueError("Rexecution descent distance and velocity thresholds must be positive")
+    if not 0.0 < minimum_downward_velocity_fraction <= 1.0:
+        raise ValueError("minimum_downward_velocity_fraction must be in (0,1]")
+    if regrasp_frame - release_frame < descent_confirmation_frames + 20:
         raise PhaseBoundaryError("Release/regrasp window is too short for rexecution detection")
 
     positions = _moving_average(piper_fk_positions(qpos[:, :6], fk_chain), smoothing_frames)
@@ -358,72 +397,62 @@ def detect_rexecution_frame(
         raise PhaseBoundaryError(
             f"Horizontal recovery displacement {displacement:.6f} m is below 0.010 m"
         )
-    tolerance = min(0.012, max(0.004, 0.10 * displacement))
-    distance = np.linalg.norm(positions[:, :2] - target_xy, axis=1)
 
-    candidate: int | None = None
-    stability_fraction = 0.0
-    search_end = regrasp_frame - endpoint_stable_frames
-    for frame in range(release_frame + 10, search_end + 1):
-        if float(np.max(distance[frame : frame + endpoint_stable_frames])) > tolerance:
-            continue
-        fraction = float(np.mean(distance[frame : regrasp_frame + 1] <= 2.0 * tolerance))
-        if fraction >= 0.90:
-            candidate = frame
-            stability_fraction = fraction
-            break
-    if candidate is None:
-        raise PhaseBoundaryError("No stable horizontal target entry before regrasp")
-
-    gripper = qpos[:, 6]
-    p5, p95 = np.percentile(gripper, (5.0, 95.0))
-    span = float(p95 - p5)
-    if span <= np.finfo(np.float64).eps * max(abs(float(p5)), abs(float(p95)), 1.0) * 100:
-        raise PhaseBoundaryError("Puppet gripper cannot define relative closing progress")
-    progress = np.clip((gripper - p5) / span, 0.0, 1.0)
-    peak = release_frame + int(np.argmax(progress[release_frame : regrasp_frame + 1]))
-    close_runs = [
-        run
-        for run in _true_runs(progress[peak : regrasp_frame + 1] < 0.85)
-        if run[1] - run[0] + 1 >= 5
-    ]
-    close_start = peak + close_runs[0][0] if close_runs else regrasp_frame
-    rexecution_frame = candidate
-    boundary_trigger = "horizontal_endpoint_stable"
-    if close_start < candidate:
-        horizontal_progress = 1.0 - float(distance[close_start] / displacement)
-        if distance[close_start] > 2.0 * tolerance or horizontal_progress < 0.80:
-            raise PhaseBoundaryError(
-                f"Closing starts at {close_start} before a safe horizontal endpoint at {candidate}; "
-                f"distance={distance[close_start]:.6f}, progress={horizontal_progress:.3f}"
-            )
-        # Safety takes precedence over the last few millimeters of horizontal
-        # convergence: the first real closing frame must belong to execution.
-        rexecution_frame = close_start
-        boundary_trigger = "closing_preempted_endpoint"
+    z = positions[:, 2]
+    apex_frame = release_frame + int(np.argmax(z[release_frame : regrasp_frame + 1]))
     release_z = float(positions[release_frame, 2])
-    lift_height = float(
-        np.max(positions[release_frame : rexecution_frame + 1, 2]) - release_z
-    )
+    lift_height = float(z[apex_frame] - release_z)
     if lift_height < 0.020:
         raise PhaseBoundaryError(f"Post-release lift {lift_height:.6f} m is below 0.020 m")
-    if rexecution_frame >= regrasp_frame:
-        raise PhaseBoundaryError("Rexecution frame must precede confirmed regrasp")
+
+    vertical_speed = np.gradient(z, timestamps)
+    rexecution_frame: int | None = None
+    z_drop = 0.0
+    downward_fraction = 0.0
+    search_start = max(apex_frame, release_frame + 1)
+    search_end = regrasp_frame - descent_confirmation_frames
+    for frame in range(search_start, search_end + 1):
+        window_end = frame + descent_confirmation_frames
+        candidate_drop = float(z[window_end] - z[frame])
+        candidate_fraction = float(
+            np.mean(
+                vertical_speed[frame:window_end]
+                <= -minimum_downward_velocity_m_per_s
+            )
+        )
+        if (
+            candidate_drop <= -minimum_z_drop_m
+            and candidate_fraction >= minimum_downward_velocity_fraction
+        ):
+            rexecution_frame = frame
+            z_drop = candidate_drop
+            downward_fraction = candidate_fraction
+            break
+    if rexecution_frame is None:
+        raise PhaseBoundaryError(
+            "No sustained post-apex descent before regrasp; "
+            f"required {minimum_z_drop_m:.6f} m over {descent_confirmation_frames} frames "
+            f"with downward fraction >= {minimum_downward_velocity_fraction:.3f}"
+        )
 
     return DetectedRexecution(
         rexecution_frame=rexecution_frame,
         rexecution_timestamp=float(timestamps[rexecution_frame]),
-        horizontal_endpoint_frame=candidate,
-        boundary_trigger=boundary_trigger,
+        last_effective_translation_frame=rexecution_frame - 1,
+        apex_frame=apex_frame,
+        apex_timestamp=float(timestamps[apex_frame]),
+        boundary_trigger="sustained_descent_10mm",
         horizontal_start_xy=(float(start_xy[0]), float(start_xy[1])),
         horizontal_target_xy=(float(target_xy[0]), float(target_xy[1])),
         horizontal_displacement_m=displacement,
-        endpoint_tolerance_m=float(tolerance),
-        endpoint_stable_frames=endpoint_stable_frames,
-        remaining_stability_fraction=stability_fraction,
         lift_height_m=lift_height,
-        close_start_frame=int(close_start),
+        z_drop_over_confirmation_window_m=z_drop,
+        downward_velocity_fraction=downward_fraction,
         smoothing_frames=smoothing_frames,
+        descent_confirmation_frames=descent_confirmation_frames,
+        minimum_z_drop_m=minimum_z_drop_m,
+        minimum_downward_velocity_m_per_s=minimum_downward_velocity_m_per_s,
+        minimum_downward_velocity_fraction=minimum_downward_velocity_fraction,
     )
 
 
@@ -699,6 +728,7 @@ def build_v5_adjustment_artifacts(
     if extra_overrides:
         raise ValueError(f"V5.2 overrides reference unselected attempts: {extra_overrides[:20]}")
     fk_chain = load_piper_fk_chain(piper_urdf)
+    rexecution_detector = v2_rexecution_detector_identity()
     raw_root = Path(str(profile["raw_data_dir"]))
     boundary_rows: list[dict[str, Any]] = []
     raw_identities: dict[str, Any] = {}
@@ -736,6 +766,7 @@ def build_v5_adjustment_artifacts(
             "raw_label_source_sha256": streams.source_sha256,
             "raw_dataset_names": streams.dataset_names,
             "piper_urdf_sha256": fk_chain.source_sha256,
+            "rexecution_detector_sha256": rexecution_detector["sha256"],
             "first_global_index": attempt_frames[0].global_index,
             "last_global_index": attempt_frames[-1].global_index,
         }
@@ -816,7 +847,7 @@ def build_v5_adjustment_artifacts(
             rexecution_trigger = "override"
         elif detected_rexecution is not None:
             rexecution = detected_rexecution.rexecution_frame
-            rexecution_source = "automatic_fk"
+            rexecution_source = "automatic_fk_sustained_descent"
             rexecution_trigger = detected_rexecution.boundary_trigger
         else:
             unresolved.append(
@@ -984,6 +1015,7 @@ def build_v5_adjustment_artifacts(
         "prompt_profile": PHASE_PROMPT_PROFILE_V2,
         "experiment_kind": V2_EXPERIMENT_KIND,
         "terminal_hold_schema": V2_TERMINAL_HOLD_SCHEMA,
+        "rexecution_detector": rexecution_detector,
         "data_config_hash": sha256_json(
             {
                 "selection_hash": selection["selection_hash"],
@@ -992,6 +1024,7 @@ def build_v5_adjustment_artifacts(
                 "experiment_kind": V2_EXPERIMENT_KIND,
                 "piper_urdf_sha256": fk_chain.source_sha256,
                 "terminal_hold_schema": V2_TERMINAL_HOLD_SCHEMA,
+                "rexecution_detector": rexecution_detector,
             }
         ),
         "selection_hash": selection["selection_hash"],
@@ -1056,6 +1089,7 @@ def build_v5_adjustment_artifacts(
         "override_version": override_payload["version"],
         "override_count": len(overrides),
         "piper_urdf_sha256": fk_chain.source_sha256,
+        "rexecution_detector": rexecution_detector,
     }
     return boundary_rows, action_rows, index, summary
 
@@ -1098,6 +1132,9 @@ def validate_v5_adjustment_training_index(
     for key, expected in expected_header.items():
         if payload.get(key) != expected:
             raise ValueError(f"V5.2 index {key}={payload.get(key)!r}, expected={expected!r}")
+    expected_detector = v2_rexecution_detector_identity()
+    if payload.get("rexecution_detector") != expected_detector:
+        raise ValueError("V5.2 index rexecution detector identity is invalid")
     stored_hash = str(payload.get("training_data_hash", ""))
     actual_hash = sha256_json({key: value for key, value in payload.items() if key != "training_data_hash"})
     if not stored_hash or stored_hash != actual_hash:
@@ -1176,6 +1213,11 @@ def validate_v5_adjustment_training_index(
     attempt2_boundaries = [row for row in boundary_rows if int(row["attempt_id"]) == 2]
     if len(attempt2_boundaries) != 408 or any(row.get("rexecution_frame") is None for row in attempt2_boundaries):
         raise ValueError("V5.2 does not resolve all 408 attempt2 rexecution boundaries")
+    if any(
+        row.get("rexecution_detector_sha256") != expected_detector["sha256"]
+        for row in boundary_rows
+    ):
+        raise ValueError("V5.2 boundary rows reference a different rexecution detector")
 
     action_lookup: dict[int, dict[str, Any]] = {}
     expected_actions: list[int] = []

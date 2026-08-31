@@ -49,8 +49,11 @@ from tactile_vla.vla.artifacts import validate_norm_stats_identity
 from tactile_vla.vla.prompts import build_execution_prompt
 from tactile_vla.vla.prompts import MINIMAL_PROMPT_PROFILE
 from tactile_vla.vla.prompts import PHASE_PROMPT_PROFILE
+from tactile_vla.vla.prompts import PHASE_PROMPT_PROFILE_V2
 from tactile_vla.vla.prompts import resolve_prompt_profile
 from tactile_vla.vla.v4_data import ROTATION_V4
+from tactile_vla.vla.v5_adjustment_data import ROTATION_PHASE_V5_ADJUSTMENT_V2
+from tactile_vla.vla.v5_adjustment_data import V2_EXPERIMENT_KIND
 from tactile_vla.vla.v5_phase_data import PHASE_EXPERIMENT_KIND
 from tactile_vla.vla.v5_phase_data import ROTATION_PHASE_V5
 
@@ -58,6 +61,18 @@ from tactile_vla.vla.v5_phase_data import ROTATION_PHASE_V5
 ACTION_HORIZON = 30
 ACTION_DIM = 32
 OUTPUT_ACTION_DIM = 7
+
+PHASE_ACTION_PROFILES = {
+    ROTATION_PHASE_V5: (PHASE_PROMPT_PROFILE, PHASE_EXPERIMENT_KIND),
+    ROTATION_PHASE_V5_ADJUSTMENT_V2: (
+        PHASE_PROMPT_PROFILE_V2,
+        V2_EXPERIMENT_KIND,
+    ),
+}
+VERSIONED_ACTION_PROFILES = {
+    ROTATION_V4: (MINIMAL_PROMPT_PROFILE, None),
+    **PHASE_ACTION_PROFILES,
+}
 
 _METADATA_CONFIG_KEYS = (
     "run_name",
@@ -138,20 +153,20 @@ def validate_v4_norm_artifacts(
     config: dict[str, Any],
 ) -> dict[str, Any] | None:
     data_profile = config.get("data_profile")
-    if data_profile not in {ROTATION_V4, ROTATION_PHASE_V5}:
+    if data_profile not in VERSIONED_ACTION_PROFILES:
         return None
-    expected_prompt = (
-        PHASE_PROMPT_PROFILE if data_profile == ROTATION_PHASE_V5 else MINIMAL_PROMPT_PROFILE
-    )
+    expected_prompt, expected_experiment = VERSIONED_ACTION_PROFILES[data_profile]
     if resolve_prompt_profile(config.get("prompt_profile")) != expected_prompt:
         raise ValueError(
             f"{data_profile} action serving requires prompt_profile={expected_prompt!r}"
         )
-    if data_profile == ROTATION_PHASE_V5:
-        if config.get("experiment_kind") != PHASE_EXPERIMENT_KIND:
-            raise ValueError("rotation_phase_v5 serving requires experiment_kind='phase_prompt_only'")
+    if data_profile in PHASE_ACTION_PROFILES:
+        if config.get("experiment_kind") != expected_experiment:
+            raise ValueError(
+                f"{data_profile} serving requires experiment_kind={expected_experiment!r}"
+            )
         if args.checkpoint_kind != "stage-a":
-            raise ValueError("V5 prompt-only phase validation has no Stage B checkpoint")
+            raise ValueError(f"{data_profile} phase validation has no Stage B checkpoint")
     checkpoint_root = args.checkpoint.expanduser().resolve()
     if checkpoint_root.name == "params":
         checkpoint_root = checkpoint_root.parent
@@ -205,7 +220,9 @@ def validate_v4_norm_artifacts(
     )
     expected_norm_sha = str(
         identity.get(
-            "v4_norm_stats_sha256" if data_profile == ROTATION_PHASE_V5 else "norm_stats_sha256",
+            "v4_norm_stats_sha256"
+            if data_profile in PHASE_ACTION_PROFILES
+            else "norm_stats_sha256",
             "",
         )
     )
@@ -341,6 +358,7 @@ class ActionOnlyAblationPolicy:
             "checkpoint": str(args.checkpoint.resolve()),
             "prompt_profile": resolve_prompt_profile(config.get("prompt_profile")),
             "data_profile": str(config.get("data_profile", "legacy")),
+            "experiment_kind": config.get("experiment_kind"),
             "norm_stats_sha256": (
                 checkpoint_artifact_identity(config).get("norm_stats_sha256")
                 or checkpoint_artifact_identity(config).get("v4_norm_stats_sha256")

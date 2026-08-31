@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 """Train VLA Stage A action generation with OpenPI pi05 in JAX/NNX."""
 
+# ruff: noqa: E402
+
 from __future__ import annotations
 
 import argparse
 import dataclasses
+import gc
 import json
 import logging
 import os
@@ -107,7 +110,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--experiment-kind")
     parser.add_argument("--split", default="train", choices=("train", "val", "test"))
     parser.add_argument("--batch-size", type=int, default=8)
-    parser.add_argument("--num-workers", type=int, default=2)
+    parser.add_argument(
+        "--num-workers",
+        type=int,
+        default=0,
+        help="DataLoader worker processes; keep at 0 for phase profiles to avoid duplicating the phase lookup.",
+    )
     parser.add_argument("--num-steps", type=int, default=10000)
     parser.add_argument("--lr", type=float, default=5e-5)
     parser.add_argument("--lr-final", type=float, default=5e-7)
@@ -606,6 +614,18 @@ def write_jsonl(path: Path, payload: dict) -> None:
         file.write(json.dumps(payload) + "\n")
 
 
+def checkpoint_config_payload(args: argparse.Namespace, identity: dict[str, Any]) -> dict[str, Any]:
+    """Build the persistent run config without private, in-memory runtime caches."""
+    public_args = {key: value for key, value in vars(args).items() if not key.startswith("_")}
+    return public_args | {
+        "artifact_identity": identity,
+        "data_config_hash": identity["data_config_hash"],
+        "action_frame_manifest_hash": identity["action_frame_manifest_hash"],
+        "action_indices_identity": identity["action_indices_identity"],
+        "index_sha256": identity["index_sha256"],
+    }
+
+
 def main() -> None:
     args = parse_args()
     init_logging()
@@ -704,6 +724,7 @@ def main() -> None:
         keep_period=args.keep_period,
         overwrite=args.overwrite,
         resume=args.resume,
+        enable_async_checkpointing=False,
     )
     if resuming:
         saved_config = json.loads((run_dir / "config.json").read_text())
@@ -713,14 +734,13 @@ def main() -> None:
             context="Stage A resume",
         )
         validate_v4_resume_config(saved_config, args)
+        # Older V5/V5.2 configs contain the full per-frame phase lookup. It is
+        # already loaded by the dataset, so do not retain a second copy during
+        # the resumed training run.
+        del saved_config
+        gc.collect()
     if jax.process_index() == 0 and not resuming:
-        config_payload = vars(args) | {
-            "artifact_identity": identity,
-            "data_config_hash": identity["data_config_hash"],
-            "action_frame_manifest_hash": identity["action_frame_manifest_hash"],
-            "action_indices_identity": identity["action_indices_identity"],
-            "index_sha256": identity["index_sha256"],
-        }
+        config_payload = checkpoint_config_payload(args, identity)
         (run_dir / "config.json").write_text(
             json.dumps(config_payload, indent=2, default=str, ensure_ascii=False) + "\n"
         )
@@ -806,6 +826,10 @@ def main() -> None:
 
         if step % args.save_interval == 0 or step == args.num_steps:
             save_state(checkpoint_manager, train_state, step)
+            # Stage A checkpoints are deliberately synchronous: checkpoint
+            # serialization must finish before the next training batch can add
+            # to the host-memory peak.
+            checkpoint_manager.wait_until_finished()
 
     logging.info("Waiting for checkpoint manager to finish")
     checkpoint_manager.wait_until_finished()

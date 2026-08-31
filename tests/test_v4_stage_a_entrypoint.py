@@ -25,6 +25,34 @@ def _load_script():
     return module
 
 
+def test_stage_a_defaults_to_single_process_data_loading(monkeypatch: pytest.MonkeyPatch) -> None:
+    module = _load_script()
+    monkeypatch.setattr(sys, "argv", ["train_vla_stage_a_openpi.py"])
+    assert module.parse_args().num_workers == 0
+
+
+def test_checkpoint_config_excludes_private_runtime_phase_lookup() -> None:
+    module = _load_script()
+    args = SimpleNamespace(
+        run_name="phase-v5.2",
+        num_workers=0,
+        _v5_action_phase_lookup={1: {"phase": "adjustment"}},
+    )
+    identity = {
+        "data_config_hash": "a" * 64,
+        "action_frame_manifest_hash": "b" * 64,
+        "action_indices_identity": {"all": {"count": 1}},
+        "index_sha256": "c" * 64,
+    }
+
+    payload = module.checkpoint_config_payload(args, identity)
+
+    assert payload["run_name"] == "phase-v5.2"
+    assert payload["num_workers"] == 0
+    assert payload["artifact_identity"] is identity
+    assert "_v5_action_phase_lookup" not in payload
+
+
 def test_stage_a_v4_args_require_minimal_prompt_and_norm() -> None:
     module = _load_script()
     module.validate_v4_args(
