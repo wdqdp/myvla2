@@ -31,9 +31,9 @@ DEFAULT_NORM_STATS = Path("/data1/outputs/vla/assets/tactile_vla_rotation_v4/nor
 DEFAULT_CAPTIONER = Path("/data1/outputs/tactile_captioner/tcn_v3_w30_rotation_head/best.pt")
 DEFAULT_CAPTION_SUMMARY = Path("/data1/outputs/vla/rotation_v4/caption_annotation_summary.json")
 DEFAULT_BACKBONE = Path(
-    "/data1/outputs/vla/stage_a_action/pi05_delta_tac_rotation_phase_v5_3/15000"
+    "/data1/outputs/vla/stage_a_action/pi05_delta_tac_rotation_phase_v5_2_1/15000"
 )
-DEFAULT_OUTPUT_DIR = Path("/data1/outputs/vla/rotation_v5_adjustment_end_v1")
+DEFAULT_OUTPUT_DIR = Path("/data1/outputs/vla/rotation_v5_adjustment_end_v2")
 
 
 def _write_json(path: Path, payload: Any) -> None:

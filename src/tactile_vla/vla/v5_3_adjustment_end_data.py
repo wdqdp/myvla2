@@ -27,17 +27,35 @@ from tactile_vla.vla.v5_3_phase_change import pi05_phase_change_token_length
 from tactile_vla.vla.v5_3_phase_change import runtime_reachable_endpoint
 
 
-DATA_PROFILE = "rotation_phase_v5_adjustment_end_v1"
+DATA_PROFILE = "rotation_phase_v5_adjustment_end_v2"
 EXPERIMENT_KIND = "adjustment_end_qpos_h30_text"
-MANIFEST_SCHEMA = "tactile_vla_v5_3_adjustment_end_manifest_v1"
-TRAINING_INDEX_SCHEMA = "tactile_vla_v5_3_adjustment_end_training_index_v1"
-SUMMARY_SCHEMA = "tactile_vla_v5_3_adjustment_end_summary_v1"
+MANIFEST_SCHEMA = "tactile_vla_v5_3_adjustment_end_manifest_v2"
+TRAINING_INDEX_SCHEMA = "tactile_vla_v5_3_adjustment_end_training_index_v2"
+SUMMARY_SCHEMA = "tactile_vla_v5_3_adjustment_end_summary_v2"
 ARTIFACT_HASH_SCHEMA = "tactile_vla_v5_3_artifact_hashes_v1"
+ADJUSTMENT_END_START_OFFSET = -10
+ADJUSTMENT_END_END_OFFSET = 5
+LABEL_POLICY = {
+    "boundary": "rexecution_frame",
+    "positive_start_offset_inclusive": ADJUSTMENT_END_START_OFFSET,
+    "positive_end_offset_inclusive": ADJUSTMENT_END_END_OFFSET,
+    "valid_end_offset_inclusive": ADJUSTMENT_END_END_OFFSET,
+}
 EXPECTED_ATTEMPT2_COUNTS = {"train": 328, "val": 44, "test": 36}
-EXPECTED_POSITIVE_COUNTS = {"train": 1968, "val": 264, "test": 216}
+EXPECTED_POSITIVE_COUNTS = {"train": 5248, "val": 704, "test": 576}
+EXPECTED_SAMPLE_COUNTS = {"train": 74480, "val": 9684, "test": 8190}
 EXPECTED_MISSING_ATTEMPT1_COUNTS = {"train": 60, "val": 13, "test": 7}
 EXPECTED_HISTORY_UNAVAILABLE_COUNTS = {"train": 1800, "val": 390, "test": 210}
 EXPECTED_ATTEMPT2_COUNT = 408
+
+
+def is_adjustment_end_positive(frame_index: int, rexecution_frame: int) -> bool:
+    relative = int(frame_index) - int(rexecution_frame)
+    return ADJUSTMENT_END_START_OFFSET <= relative <= ADJUSTMENT_END_END_OFFSET
+
+
+def is_adjustment_end_valid(frame_index: int, rexecution_frame: int) -> bool:
+    return int(frame_index) <= int(rexecution_frame) + ADJUSTMENT_END_END_OFFSET
 
 
 def _load_object(path: Path) -> dict[str, Any]:
@@ -187,7 +205,10 @@ def build_adjustment_end_artifacts(
         if len(attempt2) != int(boundary["frame_count"]):
             raise ValueError(f"episode {episode_id} attempt2 frame count differs from V5.2 boundary")
         rexecution = int(boundary["rexecution_frame"])
-        if not 5 <= rexecution < len(attempt2):
+        if not (
+            rexecution >= -ADJUSTMENT_END_START_OFFSET
+            and rexecution + ADJUSTMENT_END_END_OFFSET < len(attempt2)
+        ):
             raise ValueError(f"episode {episode_id}: invalid rexecution_frame={rexecution}")
         if attempt2[rexecution].key != (episode_id, 2, rexecution):
             raise ValueError(f"episode {episode_id}: rexecution frame identity is not unique")
@@ -197,8 +218,8 @@ def build_adjustment_end_artifacts(
         for frame in attempt2:
             timeline_position = attempt2_start + frame.frame_index
             history_available = timeline_position >= QPOS_HISTORY_FRAMES
-            adjustment_end = rexecution - 5 <= frame.frame_index <= rexecution
-            valid = frame.frame_index <= rexecution
+            adjustment_end = is_adjustment_end_positive(frame.frame_index, rexecution)
+            valid = is_adjustment_end_valid(frame.frame_index, rexecution)
             training_sample_valid = valid and history_available
             if not history_available:
                 if frame.frame_index >= QPOS_HISTORY_FRAMES:
@@ -323,6 +344,8 @@ def build_adjustment_end_artifacts(
         selected = [manifest[index] for index in indices]
         positive = sum(bool(row["adjustment_end"]) for row in selected)
         negative = len(selected) - positive
+        if len(selected) != EXPECTED_SAMPLE_COUNTS[split]:
+            raise ValueError(f"V5.3 {split} sample count changed: {len(selected)}")
         if positive != EXPECTED_POSITIVE_COUNTS[split]:
             raise ValueError(f"V5.3 {split} positive count changed: {positive}")
         splits[split] = {
@@ -371,6 +394,7 @@ def build_adjustment_end_artifacts(
         "attempt2_count": EXPECTED_ATTEMPT2_COUNT,
         "missing_attempt1_count": sum(EXPECTED_MISSING_ATTEMPT1_COUNTS.values()),
         "history_unavailable_count": sum(EXPECTED_HISTORY_UNAVAILABLE_COUNTS.values()),
+        "label_policy": LABEL_POLICY,
         "splits": splits,
         "manifest_identity": {
             "count": len(manifest),
@@ -396,6 +420,7 @@ def build_adjustment_end_artifacts(
         "attempt2_count": EXPECTED_ATTEMPT2_COUNT,
         "missing_attempt1_count": sum(EXPECTED_MISSING_ATTEMPT1_COUNTS.values()),
         "history_unavailable_count": sum(EXPECTED_HISTORY_UNAVAILABLE_COUNTS.values()),
+        "label_policy": LABEL_POLICY,
         "manifest_frame_count": len(manifest),
         "valid_sample_count": sum(value["sample_count"] for value in splits.values()),
         "positive_count": sum(value["positive_count"] for value in splits.values()),
@@ -437,6 +462,8 @@ def validate_adjustment_end_artifacts(
         EXPECTED_HISTORY_UNAVAILABLE_COUNTS.values()
     ):
         raise ValueError("V5.3 history-unavailable count mismatch")
+    if index.get("label_policy") != LABEL_POLICY:
+        raise ValueError("V5.3 label policy mismatch")
     actual_hash = sha256_json({key: value for key, value in index.items() if key != "training_data_hash"})
     if index.get("training_data_hash") != actual_hash:
         raise ValueError("V5.3 training_data_hash mismatch")
@@ -455,6 +482,8 @@ def validate_adjustment_end_artifacts(
         if int(split_payload.get("history_unavailable_count", -1)) != EXPECTED_HISTORY_UNAVAILABLE_COUNTS[split]:
             raise ValueError(f"V5.3 {split} history-unavailable count mismatch")
         rows = [manifest[int(value)] for value in split_payload["manifest_row_indices"]]
+        if len(rows) != EXPECTED_SAMPLE_COUNTS[split]:
+            raise ValueError(f"V5.3 {split} sample count mismatch")
         globals_ = [int(row["current_global_index"]) for row in rows]
         if globals_ != [int(value) for value in split_payload["global_indices"]]:
             raise ValueError(f"V5.3 {split} global/manifest order mismatch")
@@ -476,12 +505,12 @@ def validate_adjustment_end_artifacts(
             raise ValueError("V5.3 manifest schema/attempt mismatch")
         frame = int(row["frame_index"])
         rexecution = int(row["rexecution_frame"])
-        if bool(row["adjustment_end"]) != (rexecution - 5 <= frame <= rexecution):
+        if bool(row["adjustment_end"]) != is_adjustment_end_positive(frame, rexecution):
             raise ValueError("V5.3 adjustment_end label mismatch")
-        if bool(row["adjustment_end_valid"]) != (frame <= rexecution):
+        if bool(row["adjustment_end_valid"]) != is_adjustment_end_valid(frame, rexecution):
             raise ValueError("V5.3 adjustment_end_valid mismatch")
         history_available = bool(row.get("history_available"))
-        expected_sample_valid = frame <= rexecution and history_available
+        expected_sample_valid = is_adjustment_end_valid(frame, rexecution) and history_available
         if bool(row.get("classification_sample_valid")) != expected_sample_valid:
             raise ValueError("V5.3 classification_sample_valid mismatch")
         history = [int(value) for value in row["history_global_indices"]]
@@ -531,6 +560,8 @@ def load_indexed_manifest_rows(
     for key, value in expected.items():
         if index.get(key) != value:
             raise ValueError(f"V5.3 index {key}={index.get(key)!r}, expected {value!r}")
+    if index.get("label_policy") != LABEL_POLICY:
+        raise ValueError("V5.3 index label policy mismatch")
     actual_index_hash = sha256_json(
         {key: value for key, value in index.items() if key != "training_data_hash"}
     )
@@ -579,6 +610,16 @@ def load_indexed_manifest_rows(
                     or len(row.get("history_global_indices", [])) != QPOS_HISTORY_FRAMES
                     or len(row.get("qpos_h10_discrete", [])) != len(QPOS_SAMPLE_OFFSETS)
                     or row.get("prompt") is None
+                    or bool(row.get("adjustment_end"))
+                    != is_adjustment_end_positive(
+                        int(row.get("frame_index", -1)),
+                        int(row.get("rexecution_frame", -1)),
+                    )
+                    or bool(row.get("adjustment_end_valid"))
+                    != is_adjustment_end_valid(
+                        int(row.get("frame_index", -1)),
+                        int(row.get("rexecution_frame", -1)),
+                    )
                 ):
                     raise ValueError(f"V5.3 indexed manifest row {row_count} is invalid")
                 selected[row_count] = row
@@ -672,6 +713,7 @@ class AdjustmentEndManifestDataset:
             "episode_id": identity[1],
             "attempt_id": identity[2],
             "frame_index": identity[3],
+            "rexecution_frame": int(row["rexecution_frame"]),
         }
 
 
@@ -747,7 +789,13 @@ class TransformedAdjustmentEndDataset:
         label = np.asarray(raw["adjustment_end_label"], dtype=np.int32)
         identity = {
             key: np.asarray(raw[key], dtype=np.int64)
-            for key in ("global_index", "episode_id", "attempt_id", "frame_index")
+            for key in (
+                "global_index",
+                "episode_id",
+                "attempt_id",
+                "frame_index",
+                "rexecution_frame",
+            )
         }
         transformed = self.transform(raw)
         transformed["adjustment_end_label"] = label

@@ -83,6 +83,13 @@ def validate_server_metadata(args: argparse.Namespace, metadata: dict[str, Any])
     threshold = float(metadata.get("adjustment_end_threshold", -1.0))
     if not 0.0 <= threshold <= 1.0:
         raise ValueError("Server adjustment_end_threshold is invalid")
+    if metadata.get("adjustment_end_experimental_override", False) and not getattr(
+        args, "allow_experimental_adjustment_end", False
+    ):
+        raise ValueError(
+            "Server uses a non-official adjustment_end robot probe; "
+            "pass --allow-experimental-adjustment-end to acknowledge it"
+        )
     timeout = float(metadata.get("phase_change_timeout_seconds", -1.0))
     if timeout != 10.0 or args.phase_change_timeout_seconds != timeout:
         raise ValueError("V5.3 phase-change timeout must be exactly 10 seconds")
@@ -336,6 +343,11 @@ def run_v5_3(args, operator, policy, captioner, keyboard, logger):
         "V5.3 controls: s=next chunk, SPACE=execution to adjustment, q=quit. "
         f"Server threshold={metadata['adjustment_end_threshold']}; client never re-thresholds."
     )
+    if metadata.get("adjustment_end_experimental_override", False):
+        print(
+            "WARNING: EXPERIMENTAL adjustment_end deployment (manual threshold or "
+            "non-official probe). Each phase change still pauses before the next chunk."
+        )
     phase: Phase = "execution"
     phase_indices = {"execution": 0, "adjustment": 0}
     pending = None
@@ -532,6 +544,11 @@ def get_arguments():
     parser.add_argument("--arm_steps_length", nargs=7, type=float, default=[0.01] * 6 + [0.2])
     parser.add_argument("--gripper_offset", type=float, default=0.001)
     parser.add_argument("--gripper-min", dest="gripper_min", type=float, required=True)
+    parser.add_argument(
+        "--allow-experimental-adjustment-end",
+        action="store_true",
+        help="Acknowledge a non-official checkpoint or manual server threshold override",
+    )
     return parser.parse_args(), parser
 
 

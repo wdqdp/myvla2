@@ -25,6 +25,7 @@ from flax import nnx
 import jax
 import jax.numpy as jnp
 import numpy as np
+import orbax.checkpoint as ocp
 
 from openpi.models import gemma as openpi_gemma
 from openpi.models import model as openpi_model
@@ -38,11 +39,16 @@ from tactile_vla.vla.artifacts import sha256_file
 from tactile_vla.vla.openpi_bridge import build_action_output_transform
 from tactile_vla.vla.openpi_bridge import build_transform
 from tactile_vla.vla.prompts import build_phase_prompt
+from tactile_vla.vla.stage_b_v3_checkpoint import cast_frozen_params
 from tactile_vla.vla.v5_3_adjustment_end_checkpoint import CHECKPOINT_FORMAT
 from tactile_vla.vla.v5_3_adjustment_end_checkpoint import delta_params
 from tactile_vla.vla.v5_3_adjustment_end_checkpoint import merge_delta_params
+from tactile_vla.vla.v5_3_adjustment_end_checkpoint import MULTITASK_CHECKPOINT_FORMAT
+from tactile_vla.vla.v5_3_adjustment_end_checkpoint import multitask_trainable_filter
 from tactile_vla.vla.v5_3_adjustment_end_checkpoint import parameter_tree_sha256
 from tactile_vla.vla.v5_3_adjustment_end_checkpoint import trainable_filter
+from tactile_vla.vla.v5_3_adjustment_end_data import DATA_PROFILE as ADJUSTMENT_END_DATA_PROFILE
+from tactile_vla.vla.v5_3_adjustment_end_data import LABEL_POLICY
 from tactile_vla.vla.v5_3_adjustment_end_model import AdjustmentEndModel
 from tactile_vla.vla.v5_3_phase_change import PHASE_CHANGE_MAX_TOKEN_LEN
 from tactile_vla.vla.v5_3_phase_change import QPOS_BIN_COUNT
@@ -68,6 +74,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--num-inference-steps", type=int, default=10)
     parser.add_argument("--precision", choices=("auto", "bfloat16", "float32"), default="auto")
+    parser.add_argument(
+        "--adjustment-end-threshold-override",
+        type=float,
+        help=(
+            "Manual robot-probe threshold. The server advertises this as an experimental "
+            "override and does not modify checkpoint metadata."
+        ),
+    )
     parser.add_argument("--dry-run", action="store_true")
     return parser.parse_args()
 
@@ -83,6 +97,16 @@ def _find_config(path: Path) -> tuple[Path, dict[str, Any]]:
 def _params_dir(path: Path) -> Path:
     resolved = path.resolve()
     return resolved / "params" if (resolved / "params").is_dir() else resolved
+
+
+def _restore_delta_params(path: Path):
+    """Restore a directly exported V5.3 delta tree (no top-level params wrapper)."""
+
+    with ocp.PyTreeCheckpointer() as checkpointer:
+        restored = checkpointer.restore(path.resolve())
+    if not isinstance(restored, dict) or not restored:
+        raise ValueError(f"V5.3 delta checkpoint is not a non-empty parameter tree: {path}")
+    return restored
 
 
 def _model_config(config: dict[str, Any], *, max_token_len: int, precision: str) -> Pi0Config:
@@ -123,15 +147,42 @@ def _validate_configs(args, stage_a_path, stage_a, head_path, head, metadata):
         "num_steps": 15000,
         "seed": 42,
     }
-    head_required = {
-        "data_profile": "rotation_phase_v5_adjustment_end_v1",
-        "prompt_profile": "phase_change_v1",
-        "experiment_kind": "adjustment_end_qpos_h30_text",
-        "num_steps": 4000,
-        "phase_change_max_token_len": 512,
-        "checkpoint_format": CHECKPOINT_FORMAT,
-    }
-    for config, expected, name in ((stage_a, stage_required, "Stage A"), (head, head_required, "head")):
+    checkpoint_format = str(head.get("checkpoint_format", ""))
+    if checkpoint_format == CHECKPOINT_FORMAT:
+        head_required = {
+            "prompt_profile": "phase_change_v1",
+            "experiment_kind": "adjustment_end_qpos_h30_text",
+            "num_steps": 4000,
+            "phase_change_max_token_len": 512,
+            "checkpoint_format": CHECKPOINT_FORMAT,
+        }
+    elif checkpoint_format == MULTITASK_CHECKPOINT_FORMAT:
+        head_required = {
+            "prompt_profile": "phase_change_v1",
+            "experiment_kind": "adjustment_end_action_multitask_v1",
+            "num_steps": 8000,
+            "phase_change_max_token_len": 512,
+            "checkpoint_format": MULTITASK_CHECKPOINT_FORMAT,
+        }
+    else:
+        raise ValueError(f"Unsupported V5.3 checkpoint format: {checkpoint_format!r}")
+    adjustment_end_data_profile = str(head.get("data_profile", ""))
+    if adjustment_end_data_profile not in {
+        "rotation_phase_v5_adjustment_end_v1",
+        ADJUSTMENT_END_DATA_PROFILE,
+    }:
+        raise ValueError(
+            f"Unsupported V5.3 adjustment_end data profile: {adjustment_end_data_profile!r}"
+        )
+    if adjustment_end_data_profile == ADJUSTMENT_END_DATA_PROFILE:
+        if head.get("label_policy") != LABEL_POLICY:
+            raise ValueError("V5.3 R-10..R+5 checkpoint label policy mismatch")
+        if metadata.get("label_policy") != LABEL_POLICY:
+            raise ValueError("V5.3 R-10..R+5 metadata label policy mismatch")
+    for config, expected, name in (
+        (stage_a, stage_required, "Stage A"),
+        (head, head_required, "adjustment_end"),
+    ):
         mismatch = {key: (config.get(key), value) for key, value in expected.items() if config.get(key) != value}
         if mismatch:
             raise ValueError(f"V5.3 {name} config mismatch: {mismatch}")
@@ -139,12 +190,26 @@ def _validate_configs(args, stage_a_path, stage_a, head_path, head, metadata):
         raise ValueError("V5.3 head was trained with a different Stage A checkpoint")
     if head["stage_a_config_sha256"] != sha256_file(stage_a_path):
         raise ValueError("V5.3 head Stage A config SHA mismatch")
-    if int(metadata.get("official_step", -1)) != 4000:
-        raise ValueError("V5.3 server only accepts official step 4000")
+    if int(metadata.get("official_step", -1)) != int(head_required["num_steps"]):
+        raise ValueError(
+            "V5.3 metadata/checkpoint step mismatch: "
+            f"metadata={metadata.get('official_step')}, config={head_required['num_steps']}"
+        )
     threshold = float(metadata.get("adjustment_end_threshold", -1.0))
     if not 0.0 <= threshold <= 1.0:
         raise ValueError("V5.3 adjustment_end threshold is invalid")
-    return threshold
+    return threshold, checkpoint_format
+
+
+def _resolve_runtime_threshold(
+    checkpoint_threshold: float,
+    manual_override: float | None,
+) -> tuple[float, bool]:
+    if manual_override is None:
+        return float(checkpoint_threshold), False
+    if not 0.0 <= manual_override <= 1.0:
+        raise ValueError("--adjustment-end-threshold-override must be in [0,1]")
+    return float(manual_override), True
 
 
 class V53Policy:
@@ -154,9 +219,34 @@ class V53Policy:
         if not metadata_path.is_file():
             raise FileNotFoundError(metadata_path)
         final_metadata = json.loads(metadata_path.read_text())
-        self._threshold = _validate_configs(
+        checkpoint_threshold, self._checkpoint_format = _validate_configs(
             args, stage_a_config_path, stage_a_config, head_config_path, head_config, final_metadata
         )
+        self._checkpoint_threshold = checkpoint_threshold
+        self._threshold, self._manual_threshold_override = _resolve_runtime_threshold(
+            checkpoint_threshold,
+            args.adjustment_end_threshold_override,
+        )
+        self._experimental_override = bool(
+            final_metadata.get("experimental_override", False)
+            or self._manual_threshold_override
+        )
+        self._accepted_for_robot = bool(
+            final_metadata.get("accepted_for_robot", False)
+            and not self._manual_threshold_override
+        )
+        if self._experimental_override:
+            logging.warning(
+                "Loading NON-OFFICIAL adjustment_end robot probe: accepted_for_robot=%s "
+                "h30_gate_passed=%s threshold_policy=%s checkpoint_threshold=%.8f "
+                "runtime_threshold=%.8f manual_override=%s",
+                self._accepted_for_robot,
+                final_metadata.get("h30_gate_passed"),
+                final_metadata.get("threshold_policy"),
+                self._checkpoint_threshold,
+                self._threshold,
+                self._manual_threshold_override,
+            )
         self._action_config = _model_config(
             stage_a_config,
             max_token_len=int(stage_a_config.get("max_token_len", 200)),
@@ -188,8 +278,11 @@ class V53Policy:
             delta_action_dims=OUTPUT_ACTION_DIM,
         )
 
-        dtype = jnp.bfloat16 if self._action_config.dtype == "bfloat16" else jnp.float32
-        backbone_params = openpi_model.restore_params(_params_dir(args.stage_a_checkpoint), dtype=dtype)
+        # Restore the checkpoint's original mixed dtypes, then reproduce the
+        # exact training-time frozen-parameter cast below.  Casting every
+        # floating-point leaf here would incorrectly convert the trainable
+        # PaliGemma LoRA and change the audited backbone SHA.
+        backbone_params = openpi_model.restore_params(_params_dir(args.stage_a_checkpoint))
         backbone = self._action_config.load(backbone_params)
         wrapper = AdjustmentEndModel(
             backbone,
@@ -197,24 +290,40 @@ class V53Policy:
             rngs=nnx.Rngs(jax.random.key(1)),
         )
         graphdef, base_state = nnx.split(wrapper)
-        head_template = delta_params(base_state, trainable_filter())
-        head_dir = step_dir / "head_params"
-        if not head_dir.is_dir():
-            raise FileNotFoundError(head_dir)
-        restored_head = openpi_model.restore_params(head_dir, restore_type=np.ndarray)
+        if self._checkpoint_format == MULTITASK_CHECKPOINT_FORMAT:
+            overlay_filter = multitask_trainable_filter()
+            overlay_dir = step_dir / "delta_params"
+        else:
+            overlay_filter = trainable_filter()
+            overlay_dir = step_dir / "head_params"
+        frozen_filter = nnx.All(nnx.Param, nnx.Not(overlay_filter))
+        base_state = cast_frozen_params(base_state, frozen_filter)
+        initial_backbone_sha = parameter_tree_sha256(base_state["backbone"])
+        expected_initial_sha = str(head_config["stage_a_backbone_parameter_tree_sha256"])
+        if initial_backbone_sha != expected_initial_sha:
+            raise ValueError("Restored V5.2 Stage A backbone parameter-tree SHA mismatch")
+        overlay_template = delta_params(base_state, overlay_filter)
+        if not overlay_dir.is_dir():
+            raise FileNotFoundError(overlay_dir)
+        restored_head = _restore_delta_params(overlay_dir)
         at.check_pytree_equality(
-            expected=head_template.to_pure_dict(),
+            expected=overlay_template.to_pure_dict(),
             got=restored_head,
             check_shapes=True,
             check_dtypes=False,
         )
-        head_template.replace_by_pure_dict(restored_head)
-        wrapper = nnx.merge(graphdef, merge_delta_params(base_state, head_template))
+        overlay_template.replace_by_pure_dict(restored_head)
+        wrapper = nnx.merge(graphdef, merge_delta_params(base_state, overlay_template))
         wrapper.eval()
         actual_backbone_sha = parameter_tree_sha256(nnx.state(wrapper)["backbone"])
-        expected_backbone_sha = str(head_config["stage_a_backbone_parameter_tree_sha256"])
+        expected_backbone_sha = str(
+            final_metadata.get(
+                "trained_backbone_parameter_tree_sha256",
+                head_config["stage_a_backbone_parameter_tree_sha256"],
+            )
+        )
         if actual_backbone_sha != expected_backbone_sha:
-            raise ValueError("Restored V5.2 backbone parameter-tree SHA mismatch")
+            raise ValueError("Restored V5.3 inference backbone parameter-tree SHA mismatch")
 
         self._sample_actions = nnx_utils.module_jit(wrapper.backbone.sample_actions)
         self._adjustment_end_logits = nnx_utils.module_jit(wrapper.adjustment_end_logits)
@@ -225,7 +334,11 @@ class V53Policy:
         caption_source = head_config["caption_source"]
         self._metadata = {
             "name": "tactile_vla_v5_3",
-            "checkpoint_kind": "stage-a",
+            "checkpoint_kind": (
+                "stage-a-plus-adjustment-end-paligemma-lora"
+                if self._checkpoint_format == MULTITASK_CHECKPOINT_FORMAT
+                else "stage-a-plus-adjustment-end-head"
+            ),
             "checkpoint": str(args.stage_a_checkpoint.resolve()),
             "prompt_profile": "phase_v2",
             "data_profile": "rotation_phase_v5_adjustment_v2",
@@ -235,6 +348,27 @@ class V53Policy:
             "requires_action_noise": True,
             "supports_adjustment_end": True,
             "adjustment_end_threshold": self._threshold,
+            "adjustment_end_checkpoint_threshold": self._checkpoint_threshold,
+            "adjustment_end_manual_threshold_override": self._manual_threshold_override,
+            "adjustment_end_experimental_override": self._experimental_override,
+            "adjustment_end_accepted_for_robot": self._accepted_for_robot,
+            "adjustment_end_h30_gate_passed": bool(final_metadata.get("h30_gate_passed", False)),
+            "adjustment_end_threshold_policy": (
+                "manual_robot_probe_override"
+                if self._manual_threshold_override
+                else final_metadata.get("threshold_policy", "official_v5_3")
+            ),
+            "adjustment_end_checkpoint_format": self._checkpoint_format,
+            "adjustment_end_data_profile": head_config["data_profile"],
+            "adjustment_end_label_policy": head_config.get(
+                "label_policy",
+                {
+                    "boundary": "rexecution_frame",
+                    "positive_start_offset_inclusive": -5,
+                    "positive_end_offset_inclusive": 0,
+                    "valid_end_offset_inclusive": 0,
+                },
+            ),
             "phase_change_prompt_profile": "phase_change_v1",
             "phase_change_max_token_len": PHASE_CHANGE_MAX_TOKEN_LEN,
             "qpos_h30_sample_offsets": list(QPOS_SAMPLE_OFFSETS),
@@ -253,7 +387,8 @@ class V53Policy:
             "use_state_history": True,
             "stage_a_checkpoint": str(args.stage_a_checkpoint.resolve()),
             "adjustment_end_checkpoint": str(step_dir),
-            "stage_a_backbone_parameter_tree_sha256": actual_backbone_sha,
+            "stage_a_backbone_parameter_tree_sha256": initial_backbone_sha,
+            "inference_backbone_parameter_tree_sha256": actual_backbone_sha,
         }
 
     @property

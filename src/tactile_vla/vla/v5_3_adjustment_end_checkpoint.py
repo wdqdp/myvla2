@@ -1,4 +1,4 @@
-"""Delta-checkpoint helpers for the head-only V5.3 classifier."""
+"""Delta-checkpoint helpers for V5.3 head-only and shared-LoRA classifiers."""
 
 from __future__ import annotations
 
@@ -11,10 +11,22 @@ from openpi.shared import nnx_utils
 
 
 CHECKPOINT_FORMAT = "v5_3_adjustment_end_head_v1"
+MULTITASK_CHECKPOINT_FORMAT = "v5_3_adjustment_end_paligemma_lora_v1"
 
 
 def trainable_filter() -> nnx.filterlib.Filter:
     return nnx.All(nnx.Param, nnx_utils.PathRegex(".*adjustment_end_head.*"))
+
+
+def multitask_trainable_filter() -> nnx.filterlib.Filter:
+    """Train the shared PaliGemma LoRA and the adjustment-end head only."""
+
+    paligemma_lora = nnx.All(
+        nnx_utils.PathRegex(".*backbone.*llm.*lora.*"),
+        nnx.Not(nnx_utils.PathRegex(".*_1.*")),
+    )
+    adjustment_end_head = nnx_utils.PathRegex(".*adjustment_end_head.*")
+    return nnx.All(nnx.Param, nnx.Any(paligemma_lora, adjustment_end_head))
 
 
 def delta_params(state: nnx.State, filter_: nnx.filterlib.Filter) -> nnx.State:
