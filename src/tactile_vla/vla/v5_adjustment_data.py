@@ -40,6 +40,13 @@ V2_REXECUTION_DESCENT_CONFIRMATION_FRAMES = 10
 V2_REXECUTION_MINIMUM_Z_DROP_M = 0.010
 V2_REXECUTION_MINIMUM_DOWNWARD_VELOCITY_M_PER_S = 0.005
 V2_REXECUTION_MINIMUM_DOWNWARD_VELOCITY_FRACTION = 0.80
+V2_LEGACY_HORIZONTAL_ENDPOINT_TRAINING_DATA_HASH = (
+    "18724d2fc58a0e78f96f85b54313b672b093cc8f13d04387f484393514ca1b6f"
+)
+V2_LEGACY_HORIZONTAL_ENDPOINT_TRIGGERS = {
+    "horizontal_endpoint_stable",
+    "closing_preempted_endpoint",
+}
 V2_EXPECTED_MODIFIED_CHUNKS = 11_832
 V2_EXPECTED_MODIFIED_ACTION_STEPS = 177_480
 V2Phase = Literal["execution", "adjustment"]
@@ -1097,8 +1104,20 @@ def build_v5_adjustment_artifacts(
 def _validate_file_identity(identity: Mapping[str, Any], *, context: str) -> Path:
     path = Path(str(identity.get("path", "")))
     expected = str(identity.get("sha256", ""))
-    if not path.is_file():
-        raise FileNotFoundError(path)
+    try:
+        path_is_file = path.is_file()
+    except PermissionError:
+        if context != "piper_urdf":
+            raise
+        path_is_file = False
+    if not path_is_file:
+        # Immutable V5.2 indices may retain the checkout path from the server
+        # that produced them. Relocate the repository-owned URDF to this
+        # checkout, while keeping the recorded content hash authoritative.
+        if context == "piper_urdf" and DEFAULT_PIPER_URDF.is_file():
+            path = DEFAULT_PIPER_URDF
+        else:
+            raise FileNotFoundError(path)
     actual = sha256_file(path)
     if len(expected) != 64 or actual != expected:
         raise ValueError(f"V5.2 {context} hash mismatch: expected={expected}, actual={actual}")
@@ -1133,12 +1152,16 @@ def validate_v5_adjustment_training_index(
         if payload.get(key) != expected:
             raise ValueError(f"V5.2 index {key}={payload.get(key)!r}, expected={expected!r}")
     expected_detector = v2_rexecution_detector_identity()
-    if payload.get("rexecution_detector") != expected_detector:
-        raise ValueError("V5.2 index rexecution detector identity is invalid")
     stored_hash = str(payload.get("training_data_hash", ""))
     actual_hash = sha256_json({key: value for key, value in payload.items() if key != "training_data_hash"})
     if not stored_hash or stored_hash != actual_hash:
         raise ValueError("V5.2 training_data_hash does not match the index payload")
+    legacy_horizontal_endpoint = (
+        stored_hash == V2_LEGACY_HORIZONTAL_ENDPOINT_TRAINING_DATA_HASH
+        and payload.get("rexecution_detector") is None
+    )
+    if not legacy_horizontal_endpoint and payload.get("rexecution_detector") != expected_detector:
+        raise ValueError("V5.2 index rexecution detector identity is invalid")
     if index_path is not None and not Path(index_path).is_file():
         raise FileNotFoundError(index_path)
     sources = payload.get("source_files")
@@ -1213,7 +1236,18 @@ def validate_v5_adjustment_training_index(
     attempt2_boundaries = [row for row in boundary_rows if int(row["attempt_id"]) == 2]
     if len(attempt2_boundaries) != 408 or any(row.get("rexecution_frame") is None for row in attempt2_boundaries):
         raise ValueError("V5.2 does not resolve all 408 attempt2 rexecution boundaries")
-    if any(
+    if legacy_horizontal_endpoint:
+        legacy_attempt2_is_invalid = any(
+            row.get("rexecution_label_source") != "automatic_fk"
+            or not isinstance(row.get("automatic_rexecution_detection"), Mapping)
+            or row["automatic_rexecution_detection"].get("boundary_trigger")
+            not in V2_LEGACY_HORIZONTAL_ENDPOINT_TRIGGERS
+            or row.get("rexecution_detector_sha256") is not None
+            for row in attempt2_boundaries
+        )
+        if legacy_attempt2_is_invalid:
+            raise ValueError("Legacy V5.2 boundary rows do not match horizontal-endpoint detector")
+    elif any(
         row.get("rexecution_detector_sha256") != expected_detector["sha256"]
         for row in boundary_rows
     ):

@@ -15,6 +15,8 @@ sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 from tactile_vla.vla.openpi_bridge import TactileVLAFrameDataset  # noqa: E402
 from tactile_vla.vla.prompts import build_phase_prompt  # noqa: E402
+from tactile_vla.vla.artifacts import sha256_file  # noqa: E402
+import tactile_vla.vla.v5_adjustment_data as v5_adjustment_data  # noqa: E402
 from tactile_vla.vla.v5_adjustment_data import DetectedRexecution  # noqa: E402
 from tactile_vla.vla.v5_adjustment_data import FKJoint, PiperFKChain  # noqa: E402
 from tactile_vla.vla.v5_adjustment_data import PhaseBoundaryError  # noqa: E402
@@ -24,6 +26,42 @@ from tactile_vla.vla.v5_adjustment_data import load_v2_phase_overrides  # noqa: 
 from tactile_vla.vla.v5_adjustment_data import phase_for_rexecution_frame  # noqa: E402
 from tactile_vla.vla.v5_adjustment_data import piper_fk_positions  # noqa: E402
 from tactile_vla.vla.v5_adjustment_data import resolve_v2_phase_override  # noqa: E402
+
+
+def test_missing_legacy_piper_urdf_relocates_with_strict_hash_validation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    legacy_path = tmp_path / "old-server" / "piper_description.urdf"
+    relocated_path = tmp_path / "current-checkout" / "piper_description.urdf"
+    relocated_path.parent.mkdir(parents=True)
+    relocated_path.write_text("<robot name='piper'/>")
+    monkeypatch.setattr(v5_adjustment_data, "DEFAULT_PIPER_URDF", relocated_path)
+
+    identity = {
+        "path": str(legacy_path),
+        "sha256": sha256_file(relocated_path),
+    }
+    assert (
+        v5_adjustment_data._validate_file_identity(identity, context="piper_urdf")
+        == relocated_path
+    )
+
+    original_is_file = Path.is_file
+
+    def inaccessible_legacy_path(path: Path) -> bool:
+        if path == legacy_path:
+            raise PermissionError(path)
+        return original_is_file(path)
+
+    monkeypatch.setattr(Path, "is_file", inaccessible_legacy_path)
+    assert (
+        v5_adjustment_data._validate_file_identity(identity, context="piper_urdf")
+        == relocated_path
+    )
+
+    identity["sha256"] = "0" * 64
+    with pytest.raises(ValueError, match="piper_urdf hash mismatch"):
+        v5_adjustment_data._validate_file_identity(identity, context="piper_urdf")
 
 
 def test_phase_v2_prompts_are_exact_and_reposition_is_rejected() -> None:
@@ -322,6 +360,34 @@ def test_stage_a_v2_protocol_is_version_pinned(monkeypatch: pytest.MonkeyPatch) 
     )
     module.validate_v5_args(args)
     module.validate_v4_training_protocol(args)
+
+    args.use_state_history = False
+    args.state_history_len = 0
+    args.history_hidden_dim = 0
+    module.validate_v5_args(args)
+    module.validate_v4_training_protocol(args)
+    protocol_name, protocol = module.selected_stage_a_protocol(args)
+    assert protocol_name == "v6_1_no_state_history"
+    assert protocol["use_state_history"] is False
+    assert protocol["state_history_len"] == 0
+    assert protocol["history_hidden_dim"] == 0
+    identity = {
+        "data_config_hash": "a" * 64,
+        "action_frame_manifest_hash": "b" * 64,
+        "action_indices_identity": {"all": {"count": 1}},
+        "index_sha256": "c" * 64,
+    }
+    config = module.checkpoint_config_payload(args, identity)
+    assert config["stage_a_protocol"] == "v6_1_no_state_history"
+    assert config["use_state_history"] is False
+    assert config["state_history_len"] == 0
+    assert config["history_hidden_dim"] == 0
+
+    args.state_history_len = 60
+    with pytest.raises(ValueError, match="protocol mismatch"):
+        module.validate_v4_training_protocol(args)
+    args.state_history_len = 0
+
     args.prompt_profile = "phase_v1"
     with pytest.raises(ValueError, match="phase_v2"):
         module.validate_v5_args(args)

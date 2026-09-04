@@ -279,6 +279,40 @@ def test_v52_stage_a_action_server_validates_profile_experiment_and_v4_norm(
         )
 
 
+def test_v61_action_server_accepts_only_strict_no_history_protocol() -> None:
+    serve = _load_script(
+        "serve_v61_no_history_config_test_module",
+        "scripts/serve_tactile_vla_action_ablation.py",
+    )
+    args = argparse.Namespace(precision=None)
+    config = {
+        "precision": "float32",
+        "paligemma_variant": "gemma_2b_lora",
+        "action_expert_variant": "gemma_300m_lora",
+        "action_dim": 32,
+        "action_horizon": 30,
+        "max_token_len": 200,
+        "use_state_history": False,
+        "state_history_len": 0,
+        "state_history_dim": 7,
+        "history_hidden_dim": 0,
+        "stage_a_protocol": "v6_1_no_state_history",
+    }
+
+    model_config = serve._model_config(args, config)
+    assert model_config.use_state_history is False
+    assert model_config.state_history_len == 0
+    assert model_config.history_hidden_dim == 0
+    observation_spec, _ = model_config.inputs_spec(batch_size=2)
+    assert observation_spec.state_history is None
+    assert observation_spec.state_history_mask is None
+
+    with pytest.raises(ValueError, match="stage_a_protocol"):
+        serve._model_config(args, config | {"stage_a_protocol": None})
+    with pytest.raises(ValueError, match="state_history_len=0"):
+        serve._model_config(args, config | {"state_history_len": 60})
+
+
 def test_action_server_metadata_excludes_v5_per_frame_training_lookup() -> None:
     serve = _load_script(
         "serve_v5_metadata_summary_test_module",

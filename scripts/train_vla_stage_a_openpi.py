@@ -30,7 +30,20 @@ DEFAULT_NORM_STATS_DIR = Path(
     "/data1/outputs/vla/assets/tactile_vla_rotation_moderately_success_v1"
 )
 DEFAULT_OUTPUT_DIR = Path("/data1/outputs/vla/stage_a_action")
-DEFAULT_BASE_CHECKPOINT = Path.home() / ".cache/modelscope/hub/models/hairuoliu/pi05_base/params"
+
+
+def _default_base_checkpoint() -> Path:
+    openpi_data_home = Path(
+        os.environ.get("OPENPI_DATA_HOME", str(Path.home() / ".cache" / "openpi"))
+    )
+    openpi_checkpoint = openpi_data_home / "openpi-assets/checkpoints/pi05_base/params"
+    legacy_modelscope_checkpoint = (
+        Path.home() / ".cache/modelscope/hub/models/hairuoliu/pi05_base/params"
+    )
+    return openpi_checkpoint if openpi_checkpoint.is_dir() else legacy_modelscope_checkpoint
+
+
+DEFAULT_BASE_CHECKPOINT = _default_base_checkpoint()
 
 os.environ.setdefault("HF_HOME", str(PROJECT_ROOT / ".cache" / "huggingface"))
 os.environ.setdefault("HF_DATASETS_CACHE", str(PROJECT_ROOT / ".cache" / "huggingface" / "datasets"))
@@ -210,12 +223,32 @@ V4_STAGE_A_PROTOCOL = {
     "allow_random_init": False,
 }
 V5_STAGE_A_PROTOCOL = {**V4_STAGE_A_PROTOCOL, "seed": 42}
+V6_1_STAGE_A_PROTOCOL_NAME = "v6_1_no_state_history"
+V6_1_STAGE_A_PROTOCOL = {
+    **V5_STAGE_A_PROTOCOL,
+    "use_state_history": False,
+    "state_history_len": 0,
+    "history_hidden_dim": 0,
+}
+
+
+def selected_stage_a_protocol(args: argparse.Namespace) -> tuple[str | None, dict[str, Any]]:
+    """Resolve the pinned protocol without changing legacy V4/V5 behavior."""
+    data_profile = getattr(args, "data_profile", None)
+    use_state_history = bool(getattr(args, "use_state_history", True))
+    if data_profile == ROTATION_PHASE_V5_ADJUSTMENT_V2 and not use_state_history:
+        return V6_1_STAGE_A_PROTOCOL_NAME, V6_1_STAGE_A_PROTOCOL
+    if data_profile in PHASE_DATA_PROFILES:
+        return "v5_h60_state_history", V5_STAGE_A_PROTOCOL
+    if data_profile == ROTATION_V4:
+        return "v4_h60_state_history", V4_STAGE_A_PROTOCOL
+    return None, {}
 
 
 def validate_v4_training_protocol(args: argparse.Namespace) -> None:
     if args.data_profile not in {ROTATION_V4, *PHASE_DATA_PROFILES}:
         return
-    protocol = V5_STAGE_A_PROTOCOL if args.data_profile in PHASE_DATA_PROFILES else V4_STAGE_A_PROTOCOL
+    _, protocol = selected_stage_a_protocol(args)
     mismatches = {
         key: {"requested": getattr(args, key), "required": expected}
         for key, expected in protocol.items()
@@ -235,7 +268,7 @@ def validate_v4_training_protocol(args: argparse.Namespace) -> None:
 def validate_v4_resume_config(saved: dict[str, Any], args: argparse.Namespace) -> None:
     if args.data_profile not in {ROTATION_V4, *PHASE_DATA_PROFILES}:
         return
-    protocol = V5_STAGE_A_PROTOCOL if args.data_profile in PHASE_DATA_PROFILES else V4_STAGE_A_PROTOCOL
+    protocol_name, protocol = selected_stage_a_protocol(args)
     keys = (
         *protocol,
         "data_profile",
@@ -261,6 +294,15 @@ def validate_v4_resume_config(saved: dict[str, Any], args: argparse.Namespace) -
         mismatches["checkpoint"] = {
             "saved": str(saved_checkpoint),
             "requested": str(requested_checkpoint),
+        }
+    saved_protocol_name = saved.get("stage_a_protocol")
+    if (
+        protocol_name == V6_1_STAGE_A_PROTOCOL_NAME
+        or saved_protocol_name is not None
+    ) and saved_protocol_name != protocol_name:
+        mismatches["stage_a_protocol"] = {
+            "saved": saved_protocol_name,
+            "requested": protocol_name,
         }
     if mismatches:
         raise ValueError(f"{args.data_profile} Stage A resume config mismatch: {mismatches}")
@@ -617,13 +659,17 @@ def write_jsonl(path: Path, payload: dict) -> None:
 def checkpoint_config_payload(args: argparse.Namespace, identity: dict[str, Any]) -> dict[str, Any]:
     """Build the persistent run config without private, in-memory runtime caches."""
     public_args = {key: value for key, value in vars(args).items() if not key.startswith("_")}
-    return public_args | {
+    protocol_name, _ = selected_stage_a_protocol(args)
+    payload = public_args | {
         "artifact_identity": identity,
         "data_config_hash": identity["data_config_hash"],
         "action_frame_manifest_hash": identity["action_frame_manifest_hash"],
         "action_indices_identity": identity["action_indices_identity"],
         "index_sha256": identity["index_sha256"],
     }
+    if protocol_name is not None:
+        payload["stage_a_protocol"] = protocol_name
+    return payload
 
 
 def main() -> None:

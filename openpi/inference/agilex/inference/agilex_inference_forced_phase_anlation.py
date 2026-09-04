@@ -45,6 +45,7 @@ DEFAULT_INSTRUCTION = "Pick up and transfer the object stably."
 DEFAULT_CAPTIONER = Path("/data1/outputs/tactile_captioner/tcn_v3_w30_rotation_head/best.pt")
 DEFAULT_LOG_ROOT = PROJECT_ROOT / "outputs" / "runtime" / "forced_phase_ablation"
 ACTION_NOISE_SHAPE = (30, 32)
+V6_1_STAGE_A_PROTOCOL_NAME = "v6_1_no_state_history"
 ROTATION_DIRECTIONS = ("right", "left", "front", "back")
 Phase = Literal["execution", "reposition", "adjustment"]
 LEGACY_PHASE_KEYS: dict[str, Phase] = {
@@ -254,22 +255,31 @@ def validate_server_metadata(args: argparse.Namespace, metadata: dict[str, Any])
         raise ValueError(f"Server action_dim must be 32, got {metadata.get('action_dim')}")
     if int(metadata.get("output_action_dim", 0)) != 7:
         raise ValueError(f"Server output_action_dim must be 7, got {metadata.get('output_action_dim')}")
-    if not bool(metadata.get("use_state_history", False)):
-        raise ValueError("Ablation requires a checkpoint with state history enabled")
-    server_history = (
-        int(metadata.get("state_history_len", 0)),
-        int(metadata.get("state_history_dim", 0)),
-    )
-    if server_history != (args.state_history_len, 7):
-        raise ValueError(
-            f"Client/server state-history mismatch: client=[{args.state_history_len},7], "
-            f"server={list(server_history)}"
+    use_state_history = bool(metadata.get("use_state_history", False))
+    if use_state_history:
+        server_history = (
+            int(metadata.get("state_history_len", 0)),
+            int(metadata.get("state_history_dim", 0)),
         )
-    server_fps = float(metadata.get("state_history_fps", 0.0))
-    if not np.isclose(server_fps, args.state_history_fps):
-        raise ValueError(
-            f"Client state_history_fps={args.state_history_fps} does not match server={server_fps}"
-        )
+        if server_history != (args.state_history_len, 7):
+            raise ValueError(
+                f"Client/server state-history mismatch: client=[{args.state_history_len},7], "
+                f"server={list(server_history)}"
+            )
+        server_fps = float(metadata.get("state_history_fps", 0.0))
+        if not np.isclose(server_fps, args.state_history_fps):
+            raise ValueError(
+                f"Client state_history_fps={args.state_history_fps} does not match server={server_fps}"
+            )
+    else:
+        stage_a_protocol = metadata.get("stage_a_protocol")
+        if stage_a_protocol != V6_1_STAGE_A_PROTOCOL_NAME:
+            raise ValueError(
+                "A no-history server must advertise "
+                f"stage_a_protocol={V6_1_STAGE_A_PROTOCOL_NAME!r}"
+            )
+        if int(metadata.get("state_history_len", -1)) != 0:
+            raise ValueError("V6.1 no-history server must advertise state_history_len=0")
     if args.chunk_size > ACTION_NOISE_SHAPE[0]:
         raise ValueError(f"--chunk_size must be at most 30, got {args.chunk_size}")
     profile = resolve_prompt_profile(metadata.get("prompt_profile"))
@@ -294,6 +304,8 @@ def validate_server_metadata(args: argparse.Namespace, metadata: dict[str, Any])
             )
         if metadata.get("checkpoint_kind") != "stage-a":
             raise ValueError(f"{data_profile} forced phase inference requires a Stage A checkpoint")
+    if not use_state_history and profile != PHASE_PROMPT_PROFILE_V2:
+        raise ValueError("V6.1 no-history inference requires the V5.2 phase_v2 profile")
 
 
 def _capture_observation(
@@ -773,6 +785,7 @@ def run_ablation(
 ) -> None:
     metadata = policy.get_server_metadata()
     validate_server_metadata(args, metadata)
+    args.use_state_history = bool(metadata.get("use_state_history", False))
     args.prompt_profile = resolve_prompt_profile(metadata.get("prompt_profile"))
     logger.record(
         {

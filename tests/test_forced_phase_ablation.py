@@ -240,6 +240,24 @@ def test_v52_server_metadata_pair_is_strict() -> None:
         "experiment_kind": "phase_prompt_h30_terminal_hold",
     }
     client.validate_server_metadata(args, metadata)
+    client.validate_server_metadata(
+        args,
+        metadata
+        | {
+            "stage_a_protocol": "v6_1_no_state_history",
+            "use_state_history": False,
+            "state_history_len": 0,
+        },
+    )
+    with pytest.raises(ValueError, match="stage_a_protocol"):
+        client.validate_server_metadata(
+            args,
+            metadata
+            | {
+                "use_state_history": False,
+                "state_history_len": 0,
+            },
+        )
     with pytest.raises(ValueError, match="experiment/prompt profile mismatch"):
         client.validate_server_metadata(
             args,

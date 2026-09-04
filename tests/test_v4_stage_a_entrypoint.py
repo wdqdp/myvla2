@@ -195,4 +195,10 @@ def test_stage_a_v4_loader_uses_index_execution_indices_and_v4_repo_id(
     loader = module.build_loader(args, object(), payload)
     assert captured["indices"] == [7, 3]
     assert captured["dataset_repo_id"] == "tactile_vla_rotation_v4"
+    assert captured["state_history_len"] == 60
     assert loader["shuffle"] is True
+
+    args.use_state_history = False
+    args.state_history_len = 0
+    module.build_loader(args, object(), payload)
+    assert captured["state_history_len"] == 0

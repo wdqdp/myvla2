@@ -61,6 +61,7 @@ from tactile_vla.vla.v5_phase_data import ROTATION_PHASE_V5
 ACTION_HORIZON = 30
 ACTION_DIM = 32
 OUTPUT_ACTION_DIM = 7
+V6_1_STAGE_A_PROTOCOL_NAME = "v6_1_no_state_history"
 
 PHASE_ACTION_PROFILES = {
     ROTATION_PHASE_V5: (PHASE_PROMPT_PROFILE, PHASE_EXPERIMENT_KIND),
@@ -76,6 +77,7 @@ VERSIONED_ACTION_PROFILES = {
 
 _METADATA_CONFIG_KEYS = (
     "run_name",
+    "stage_a_protocol",
     "data_profile",
     "prompt_profile",
     "experiment_kind",
@@ -260,13 +262,25 @@ def _model_config(args: argparse.Namespace, config: dict[str, Any]) -> Pi0Config
             "Forced-phase ablation requires action noise [30,32], but checkpoint config has "
             f"[{model_config.action_horizon},{model_config.action_dim}]"
         )
-    if not model_config.use_state_history:
-        raise ValueError("Forced-recovery ablation requires the V3 state-history checkpoint")
-    if (model_config.state_history_len, model_config.state_history_dim) != (60, OUTPUT_ACTION_DIM):
+    if model_config.use_state_history and (
+        model_config.state_history_len,
+        model_config.state_history_dim,
+    ) != (60, OUTPUT_ACTION_DIM):
         raise ValueError(
             "Forced-recovery ablation requires state history [60,7], but checkpoint config has "
             f"[{model_config.state_history_len},{model_config.state_history_dim}]"
         )
+    if not model_config.use_state_history:
+        if config.get("stage_a_protocol") != V6_1_STAGE_A_PROTOCOL_NAME:
+            raise ValueError(
+                "A no-history action checkpoint must declare "
+                f"stage_a_protocol={V6_1_STAGE_A_PROTOCOL_NAME!r}"
+            )
+        if (model_config.state_history_len, model_config.history_hidden_dim) != (0, 0):
+            raise ValueError(
+                "V6.1 no-history checkpoint requires state_history_len=0 and "
+                "history_hidden_dim=0"
+            )
     return model_config
 
 
@@ -356,6 +370,7 @@ class ActionOnlyAblationPolicy:
             "action_only_ablation": True,
             "checkpoint_kind": args.checkpoint_kind,
             "checkpoint": str(args.checkpoint.resolve()),
+            "stage_a_protocol": config.get("stage_a_protocol"),
             "prompt_profile": resolve_prompt_profile(config.get("prompt_profile")),
             "data_profile": str(config.get("data_profile", "legacy")),
             "experiment_kind": config.get("experiment_kind"),
@@ -404,6 +419,9 @@ class ActionOnlyAblationPolicy:
         inputs.pop("noise_seed", None)
         inputs.pop("noise_phase", None)
         inputs.pop("noise_index", None)
+        if not self._config.use_state_history:
+            inputs.pop("observation/state_history", None)
+            inputs.pop("observation/state_history_mask", None)
         transformed = self._input_transform(inputs)
         return transformed, self._observation(transformed), noise
 
@@ -452,12 +470,8 @@ class ActionOnlyAblationPolicy:
 def warm_up(policy: ActionOnlyAblationPolicy) -> dict[str, Any]:
     image = np.zeros((224, 224, 3), dtype=np.uint8)
     state = np.zeros((OUTPUT_ACTION_DIM,), dtype=np.float32)
-    response = policy.infer(
+    history_inputs = (
         {
-            "mode": "execution",
-            "observation/image": image,
-            "observation/wrist_image": image,
-            "observation/state": state,
             "observation/state_history": np.zeros(
                 (policy._config.state_history_len, policy._config.state_history_dim),  # noqa: SLF001
                 dtype=np.float32,
@@ -466,6 +480,17 @@ def warm_up(policy: ActionOnlyAblationPolicy) -> dict[str, Any]:
                 (policy._config.state_history_len,),  # noqa: SLF001
                 dtype=np.bool_,
             ),
+        }
+        if policy._config.use_state_history  # noqa: SLF001
+        else {}
+    )
+    response = policy.infer(
+        {
+            "mode": "execution",
+            "observation/image": image,
+            "observation/wrist_image": image,
+            "observation/state": state,
+            **history_inputs,
             "prompt": build_execution_prompt(
                 instruction="dry run",
                 tactile_caption=(
@@ -482,10 +507,14 @@ def warm_up(policy: ActionOnlyAblationPolicy) -> dict[str, Any]:
         "raw_model_actions_shape": list(np.asarray(response["raw_model_actions"]).shape),
         "actions_shape": list(np.asarray(response["actions"]).shape),
         "action_noise_shape": policy.metadata["action_noise_shape"],
-        "state_history_shape": [
-            policy.metadata["state_history_len"],
-            policy.metadata["state_history_dim"],
-        ],
+        "state_history_shape": (
+            [
+                policy.metadata["state_history_len"],
+                policy.metadata["state_history_dim"],
+            ]
+            if policy.metadata["use_state_history"]
+            else None
+        ),
     }
 
 
