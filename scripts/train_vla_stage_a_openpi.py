@@ -203,7 +203,6 @@ def validate_v5_args(args: argparse.Namespace) -> None:
 
 V4_STAGE_A_PROTOCOL = {
     "split": "train",
-    "batch_size": 8,
     "num_steps": 15_000,
     "lr": 5e-5,
     "lr_final": 5e-7,
