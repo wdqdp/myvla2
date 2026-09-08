@@ -134,8 +134,8 @@ def _run_async_adjustment_end_once(
         img_front_bgr=observation.img_front,
         img_left_bgr=observation.img_left,
         qpos=observation.qpos,
-        state_history=observation.state_history,
-        state_history_mask=observation.state_history_mask,
+        state_history=observation.state_history if getattr(args, "use_state_history", True) else None,
+        state_history_mask=observation.state_history_mask if getattr(args, "use_state_history", True) else None,
         prompt=prompt,
     )
     started = time.perf_counter()
@@ -288,6 +288,7 @@ def run_v5_3_async(
     v53.validate_server_metadata(args, classification_metadata)
     if action_metadata != classification_metadata:
         raise ValueError("Action and asynchronous classification connections expose different metadata")
+    args.use_state_history = bool(action_metadata.get("use_state_history", False))
     stats = load_state_quantiles(args.norm_stats_file)
     logger.record({
         "event": "run_start",
@@ -537,6 +538,11 @@ def get_arguments() -> tuple[argparse.Namespace, argparse.ArgumentParser]:
     parser.add_argument("--noise-seed", type=int, required=True)
     parser.add_argument("--trial-id")
     parser.add_argument("--log-dir", type=Path, default=DEFAULT_LOG_ROOT)
+    parser.add_argument(
+        "--expected-data-profile",
+        choices=(v53.V5_3_DATA_PROFILE, v53.V7_DATA_PROFILE),
+        default=v53.V5_3_DATA_PROFILE,
+    )
     parser.add_argument("--norm-stats-file", type=Path, default=v53.DEFAULT_NORM_STATS)
     parser.add_argument("--phase-change-timeout-seconds", type=float, default=10.0)
     parser.add_argument("--adjustment-end-rate-hz", type=float, default=DEFAULT_ADJUSTMENT_END_RATE_HZ)

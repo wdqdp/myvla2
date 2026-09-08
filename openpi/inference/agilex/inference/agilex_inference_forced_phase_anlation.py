@@ -335,9 +335,13 @@ def _capture_observation(
     if qpos.shape != (7,) or not np.isfinite(qpos).all():
         raise ValueError(f"Expected finite qpos [7], got {qpos.shape}")
     tactile_caption = runtime.current_tactile_caption(operator, captioner)
-    if reset_history:
-        operator.reset_state_history()
-    state_history, state_history_mask = operator.get_state_history(puppet_arm)
+    if getattr(args, "use_state_history", True):
+        if reset_history:
+            operator.reset_state_history()
+        state_history, state_history_mask = operator.get_state_history(puppet_arm)
+    else:
+        state_history = np.empty((0, 7), dtype=np.float32)
+        state_history_mask = np.empty((0,), dtype=np.bool_)
     return FrozenObservation(
         img_front=np.asarray(img_front).copy(),
         img_left=np.asarray(img_left).copy(),
@@ -363,7 +367,7 @@ def _capture_delayed_history_snapshot(
     again from a frame newer than the key press.
     """
 
-    delay = float(args.history_freeze_delay_seconds)
+    delay = float(args.history_freeze_delay_seconds) if getattr(args, "use_state_history", True) else 0.0
     if delay > 0.0:
         time.sleep(delay)
     return _capture_observation(
@@ -450,10 +454,13 @@ def _start_forced_recovery(
             reset_history=True,
             after_timestamp=time.time(),
         )
-    else:
+    elif getattr(args, "use_state_history", True):
         operator.reset_state_history()
         frozen = _as_new_attempt_observation(args, locked_observation)
-    _resume_state_history(args, operator, frozen)
+    else:
+        frozen = locked_observation
+    if getattr(args, "use_state_history", True):
+        _resume_state_history(args, operator, frozen)
     image_paths = logger.save_trigger_images(frozen.img_front, frozen.img_left)
     start_phase = forced_attempt_start_phase(args.prompt_profile)
     logger.record(
@@ -517,8 +524,8 @@ def _request_action_chunk(
         img_front_bgr=observation.img_front,
         img_left_bgr=observation.img_left,
         qpos=observation.qpos,
-        state_history=observation.state_history,
-        state_history_mask=observation.state_history_mask,
+        state_history=observation.state_history if getattr(args, "use_state_history", True) else None,
+        state_history_mask=observation.state_history_mask if getattr(args, "use_state_history", True) else None,
         prompt=prompt,
     )
     payload.update(
@@ -673,7 +680,8 @@ def _wait_for_chunk_continue(
 ) -> ControlSignal:
     """Pause with history locked, then capture live image/qpos on continue."""
 
-    _pause_state_history(operator)
+    if getattr(args, "use_state_history", True):
+        _pause_state_history(operator)
     pause_started = time.monotonic()
     logger.record(
         {
@@ -742,12 +750,15 @@ def _wait_for_chunk_continue(
                 reset_history=False,
                 after_timestamp=continue_requested_timestamp,
             )
-            realtime_observation = replace(
-                realtime_observation,
-                state_history=locked_history.state_history.copy(),
-                state_history_mask=locked_history.state_history_mask.copy(),
-            )
-            anchor_timestamp = _resume_state_history(args, operator, realtime_observation)
+            if getattr(args, "use_state_history", True):
+                realtime_observation = replace(
+                    realtime_observation,
+                    state_history=locked_history.state_history.copy(),
+                    state_history_mask=locked_history.state_history_mask.copy(),
+                )
+                anchor_timestamp = _resume_state_history(args, operator, realtime_observation)
+            else:
+                anchor_timestamp = realtime_observation.timestamp
             logger.record(
                 {
                     "event": "chunk_continue",

@@ -548,28 +548,32 @@ def build_payload(
     img_front_bgr: np.ndarray,
     img_left_bgr: np.ndarray,
     qpos: np.ndarray,
-    state_history: np.ndarray,
-    state_history_mask: np.ndarray,
+    state_history: np.ndarray | None,
+    state_history_mask: np.ndarray | None,
     prompt: str,
 ) -> dict[str, Any]:
     qpos = np.asarray(qpos, dtype=np.float32)
     if qpos.shape[0] != 7:
         raise ValueError(f"Expected puppetRight qpos dim 7, got {qpos.shape}")
-    state_history = np.asarray(state_history, dtype=np.float32)
-    state_history_mask = np.asarray(state_history_mask, dtype=np.bool_)
-    if state_history.shape != (state_history_mask.shape[0], 7):
-        raise ValueError(
-            f"Expected state_history [T,7] matching mask [T], got {state_history.shape} and {state_history_mask.shape}"
-        )
-    return {
+    payload = {
         "mode": mode,
         "observation/image": prepare_rgb(img_front_bgr),
         "observation/wrist_image": prepare_rgb(img_left_bgr),
         "observation/state": qpos,
-        "observation/state_history": state_history,
-        "observation/state_history_mask": state_history_mask,
         "prompt": prompt,
     }
+    if (state_history is None) != (state_history_mask is None):
+        raise ValueError("state_history and state_history_mask must both be present or both be absent")
+    if state_history is not None:
+        state_history = np.asarray(state_history, dtype=np.float32)
+        state_history_mask = np.asarray(state_history_mask, dtype=np.bool_)
+        if state_history.shape != (state_history_mask.shape[0], 7):
+            raise ValueError(
+                f"Expected state_history [T,7] matching mask [T], got {state_history.shape} and {state_history_mask.shape}"
+            )
+        payload["observation/state_history"] = state_history
+        payload["observation/state_history_mask"] = state_history_mask
+    return payload
 
 
 def load_captioner(args: argparse.Namespace):

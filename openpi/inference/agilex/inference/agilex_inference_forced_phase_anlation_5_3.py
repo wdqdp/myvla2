@@ -39,6 +39,8 @@ from tactile_vla.vla.v5_3_phase_change import build_adjustment_end_prompt
 DEFAULT_CAPTIONER = Path("/data1/outputs/tactile_captioner/tcn_v3_w30_rotation_head/best.pt")
 DEFAULT_NORM_STATS = Path("/data1/outputs/vla/assets/tactile_vla_rotation_v4/norm_stats.json")
 DEFAULT_LOG_ROOT = PROJECT_ROOT / "outputs/runtime/forced_phase_ablation_v5_3"
+V5_3_DATA_PROFILE = "rotation_phase_v5_adjustment_v2"
+V7_DATA_PROFILE = "rotation_phase_v7_adjustment"
 ACTION_NOISE_SHAPE = (30, 32)
 SYNC_TOLERANCE_SECONDS = 0.050
 Phase = Literal["execution", "adjustment"]
@@ -58,13 +60,19 @@ class TimeoutWebsocketPolicy(websocket_client_policy.WebsocketClientPolicy):
 
 
 def validate_server_metadata(args: argparse.Namespace, metadata: dict[str, Any]) -> None:
+    expected_profile = getattr(args, "expected_data_profile", V5_3_DATA_PROFILE)
+    no_history = expected_profile == V7_DATA_PROFILE
     expected = {
         "supports_action_noise": True,
         "requires_action_noise": True,
         "supports_adjustment_end": True,
         "prompt_profile": "phase_v2",
-        "data_profile": "rotation_phase_v5_adjustment_v2",
-        "experiment_kind": "phase_prompt_h30_terminal_hold",
+        "data_profile": expected_profile,
+        "experiment_kind": (
+            "phase_prompt_h30_terminal_hold_native_reexecution"
+            if no_history
+            else "phase_prompt_h30_terminal_hold"
+        ),
         "phase_change_prompt_profile": "phase_change_v1",
         "phase_change_max_token_len": PHASE_CHANGE_MAX_TOKEN_LEN,
         "qpos_h30_sample_offsets": list(QPOS_SAMPLE_OFFSETS),
@@ -74,12 +82,16 @@ def validate_server_metadata(args: argparse.Namespace, metadata: dict[str, Any])
         "action_horizon": 30,
         "action_dim": 32,
         "output_action_dim": 7,
-        "state_history_len": 60,
+        "state_history_len": 0 if no_history else 60,
         "state_history_dim": 7,
     }
+    if no_history:
+        expected["use_state_history"] = False
     mismatch = {key: (metadata.get(key), value) for key, value in expected.items() if metadata.get(key) != value}
     if mismatch:
         raise ValueError(f"V5.3 client/server metadata mismatch: {mismatch}")
+    if no_history and metadata.get("stage_a_protocol") != "v7_no_state_history":
+        raise ValueError("V7 server must advertise stage_a_protocol=v7_no_state_history")
     threshold = float(metadata.get("adjustment_end_threshold", -1.0))
     if not 0.0 <= threshold <= 1.0:
         raise ValueError("Server adjustment_end_threshold is invalid")
@@ -176,7 +188,11 @@ def _capture_classification_observation(
         if captioner is None or operator.tactile is None or not operator.tactile.ready:
             raise RuntimeError("V5.3 classification requires a ready 30-frame tactile captioner")
         qpos = np.asarray(joint.position, dtype=np.float32)
-        history, mask = operator.get_state_history(joint)
+        if getattr(args, "use_state_history", True):
+            history, mask = operator.get_state_history(joint)
+        else:
+            history = np.empty((0, 7), dtype=np.float32)
+            mask = np.empty((0,), dtype=np.bool_)
         observation = v52.FrozenObservation(
             img_front=np.asarray(front).copy(),
             img_left=np.asarray(left).copy(),
@@ -252,8 +268,8 @@ def _classify_adjustment_end(
         img_front_bgr=observation.img_front,
         img_left_bgr=observation.img_left,
         qpos=observation.qpos,
-        state_history=observation.state_history,
-        state_history_mask=observation.state_history_mask,
+        state_history=observation.state_history if getattr(args, "use_state_history", True) else None,
+        state_history_mask=observation.state_history_mask if getattr(args, "use_state_history", True) else None,
         prompt=prompt,
     )
     started = time.perf_counter()
@@ -311,9 +327,12 @@ def should_request_adjustment_end(*, phase: Phase, completed_raw_actions: int) -
 
 
 def _wait_for_s(args, operator, captioner, keyboard, logger, phase, phase_index, locked_history):
-    v52._pause_state_history(operator)
+    uses_history = getattr(args, "use_state_history", True)
+    if uses_history:
+        v52._pause_state_history(operator)
     logger.record({"event": "chunk_pause", "phase": phase, "phase_index": phase_index})
-    print(f"[{phase.upper()}] chunk complete; history locked. Press s for next chunk, SPACE in execution, q to quit.")
+    pause_text = "history locked" if uses_history else "no state history"
+    print(f"[{phase.upper()}] chunk complete; {pause_text}. Press s for next chunk, SPACE in execution, q to quit.")
     rate = operator.rate(args.observation_poll_rate)
     while not operator.is_shutdown() and not runtime.shutdown_event.is_set():
         signal_value = _poll_key(args, keyboard, phase=phase, paused=True)
@@ -323,12 +342,13 @@ def _wait_for_s(args, operator, captioner, keyboard, logger, phase, phase_index,
         if signal_value == "continue":
             requested = time.time()
             live = v52._capture_observation(args, operator, captioner, reset_history=False, after_timestamp=requested)
-            live = replace(
-                live,
-                state_history=locked_history.state_history.copy(),
-                state_history_mask=locked_history.state_history_mask.copy(),
-            )
-            v52._resume_state_history(args, operator, live)
+            if uses_history:
+                live = replace(
+                    live,
+                    state_history=locked_history.state_history.copy(),
+                    state_history_mask=locked_history.state_history_mask.copy(),
+                )
+                v52._resume_state_history(args, operator, live)
             return "continue", live
         return signal_value, None
     return "quit", None
@@ -337,6 +357,7 @@ def _wait_for_s(args, operator, captioner, keyboard, logger, phase, phase_index,
 def run_v5_3(args, operator, policy, captioner, keyboard, logger):
     metadata = policy.get_server_metadata()
     validate_server_metadata(args, metadata)
+    args.use_state_history = bool(metadata.get("use_state_history", False))
     stats = load_state_quantiles(args.norm_stats_file)
     logger.record({"event": "run_start", "server_metadata": metadata, "args": vars(args)})
     print(
@@ -509,6 +530,11 @@ def get_arguments():
     parser.add_argument("--noise-seed", type=int, required=True)
     parser.add_argument("--trial-id")
     parser.add_argument("--log-dir", type=Path, default=DEFAULT_LOG_ROOT)
+    parser.add_argument(
+        "--expected-data-profile",
+        choices=(V5_3_DATA_PROFILE, V7_DATA_PROFILE),
+        default=V5_3_DATA_PROFILE,
+    )
     parser.add_argument("--norm-stats-file", type=Path, default=DEFAULT_NORM_STATS)
     parser.add_argument("--phase-change-timeout-seconds", type=float, default=10.0)
     parser.add_argument("--max_publish_step", type=int, default=10000)
@@ -564,8 +590,10 @@ def validate_args(args, parser):
         parser.error("provide --rotation-direction or a legal --forced-recovery-plan")
     if args.chunk_size != 30:
         parser.error("V5.3 requires --chunk_size=30 so every adjustment check owns one complete H30")
-    if args.state_history_len != 60 or args.tactile_window_size != 30:
-        parser.error("V5.3 requires state history 60 and tactile window 30")
+    if args.tactile_window_size != 30:
+        parser.error("adjustment_end inference requires tactile window 30")
+    if args.expected_data_profile == V5_3_DATA_PROFILE and args.state_history_len != 60:
+        parser.error("V5.3 requires state history 60")
     if args.phase_change_timeout_seconds != 10.0:
         parser.error("V5.3 phase-change timeout is fixed at 10 seconds")
     if not args.captioner_checkpoint.is_file() or not args.norm_stats_file.is_file():
@@ -573,6 +601,7 @@ def validate_args(args, parser):
     if not 0 <= args.gripper_min <= 0.08:
         parser.error("--gripper-min must be in [0,0.08]")
     args.prompt_profile = "phase_v2"
+    args.use_state_history = args.expected_data_profile != V7_DATA_PROFILE
     args.no_captioner = False
 
 

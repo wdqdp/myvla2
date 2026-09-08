@@ -102,6 +102,13 @@ ACTION_DATA_PROFILE = "rotation_phase_v5_adjustment_v2"
 ACTION_PROMPT_PROFILE = "phase_v2"
 ACTION_EXPERIMENT_KIND = "phase_prompt_h30_terminal_hold"
 TASK_CYCLE = ("action", "adjustment_end")
+FROZEN_COMPONENTS = [
+    "action_expert_all_parameters",
+    "paligemma_non_lora",
+    "state_history_encoder",
+    "action_projection_layers",
+]
+CHECKPOINT_EXPORTS = ["delta_params"]
 
 
 def parse_args() -> argparse.Namespace:
@@ -135,6 +142,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--phase-change-max-token-len", type=int, default=512)
     parser.add_argument("--action-horizon", type=int, default=30)
     parser.add_argument("--action-dim", type=int, default=32)
+    parser.add_argument(
+        "--use-state-history",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
     parser.add_argument("--state-history-len", type=int, default=60)
     parser.add_argument("--state-history-dim", type=int, default=7)
     parser.add_argument("--history-hidden-dim", type=int, default=256)
@@ -168,6 +180,7 @@ def _validate_protocol(args: argparse.Namespace) -> None:
         "phase_change_max_token_len": PHASE_CHANGE_MAX_TOKEN_LEN,
         "action_horizon": 30,
         "action_dim": 32,
+        "use_state_history": True,
         "state_history_len": 60,
         "state_history_dim": 7,
         "history_hidden_dim": 256,
@@ -265,7 +278,7 @@ def _model_config(args: argparse.Namespace, *, precision: str, max_token_len: in
         action_horizon=args.action_horizon,
         max_token_len=max_token_len,
         pi05=True,
-        use_state_history=True,
+        use_state_history=args.use_state_history,
         state_history_len=args.state_history_len,
         state_history_dim=args.state_history_dim,
         history_hidden_dim=args.history_hidden_dim,
@@ -806,12 +819,8 @@ def main() -> None:
         "classification_sampling_ratio": {"positive": 1, "negative": 3},
         "label_policy": LABEL_POLICY,
         "trainable_components": ["paligemma_lora", "adjustment_end_head"],
-        "frozen_components": [
-            "action_expert_all_parameters",
-            "paligemma_non_lora",
-            "state_history_encoder",
-            "action_projection_layers",
-        ],
+        "frozen_components": FROZEN_COMPONENTS,
+        "checkpoint_exports": CHECKPOINT_EXPORTS,
         "action_regression_gate": None,
         "minimum_recall_gate": None,
         "threshold_policy": "max_recall_subject_to_early_fpr_lte_0_01",
