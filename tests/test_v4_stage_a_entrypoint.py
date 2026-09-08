@@ -123,6 +123,33 @@ def test_stage_a_v4_protocol_and_resume_are_strict(monkeypatch: pytest.MonkeyPat
         module.validate_v4_resume_config(saved | {"lr": 1e-4}, args)
 
 
+def test_stage_a_v7_requires_no_history_protocol(monkeypatch: pytest.MonkeyPatch) -> None:
+    module = _load_script()
+    monkeypatch.setattr(module, "DEFAULT_BASE_CHECKPOINT", Path("/models/pi05_base/params"))
+    args = _v4_stage_a_protocol_args(
+        data_profile="rotation_phase_v7_adjustment",
+        prompt_profile="phase_v2",
+        experiment_kind="phase_prompt_h30_terminal_hold_native_reexecution",
+        use_state_history=False,
+        state_history_len=0,
+        history_hidden_dim=0,
+        no_norm=False,
+    )
+    module.validate_v5_args(args)
+    module.validate_v4_training_protocol(args)
+    assert module.selected_stage_a_protocol(args)[0] == "v7_no_state_history"
+
+    with pytest.raises(ValueError, match="protocol mismatch"):
+        module.validate_v4_training_protocol(
+            _v4_stage_a_protocol_args(
+                data_profile="rotation_phase_v7_adjustment",
+                prompt_profile="phase_v2",
+                experiment_kind="phase_prompt_h30_terminal_hold_native_reexecution",
+                no_norm=False,
+            )
+        )
+
+
 def test_stage_a_v4_requires_existing_dedicated_index_and_validates_dataset(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

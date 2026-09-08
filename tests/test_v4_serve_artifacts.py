@@ -312,6 +312,14 @@ def test_v61_action_server_accepts_only_strict_no_history_protocol() -> None:
     with pytest.raises(ValueError, match="state_history_len=0"):
         serve._model_config(args, config | {"state_history_len": 60})
 
+    v7_config = config | {
+        "data_profile": "rotation_phase_v7_adjustment",
+        "stage_a_protocol": "v7_no_state_history",
+    }
+    assert serve._model_config(args, v7_config).use_state_history is False
+    with pytest.raises(ValueError, match="v7_no_state_history"):
+        serve._model_config(args, v7_config | {"stage_a_protocol": "v6_1_no_state_history"})
+
 
 def test_action_server_metadata_excludes_v5_per_frame_training_lookup() -> None:
     serve = _load_script(

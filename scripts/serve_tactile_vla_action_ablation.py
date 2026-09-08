@@ -56,18 +56,25 @@ from tactile_vla.vla.v5_adjustment_data import ROTATION_PHASE_V5_ADJUSTMENT_V2
 from tactile_vla.vla.v5_adjustment_data import V2_EXPERIMENT_KIND
 from tactile_vla.vla.v5_phase_data import PHASE_EXPERIMENT_KIND
 from tactile_vla.vla.v5_phase_data import ROTATION_PHASE_V5
+from tactile_vla.vla.v7_adjustment_data import ROTATION_PHASE_V7_ADJUSTMENT
+from tactile_vla.vla.v7_adjustment_data import V7_EXPERIMENT_KIND
 
 
 ACTION_HORIZON = 30
 ACTION_DIM = 32
 OUTPUT_ACTION_DIM = 7
 V6_1_STAGE_A_PROTOCOL_NAME = "v6_1_no_state_history"
+V7_STAGE_A_PROTOCOL_NAME = "v7_no_state_history"
 
 PHASE_ACTION_PROFILES = {
     ROTATION_PHASE_V5: (PHASE_PROMPT_PROFILE, PHASE_EXPERIMENT_KIND),
     ROTATION_PHASE_V5_ADJUSTMENT_V2: (
         PHASE_PROMPT_PROFILE_V2,
         V2_EXPERIMENT_KIND,
+    ),
+    ROTATION_PHASE_V7_ADJUSTMENT: (
+        PHASE_PROMPT_PROFILE_V2,
+        V7_EXPERIMENT_KIND,
     ),
 }
 VERSIONED_ACTION_PROFILES = {
@@ -271,10 +278,15 @@ def _model_config(args: argparse.Namespace, config: dict[str, Any]) -> Pi0Config
             f"[{model_config.state_history_len},{model_config.state_history_dim}]"
         )
     if not model_config.use_state_history:
-        if config.get("stage_a_protocol") != V6_1_STAGE_A_PROTOCOL_NAME:
+        expected_protocol = (
+            V7_STAGE_A_PROTOCOL_NAME
+            if config.get("data_profile") == ROTATION_PHASE_V7_ADJUSTMENT
+            else V6_1_STAGE_A_PROTOCOL_NAME
+        )
+        if config.get("stage_a_protocol") != expected_protocol:
             raise ValueError(
                 "A no-history action checkpoint must declare "
-                f"stage_a_protocol={V6_1_STAGE_A_PROTOCOL_NAME!r}"
+                f"stage_a_protocol={expected_protocol!r}"
             )
         if (model_config.state_history_len, model_config.history_hidden_dim) != (0, 0):
             raise ValueError(

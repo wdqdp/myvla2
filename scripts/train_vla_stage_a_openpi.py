@@ -105,9 +105,17 @@ from tactile_vla.vla.v5_adjustment_data import ROTATION_PHASE_V5_ADJUSTMENT_V2
 from tactile_vla.vla.v5_adjustment_data import V2_EXPERIMENT_KIND
 from tactile_vla.vla.v5_adjustment_data import V2_TRAINING_INDEX_SCHEMA
 from tactile_vla.vla.v5_adjustment_data import validate_v5_adjustment_training_index
+from tactile_vla.vla.v7_adjustment_data import ROTATION_PHASE_V7_ADJUSTMENT
+from tactile_vla.vla.v7_adjustment_data import V7_EXPERIMENT_KIND
+from tactile_vla.vla.v7_adjustment_data import V7_TRAINING_INDEX_SCHEMA
+from tactile_vla.vla.v7_adjustment_data import validate_v7_adjustment_training_index
 
 
-PHASE_DATA_PROFILES = {ROTATION_PHASE_V5, ROTATION_PHASE_V5_ADJUSTMENT_V2}
+PHASE_DATA_PROFILES = {
+    ROTATION_PHASE_V5,
+    ROTATION_PHASE_V5_ADJUSTMENT_V2,
+    ROTATION_PHASE_V7_ADJUSTMENT,
+}
 
 
 def parse_args() -> argparse.Namespace:
@@ -185,14 +193,17 @@ def validate_v5_args(args: argparse.Namespace) -> None:
         return
     expected_prompt = (
         PHASE_PROMPT_PROFILE_V2
-        if args.data_profile == ROTATION_PHASE_V5_ADJUSTMENT_V2
+        if args.data_profile in {
+            ROTATION_PHASE_V5_ADJUSTMENT_V2,
+            ROTATION_PHASE_V7_ADJUSTMENT,
+        }
         else PHASE_PROMPT_PROFILE
     )
-    expected_experiment = (
-        V2_EXPERIMENT_KIND
-        if args.data_profile == ROTATION_PHASE_V5_ADJUSTMENT_V2
-        else PHASE_EXPERIMENT_KIND
-    )
+    expected_experiment = {
+        ROTATION_PHASE_V5: PHASE_EXPERIMENT_KIND,
+        ROTATION_PHASE_V5_ADJUSTMENT_V2: V2_EXPERIMENT_KIND,
+        ROTATION_PHASE_V7_ADJUSTMENT: V7_EXPERIMENT_KIND,
+    }[args.data_profile]
     if args.prompt_profile != expected_prompt:
         raise ValueError(f"{args.data_profile} Stage A requires prompt_profile={expected_prompt!r}")
     if args.experiment_kind != expected_experiment:
@@ -229,12 +240,16 @@ V6_1_STAGE_A_PROTOCOL = {
     "state_history_len": 0,
     "history_hidden_dim": 0,
 }
+V7_STAGE_A_PROTOCOL_NAME = "v7_no_state_history"
+V7_STAGE_A_PROTOCOL = dict(V6_1_STAGE_A_PROTOCOL)
 
 
 def selected_stage_a_protocol(args: argparse.Namespace) -> tuple[str | None, dict[str, Any]]:
     """Resolve the pinned protocol without changing legacy V4/V5 behavior."""
     data_profile = getattr(args, "data_profile", None)
     use_state_history = bool(getattr(args, "use_state_history", True))
+    if data_profile == ROTATION_PHASE_V7_ADJUSTMENT:
+        return V7_STAGE_A_PROTOCOL_NAME, V7_STAGE_A_PROTOCOL
     if data_profile == ROTATION_PHASE_V5_ADJUSTMENT_V2 and not use_state_history:
         return V6_1_STAGE_A_PROTOCOL_NAME, V6_1_STAGE_A_PROTOCOL
     if data_profile in PHASE_DATA_PROFILES:
@@ -296,7 +311,7 @@ def validate_v4_resume_config(saved: dict[str, Any], args: argparse.Namespace) -
         }
     saved_protocol_name = saved.get("stage_a_protocol")
     if (
-        protocol_name == V6_1_STAGE_A_PROTOCOL_NAME
+        protocol_name in {V6_1_STAGE_A_PROTOCOL_NAME, V7_STAGE_A_PROTOCOL_NAME}
         or saved_protocol_name is not None
     ) and saved_protocol_name != protocol_name:
         mismatches["stage_a_protocol"] = {
@@ -328,6 +343,15 @@ def ensure_index(args: argparse.Namespace) -> dict:
             if payload.get("schema_version") != V2_TRAINING_INDEX_SCHEMA:
                 raise ValueError("rotation_phase_v5_adjustment_v2 requires its dedicated V2 index")
             _, lookup = validate_v5_adjustment_training_index(
+                payload,
+                index_path=args.index_file,
+                dataset_dir=args.dataset_dir,
+            )
+            args._v5_action_phase_lookup = lookup
+        elif args.data_profile == ROTATION_PHASE_V7_ADJUSTMENT:
+            if payload.get("schema_version") != V7_TRAINING_INDEX_SCHEMA:
+                raise ValueError("rotation_phase_v7_adjustment requires its dedicated V7 index")
+            _, lookup = validate_v7_adjustment_training_index(
                 payload,
                 index_path=args.index_file,
                 dataset_dir=args.dataset_dir,
@@ -369,11 +393,11 @@ def build_loader(
     if args.data_profile in PHASE_DATA_PROFILES:
         phase_lookup = getattr(args, "_v5_action_phase_lookup", None)
         if phase_lookup is None:
-            validator = (
-                validate_v5_adjustment_training_index
-                if args.data_profile == ROTATION_PHASE_V5_ADJUSTMENT_V2
-                else validate_v5_training_index
-            )
+            validator = {
+                ROTATION_PHASE_V5: validate_v5_training_index,
+                ROTATION_PHASE_V5_ADJUSTMENT_V2: validate_v5_adjustment_training_index,
+                ROTATION_PHASE_V7_ADJUSTMENT: validate_v7_adjustment_training_index,
+            }[args.data_profile]
             _, phase_lookup = validator(
                 payload, index_path=args.index_file, dataset_dir=args.dataset_dir
             )
