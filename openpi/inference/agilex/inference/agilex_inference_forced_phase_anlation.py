@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: UTF-8 -*-
-"""Manual phase-prompt ablation for V4, V5, V5.2, V7, and V7.1."""
+"""Manual phase-prompt ablation for V4, V5, V5.2, V7, V7.1, and V7.2."""
 
 # ruff: noqa: E402
 
@@ -48,6 +48,7 @@ ACTION_NOISE_SHAPE = (30, 32)
 V6_1_STAGE_A_PROTOCOL_NAME = "v6_1_no_state_history"
 V7_STAGE_A_PROTOCOL_NAME = "v7_no_state_history"
 V7_1_STAGE_A_PROTOCOL_NAME = "v7_1_no_state_history"
+V7_2_STAGE_A_PROTOCOL_NAME = "v7_2_no_state_history"
 ROTATION_DIRECTIONS = ("right", "left", "front", "back")
 Phase = Literal["execution", "reposition", "adjustment"]
 LEGACY_PHASE_KEYS: dict[str, Phase] = {
@@ -74,6 +75,10 @@ DATA_PROFILE_SPECS = {
     "rotation_phase_v7_1_adjustment": (
         PHASE_PROMPT_PROFILE_V2,
         "phase_prompt_h30_terminal_hold_native_reexecution_static_filtered",
+    ),
+    "rotation_phase_v7_2_adjustment": (
+        PHASE_PROMPT_PROFILE_V2,
+        "phase_prompt_h30_terminal_hold_native_reexecution_event_gap_filtered",
     ),
 }
 
@@ -284,13 +289,11 @@ def validate_server_metadata(args: argparse.Namespace, metadata: dict[str, Any])
     else:
         stage_a_protocol = metadata.get("stage_a_protocol")
         expected_protocol = (
-            V7_1_STAGE_A_PROTOCOL_NAME
-            if metadata.get("data_profile") == "rotation_phase_v7_1_adjustment"
-            else (
-                V7_STAGE_A_PROTOCOL_NAME
-                if metadata.get("data_profile") == "rotation_phase_v7_adjustment"
-                else V6_1_STAGE_A_PROTOCOL_NAME
-            )
+            {
+                "rotation_phase_v7_adjustment": V7_STAGE_A_PROTOCOL_NAME,
+                "rotation_phase_v7_1_adjustment": V7_1_STAGE_A_PROTOCOL_NAME,
+                "rotation_phase_v7_2_adjustment": V7_2_STAGE_A_PROTOCOL_NAME,
+            }.get(metadata.get("data_profile"), V6_1_STAGE_A_PROTOCOL_NAME)
         )
         if stage_a_protocol != expected_protocol:
             raise ValueError(
@@ -306,7 +309,7 @@ def validate_server_metadata(args: argparse.Namespace, metadata: dict[str, Any])
     if data_profile not in DATA_PROFILE_SPECS:
         raise ValueError(
             "Forced phase ablation supports only V4 minimal_v1, V5 phase_v1, "
-            "or V5.2/V7/V7.1 phase_v2 checkpoints"
+            "or V5.2/V7/V7.1/V7.2 phase_v2 checkpoints"
         )
     expected_prompt_profile, expected_experiment = DATA_PROFILE_SPECS[data_profile]
     if profile != expected_prompt_profile:
