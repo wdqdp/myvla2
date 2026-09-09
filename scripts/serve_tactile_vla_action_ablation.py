@@ -58,6 +58,8 @@ from tactile_vla.vla.v5_phase_data import PHASE_EXPERIMENT_KIND
 from tactile_vla.vla.v5_phase_data import ROTATION_PHASE_V5
 from tactile_vla.vla.v7_adjustment_data import ROTATION_PHASE_V7_ADJUSTMENT
 from tactile_vla.vla.v7_adjustment_data import V7_EXPERIMENT_KIND
+from tactile_vla.vla.v7_1_adjustment_data import ROTATION_PHASE_V7_1_ADJUSTMENT
+from tactile_vla.vla.v7_1_adjustment_data import V7_1_EXPERIMENT_KIND
 
 
 ACTION_HORIZON = 30
@@ -65,6 +67,7 @@ ACTION_DIM = 32
 OUTPUT_ACTION_DIM = 7
 V6_1_STAGE_A_PROTOCOL_NAME = "v6_1_no_state_history"
 V7_STAGE_A_PROTOCOL_NAME = "v7_no_state_history"
+V7_1_STAGE_A_PROTOCOL_NAME = "v7_1_no_state_history"
 
 PHASE_ACTION_PROFILES = {
     ROTATION_PHASE_V5: (PHASE_PROMPT_PROFILE, PHASE_EXPERIMENT_KIND),
@@ -75,6 +78,10 @@ PHASE_ACTION_PROFILES = {
     ROTATION_PHASE_V7_ADJUSTMENT: (
         PHASE_PROMPT_PROFILE_V2,
         V7_EXPERIMENT_KIND,
+    ),
+    ROTATION_PHASE_V7_1_ADJUSTMENT: (
+        PHASE_PROMPT_PROFILE_V2,
+        V7_1_EXPERIMENT_KIND,
     ),
 }
 VERSIONED_ACTION_PROFILES = {
@@ -132,6 +139,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--checkpoint-kind", choices=("stage-a", "stage-b"), required=True)
     parser.add_argument("--checkpoint", type=Path, required=True, help="Stage A step/params or merged Stage B directory.")
     parser.add_argument("--norm-stats-dir", type=Path, required=True)
+    parser.add_argument(
+        "--expected-data-profile",
+        help="Refuse to load a checkpoint whose config declares a different profile.",
+    )
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--num-inference-steps", type=int, default=10)
@@ -279,9 +290,13 @@ def _model_config(args: argparse.Namespace, config: dict[str, Any]) -> Pi0Config
         )
     if not model_config.use_state_history:
         expected_protocol = (
-            V7_STAGE_A_PROTOCOL_NAME
-            if config.get("data_profile") == ROTATION_PHASE_V7_ADJUSTMENT
-            else V6_1_STAGE_A_PROTOCOL_NAME
+            V7_1_STAGE_A_PROTOCOL_NAME
+            if config.get("data_profile") == ROTATION_PHASE_V7_1_ADJUSTMENT
+            else (
+                V7_STAGE_A_PROTOCOL_NAME
+                if config.get("data_profile") == ROTATION_PHASE_V7_ADJUSTMENT
+                else V6_1_STAGE_A_PROTOCOL_NAME
+            )
         )
         if config.get("stage_a_protocol") != expected_protocol:
             raise ValueError(
@@ -493,7 +508,7 @@ def warm_up(policy: ActionOnlyAblationPolicy) -> dict[str, Any]:
                 dtype=np.bool_,
             ),
         }
-        if policy._config.use_state_history  # noqa: SLF001
+        if getattr(policy._config, "use_state_history", True)  # noqa: SLF001
         else {}
     )
     response = policy.infer(
@@ -524,7 +539,7 @@ def warm_up(policy: ActionOnlyAblationPolicy) -> dict[str, Any]:
                 policy.metadata["state_history_len"],
                 policy.metadata["state_history_dim"],
             ]
-            if policy.metadata["use_state_history"]
+            if policy.metadata.get("use_state_history", True)
             else None
         ),
     }
@@ -534,6 +549,11 @@ def main() -> None:
     args = parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s", force=True)
     config_path, config = _find_config(args.checkpoint)
+    if args.expected_data_profile is not None and config.get("data_profile") != args.expected_data_profile:
+        raise ValueError(
+            "Action server checkpoint profile mismatch: "
+            f"expected={args.expected_data_profile!r}, config={config.get('data_profile')!r}"
+        )
     validate_v4_norm_artifacts(args, config)
     model_config = _model_config(args, config)
     norm_stats = normalize.load(args.norm_stats_dir)
