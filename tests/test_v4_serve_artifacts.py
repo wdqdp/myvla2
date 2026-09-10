@@ -331,6 +331,17 @@ def test_v61_action_server_accepts_only_strict_no_history_protocol() -> None:
             v7_2_config | {"stage_a_protocol": "v7_1_no_state_history"},
         )
 
+    v7_3_config = config | {
+        "data_profile": "rotation_phase_v7_3_adjustment",
+        "stage_a_protocol": "v7_3_no_state_history",
+    }
+    assert serve._model_config(args, v7_3_config).use_state_history is False
+    with pytest.raises(ValueError, match="v7_3_no_state_history"):
+        serve._model_config(
+            args,
+            v7_3_config | {"stage_a_protocol": "v7_2_no_state_history"},
+        )
+
 
 def test_v72_action_server_validates_profile_experiment_and_v4_norm(
     tmp_path: Path,
@@ -368,6 +379,48 @@ def test_v72_action_server_validates_profile_experiment_and_v4_norm(
         "norm_stats_sha256": identity["v4_norm_stats_sha256"]
     }
     with pytest.raises(ValueError, match="phase_prompt_h30_terminal_hold"):
+        serve.validate_v4_norm_artifacts(
+            args,
+            config | {"experiment_kind": "phase_prompt_only"},
+        )
+
+
+def test_v73_action_server_validates_profile_experiment_and_v4_norm(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    serve = _load_script(
+        "serve_v73_action_validation_test_module",
+        "scripts/serve_tactile_vla_action_ablation.py",
+    )
+    identity = {
+        "data_profile": "rotation_phase_v7_3_adjustment",
+        "prompt_profile": "phase_v2",
+        "v4_norm_stats_sha256": "a" * 64,
+    }
+    config = {
+        "data_profile": "rotation_phase_v7_3_adjustment",
+        "prompt_profile": "phase_v2",
+        "experiment_kind": (
+            "phase_prompt_h30_native_reexecution_event_gap_adaptive_stop_filtered"
+        ),
+        "artifact_identity": identity,
+    }
+    monkeypatch.setattr(
+        serve,
+        "validate_norm_stats_identity",
+        lambda *_args, **_kwargs: {"norm_stats_sha256": identity["v4_norm_stats_sha256"]},
+    )
+    args = argparse.Namespace(
+        checkpoint=tmp_path / "stage_a" / "10000",
+        checkpoint_kind="stage-a",
+        norm_stats_dir=tmp_path / "norm",
+    )
+
+    assert serve.validate_v4_norm_artifacts(args, config) == {
+        "norm_stats_sha256": identity["v4_norm_stats_sha256"]
+    }
+    with pytest.raises(ValueError, match="adaptive_stop_filtered"):
         serve.validate_v4_norm_artifacts(
             args,
             config | {"experiment_kind": "phase_prompt_only"},

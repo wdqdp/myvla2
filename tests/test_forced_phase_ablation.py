@@ -330,6 +330,40 @@ def test_v72_server_metadata_accepts_event_filtered_no_history_profile() -> None
         )
 
 
+def test_v73_server_metadata_accepts_adaptive_stop_no_history_profile() -> None:
+    args = argparse.Namespace(
+        expected_data_profile="rotation_phase_v7_3_adjustment",
+        state_history_len=0,
+        state_history_fps=30.0,
+        chunk_size=30,
+    )
+    metadata = {
+        "action_only_ablation": True,
+        "supports_action_noise": True,
+        "action_noise_shape": [30, 32],
+        "action_horizon": 30,
+        "action_dim": 32,
+        "output_action_dim": 7,
+        "use_state_history": False,
+        "state_history_len": 0,
+        "state_history_dim": 7,
+        "checkpoint_kind": "stage-a",
+        "stage_a_protocol": "v7_3_no_state_history",
+        "data_profile": "rotation_phase_v7_3_adjustment",
+        "prompt_profile": "phase_v2",
+        "experiment_kind": (
+            "phase_prompt_h30_native_reexecution_event_gap_adaptive_stop_filtered"
+        ),
+    }
+    client.validate_server_metadata(args, metadata)
+
+    with pytest.raises(ValueError, match="v7_3_no_state_history"):
+        client.validate_server_metadata(
+            args,
+            metadata | {"stage_a_protocol": "v7_2_no_state_history"},
+        )
+
+
 def test_history_snapshot_waits_then_requires_a_post_chunk_frame(monkeypatch) -> None:
     args = _args("phase_v1")
     args.history_freeze_delay_seconds = 1.0
