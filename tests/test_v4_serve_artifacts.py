@@ -427,6 +427,46 @@ def test_v73_action_server_validates_profile_experiment_and_v4_norm(
         )
 
 
+def test_v74_action_server_validates_profile_experiment_and_v4_norm(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    serve = _load_script(
+        "serve_v74_action_validation_test_module",
+        "scripts/serve_tactile_vla_action_ablation.py",
+    )
+    identity = {
+        "data_profile": "rotation_phase_v7_4_adjustment",
+        "prompt_profile": "phase_v2",
+        "v4_norm_stats_sha256": "a" * 64,
+    }
+    config = {
+        "data_profile": "rotation_phase_v7_4_adjustment",
+        "prompt_profile": "phase_v2",
+        "experiment_kind": "phase_prompt_h30_v7_3_pre_adjustment_idle_compressed",
+        "artifact_identity": identity,
+    }
+    monkeypatch.setattr(
+        serve,
+        "validate_norm_stats_identity",
+        lambda *_args, **_kwargs: {"norm_stats_sha256": identity["v4_norm_stats_sha256"]},
+    )
+    args = argparse.Namespace(
+        checkpoint=tmp_path / "stage_a" / "10000",
+        checkpoint_kind="stage-a",
+        norm_stats_dir=tmp_path / "norm",
+    )
+
+    assert serve.validate_v4_norm_artifacts(args, config) == {
+        "norm_stats_sha256": identity["v4_norm_stats_sha256"]
+    }
+    with pytest.raises(ValueError, match="idle_compressed"):
+        serve.validate_v4_norm_artifacts(
+            args,
+            config | {"experiment_kind": "phase_prompt_only"},
+        )
+
+
 def test_action_server_metadata_excludes_v5_per_frame_training_lookup() -> None:
     serve = _load_script(
         "serve_v5_metadata_summary_test_module",

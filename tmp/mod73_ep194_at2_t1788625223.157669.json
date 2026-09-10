@@ -1,0 +1,54 @@
+{
+  "left_slightly": {
+    "translation_mm": {
+      "x": 1.003,
+      "y": 20.487,
+      "z": 6.234
+    },
+    "rotation_zyx_deg": {
+      "z_yaw": 0.6904,
+      "y_pitch": -1.2464,
+      "x_roll": 0.1364
+    },
+    "gripper": 0.005836
+  },
+  "left_moderately": {
+    "translation_mm": {
+      "x": 0.424,
+      "y": 26.815,
+      "z": 7.593
+    },
+    "rotation_zyx_deg": {
+      "z_yaw": 0.903,
+      "y_pitch": -1.4647,
+      "x_roll": 0.3318
+    },
+    "gripper": 0.00608
+  },
+  "right_slightly": {
+    "translation_mm": {
+      "x": -5.184,
+      "y": -25.651,
+      "z": 5.377
+    },
+    "rotation_zyx_deg": {
+      "z_yaw": 0.7144,
+      "y_pitch": -0.0131,
+      "x_roll": -0.486
+    },
+    "gripper": 0.005805
+  },
+  "right_moderately": {
+    "translation_mm": {
+      "x": -6.033,
+      "y": -29.513,
+      "z": 5.281
+    },
+    "rotation_zyx_deg": {
+      "z_yaw": 0.9732,
+      "y_pitch": 0.2263,
+      "x_roll": -0.3553
+    },
+    "gripper": 0.005744
+  }
+}

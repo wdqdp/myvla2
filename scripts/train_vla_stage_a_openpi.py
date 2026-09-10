@@ -121,6 +121,10 @@ from tactile_vla.vla.v7_3_adjustment_data import ROTATION_PHASE_V7_3_ADJUSTMENT
 from tactile_vla.vla.v7_3_adjustment_data import V7_3_EXPERIMENT_KIND
 from tactile_vla.vla.v7_3_adjustment_data import V7_3_TRAINING_INDEX_SCHEMA
 from tactile_vla.vla.v7_3_adjustment_data import validate_v7_3_adjustment_training_index
+from tactile_vla.vla.v7_4_adjustment_data import ROTATION_PHASE_V7_4_ADJUSTMENT
+from tactile_vla.vla.v7_4_adjustment_data import V7_4_EXPERIMENT_KIND
+from tactile_vla.vla.v7_4_adjustment_data import V7_4_TRAINING_INDEX_SCHEMA
+from tactile_vla.vla.v7_4_adjustment_data import validate_v7_4_adjustment_training_index
 
 
 PHASE_DATA_PROFILES = {
@@ -130,6 +134,7 @@ PHASE_DATA_PROFILES = {
     ROTATION_PHASE_V7_1_ADJUSTMENT,
     ROTATION_PHASE_V7_2_ADJUSTMENT,
     ROTATION_PHASE_V7_3_ADJUSTMENT,
+    ROTATION_PHASE_V7_4_ADJUSTMENT,
 }
 
 
@@ -214,6 +219,7 @@ def validate_v5_args(args: argparse.Namespace) -> None:
             ROTATION_PHASE_V7_1_ADJUSTMENT,
             ROTATION_PHASE_V7_2_ADJUSTMENT,
             ROTATION_PHASE_V7_3_ADJUSTMENT,
+            ROTATION_PHASE_V7_4_ADJUSTMENT,
         }
         else PHASE_PROMPT_PROFILE
     )
@@ -224,6 +230,7 @@ def validate_v5_args(args: argparse.Namespace) -> None:
         ROTATION_PHASE_V7_1_ADJUSTMENT: V7_1_EXPERIMENT_KIND,
         ROTATION_PHASE_V7_2_ADJUSTMENT: V7_2_EXPERIMENT_KIND,
         ROTATION_PHASE_V7_3_ADJUSTMENT: V7_3_EXPERIMENT_KIND,
+        ROTATION_PHASE_V7_4_ADJUSTMENT: V7_4_EXPERIMENT_KIND,
     }[args.data_profile]
     if args.prompt_profile != expected_prompt:
         raise ValueError(f"{args.data_profile} Stage A requires prompt_profile={expected_prompt!r}")
@@ -269,12 +276,16 @@ V7_2_STAGE_A_PROTOCOL_NAME = "v7_2_no_state_history"
 V7_2_STAGE_A_PROTOCOL = dict(V7_STAGE_A_PROTOCOL)
 V7_3_STAGE_A_PROTOCOL_NAME = "v7_3_no_state_history"
 V7_3_STAGE_A_PROTOCOL = dict(V7_STAGE_A_PROTOCOL)
+V7_4_STAGE_A_PROTOCOL_NAME = "v7_4_no_state_history"
+V7_4_STAGE_A_PROTOCOL = dict(V7_STAGE_A_PROTOCOL)
 
 
 def selected_stage_a_protocol(args: argparse.Namespace) -> tuple[str | None, dict[str, Any]]:
     """Resolve the pinned protocol without changing legacy V4/V5 behavior."""
     data_profile = getattr(args, "data_profile", None)
     use_state_history = bool(getattr(args, "use_state_history", True))
+    if data_profile == ROTATION_PHASE_V7_4_ADJUSTMENT:
+        return V7_4_STAGE_A_PROTOCOL_NAME, V7_4_STAGE_A_PROTOCOL
     if data_profile == ROTATION_PHASE_V7_3_ADJUSTMENT:
         return V7_3_STAGE_A_PROTOCOL_NAME, V7_3_STAGE_A_PROTOCOL
     if data_profile == ROTATION_PHASE_V7_2_ADJUSTMENT:
@@ -417,6 +428,15 @@ def ensure_index(args: argparse.Namespace) -> dict:
                 dataset_dir=args.dataset_dir,
             )
             args._v5_action_phase_lookup = lookup
+        elif args.data_profile == ROTATION_PHASE_V7_4_ADJUSTMENT:
+            if payload.get("schema_version") != V7_4_TRAINING_INDEX_SCHEMA:
+                raise ValueError("rotation_phase_v7_4_adjustment requires its dedicated V7.4 index")
+            _, lookup = validate_v7_4_adjustment_training_index(
+                payload,
+                index_path=args.index_file,
+                dataset_dir=args.dataset_dir,
+            )
+            args._v5_action_phase_lookup = lookup
         return payload
     if args.data_profile != LEGACY_DATA_PROFILE:
         raise FileNotFoundError(
@@ -460,6 +480,7 @@ def build_loader(
                 ROTATION_PHASE_V7_1_ADJUSTMENT: validate_v7_1_adjustment_training_index,
                 ROTATION_PHASE_V7_2_ADJUSTMENT: validate_v7_2_adjustment_training_index,
                 ROTATION_PHASE_V7_3_ADJUSTMENT: validate_v7_3_adjustment_training_index,
+                ROTATION_PHASE_V7_4_ADJUSTMENT: validate_v7_4_adjustment_training_index,
             }[args.data_profile]
             _, phase_lookup = validator(
                 payload, index_path=args.index_file, dataset_dir=args.dataset_dir

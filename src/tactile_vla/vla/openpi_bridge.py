@@ -328,7 +328,28 @@ class TactileVLAFrameDataset(torch.utils.data.Dataset):
                 step / self.fps for step in range(-(self.state_history_len - 1), 1)
             ]
         if stage == "execution":
-            delta_timestamps["action"] = [step / self.fps for step in range(action_horizon)]
+            max_action_offset = action_horizon - 1
+            if self.action_phase_by_global_index is not None:
+                for global_index in self.indices:
+                    phase_row = self.action_phase_by_global_index.get(global_index, {})
+                    target_offsets = phase_row.get("action_target_offsets")
+                    if target_offsets is None:
+                        continue
+                    offsets = [int(offset) for offset in target_offsets]
+                    if len(offsets) != action_horizon or offsets[0] != 0:
+                        raise ValueError(
+                            f"Invalid action_target_offsets at global_index={global_index}: {offsets}"
+                        )
+                    if any(right <= left for left, right in zip(offsets, offsets[1:])):
+                        raise ValueError(
+                            f"action_target_offsets must be strictly increasing at "
+                            f"global_index={global_index}"
+                        )
+                    max_action_offset = max(max_action_offset, offsets[-1])
+            self.max_action_offset = max_action_offset
+            delta_timestamps["action"] = [
+                step / self.fps for step in range(max_action_offset + 1)
+            ]
         self._dataset = lerobot_dataset or LeRobotDataset(
             dataset_repo_id,
             root=self.dataset_dir,
@@ -451,17 +472,24 @@ class TactileVLAFrameDataset(torch.utils.data.Dataset):
             result["observation/state_history_mask"] = np.logical_not(history_is_pad)
         if self.stage == "execution":
             terminal_hold_from_offset = None
+            action_target_offsets = None
             phase_lookup = getattr(self, "action_phase_by_global_index", None)
             if phase_lookup is not None:
                 phase_row = phase_lookup.get(result["global_index"])
                 if phase_row is not None:
                     terminal_hold_from_offset = phase_row.get("terminal_hold_from_offset")
+                    action_target_offsets = phase_row.get("action_target_offsets")
+            actions = item["action"]
+            if action_target_offsets is not None:
+                actions = _to_numpy(actions)[np.asarray(action_target_offsets, dtype=np.int64)]
+            else:
+                actions = actions[: self.action_horizon]
             result["actions"] = (
                 apply_h30_terminal_hold(
-                    item["action"], terminal_hold_from_offset=terminal_hold_from_offset
+                    actions, terminal_hold_from_offset=terminal_hold_from_offset
                 )
                 if terminal_hold_from_offset is not None
-                else item["action"]
+                else actions
             )
         return result
 
