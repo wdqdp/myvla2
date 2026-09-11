@@ -54,7 +54,9 @@ def parse_args() -> argparse.Namespace:
         "--model-folder",
         dest="model",
         required=True,
-        help=f"Model folder name under {MODEL_ROOT}.",
+        help=(
+            f"Model folder name under {MODEL_ROOT}, or a checkpoint/run/params directory path."
+        ),
     )
     parser.add_argument(
         "--output", type=Path, required=True, help="Compact combined JSON output path."
@@ -62,13 +64,20 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def resolve_model_folder(folder_name: str) -> Path:
-    model_name = Path(folder_name)
-    if not folder_name or model_name.name != folder_name or folder_name in {".", ".."}:
-        raise ValueError("--model must be a folder name, not a path")
-    checkpoint = MODEL_ROOT / model_name
+def resolve_model_checkpoint(model: str) -> Path:
+    """Resolve a stage_a_action folder name or an explicit checkpoint path."""
+
+    if not model:
+        raise ValueError("--model must not be empty")
+    requested = Path(model).expanduser()
+    if requested.is_absolute() or len(requested.parts) > 1:
+        checkpoint = requested.resolve()
+    else:
+        if model in {".", ".."}:
+            raise ValueError("--model must be a model folder name or checkpoint path")
+        checkpoint = (MODEL_ROOT / requested).resolve()
     if not checkpoint.is_dir():
-        raise FileNotFoundError(f"Model folder not found: {checkpoint}")
+        raise FileNotFoundError(f"Model/checkpoint directory not found: {checkpoint}")
     return checkpoint
 
 
@@ -164,7 +173,7 @@ def endpoint_change(result_path: Path) -> dict[str, Any]:
 
 def main() -> None:
     args = parse_args()
-    checkpoint = resolve_model_folder(args.model)
+    checkpoint = resolve_model_checkpoint(args.model)
     with tempfile.TemporaryDirectory(prefix="vla_four_adjustments_") as temporary_dir:
         temp_root = Path(temporary_dir)
         result_paths = {job: temp_root / f"{job.name}.json" for job in JOBS}

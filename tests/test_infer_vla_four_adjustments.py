@@ -45,18 +45,23 @@ def test_build_command_calls_single_inference_script(tmp_path: Path) -> None:
     assert command[command.index("--noise-seed") + 1] == "0"
 
 
-def test_resolve_model_folder_uses_stage_a_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_resolve_model_checkpoint_uses_stage_a_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     model_root = tmp_path / "stage_a_action"
     model = model_root / "pi05_test_model"
     model.mkdir(parents=True)
     monkeypatch.setattr(MODULE, "MODEL_ROOT", model_root)
-    assert MODULE.resolve_model_folder("pi05_test_model") == model
+    assert MODULE.resolve_model_checkpoint("pi05_test_model") == model
 
 
-@pytest.mark.parametrize("folder_name", ("../model", "/tmp/model", "nested/model", "."))
-def test_resolve_model_folder_rejects_paths(folder_name: str) -> None:
-    with pytest.raises(ValueError, match="folder name"):
-        MODULE.resolve_model_folder(folder_name)
+def test_resolve_model_checkpoint_accepts_explicit_step_path(tmp_path: Path) -> None:
+    checkpoint = tmp_path / "pi05_test_model" / "15000"
+    checkpoint.mkdir(parents=True)
+    assert MODULE.resolve_model_checkpoint(str(checkpoint)) == checkpoint
+
+
+def test_resolve_model_checkpoint_rejects_current_directory_alias() -> None:
+    with pytest.raises(ValueError, match="folder name or checkpoint path"):
+        MODULE.resolve_model_checkpoint(".")
 
 
 def test_endpoint_change_returns_only_final_delta(tmp_path: Path) -> None:
