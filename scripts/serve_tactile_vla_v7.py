@@ -148,7 +148,28 @@ def _restore_tree(path: Path) -> dict:
     if not path.is_dir():
         raise FileNotFoundError(path)
     with ocp.PyTreeCheckpointer() as checkpointer:
-        restored = checkpointer.restore(path.resolve())
+        metadata = checkpointer.metadata(path.resolve())
+        devices = jax.devices()
+        if not devices:
+            raise RuntimeError("No JAX device is available for checkpoint restore")
+        # The multitask exports may have been written from a multi-device FSDP
+        # mesh.  Orbax cannot reconstruct that training mesh on a single-device
+        # inference host unless a concrete destination sharding is supplied.
+        inference_sharding = jax.sharding.SingleDeviceSharding(devices[0])
+
+        def restore_args(_):
+            return ocp.ArrayRestoreArgs(
+                sharding=inference_sharding,
+                restore_type=jax.Array,
+            )
+
+        restored = checkpointer.restore(
+            path.resolve(),
+            ocp.args.PyTreeRestore(
+                item=metadata,
+                restore_args=jax.tree.map(restore_args, metadata),
+            ),
+        )
     if not isinstance(restored, dict) or not restored:
         raise ValueError(f"Invalid V7 parameter tree: {path}")
     return restored

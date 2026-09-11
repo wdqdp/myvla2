@@ -18,6 +18,7 @@ sys.path.insert(0, str(PROJECT_ROOT / "openpi/inference/agilex/inference"))
 from agilex_inference_forced_phase_anlation_5_3 import validate_server_metadata
 from agilex_inference_tactile_vla_sync_single import build_payload
 from scripts.serve_tactile_vla_v7 import V7Policy
+from scripts.serve_tactile_vla_v7 import _restore_tree
 from tactile_vla.vla.artifacts import sha256_file
 from tactile_vla.vla.v7_adjustment_end_data import LABEL_POLICY
 from tactile_vla.vla.v7_adjustment_end_data import is_adjustment_end_positive
@@ -73,6 +74,42 @@ def test_no_history_payload_omits_both_history_keys() -> None:
 def test_v7_server_rejects_history_fields() -> None:
     with pytest.raises(ValueError, match="forbidden fields"):
         V7Policy._clean_inputs({"observation/state_history": np.zeros((60, 7))})
+
+
+def test_restore_tree_supplies_concrete_inference_sharding(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import jax
+    import orbax.checkpoint as ocp
+
+    checkpoint = tmp_path / "params"
+    checkpoint.mkdir()
+    captured = {}
+
+    class FakeCheckpointer:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_):
+            return None
+
+        def metadata(self, path):
+            assert path == checkpoint.resolve()
+            return {"weight": object()}
+
+        def restore(self, path, args):
+            assert path == checkpoint.resolve()
+            captured["args"] = args
+            return {"weight": jax.numpy.arange(6, dtype=jax.numpy.float32).reshape(2, 3)}
+
+    monkeypatch.setattr(ocp, "PyTreeCheckpointer", FakeCheckpointer)
+
+    restored = _restore_tree(checkpoint)
+
+    np.testing.assert_array_equal(restored["weight"], np.arange(6, dtype=np.float32).reshape(2, 3))
+    restore_args = captured["args"].restore_args["weight"]
+    assert isinstance(restore_args.sharding, jax.sharding.SingleDeviceSharding)
+    assert restore_args.restore_type is jax.Array
 
 
 def test_v7_client_accepts_only_no_history_metadata(tmp_path: Path) -> None:

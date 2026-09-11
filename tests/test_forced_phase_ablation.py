@@ -166,6 +166,26 @@ def test_v52_uses_two_prompts_and_never_sends_reposition(tmp_path: Path) -> None
         )
 
 
+def test_no_history_action_request_omits_history_fields(tmp_path: Path) -> None:
+    args = _args("phase_v2")
+    args.use_state_history = False
+    policy = _Policy()
+    logger = client.TrialLogger(tmp_path, trial_id=None)
+
+    client._request_action_chunk(
+        args=args,
+        policy=policy,
+        logger=logger,
+        observation=_observation(),
+        phase="execution",
+        phase_index=0,
+    )
+
+    request = policy.requests[0]
+    assert "observation/state_history" not in request
+    assert "observation/state_history_mask" not in request
+
+
 def test_v4_reposition_and_adjustment_use_same_old_recovery_prompt(tmp_path: Path) -> None:
     args = _args("minimal_v1")
     policy = _Policy()

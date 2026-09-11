@@ -548,11 +548,14 @@ def _request_action_chunk(
         img_front_bgr=observation.img_front,
         img_left_bgr=observation.img_left,
         qpos=observation.qpos,
-        # build_payload requires array-shaped history fields.  In no-history
-        # profiles _capture_observation supplies empty [0, 7]/[0] arrays; the
-        # V7 server removes these fields before applying the model transform.
-        state_history=observation.state_history,
-        state_history_mask=observation.state_history_mask,
+        # No-history servers reject these keys even when the arrays are empty.
+        # build_payload omits both fields when both values are None.
+        state_history=(
+            observation.state_history if getattr(args, "use_state_history", True) else None
+        ),
+        state_history_mask=(
+            observation.state_history_mask if getattr(args, "use_state_history", True) else None
+        ),
         prompt=prompt,
     )
     payload.update(
