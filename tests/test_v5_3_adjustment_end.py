@@ -18,6 +18,7 @@ sys.path.insert(0, str(PROJECT_ROOT / "openpi/inference/agilex/inference"))
 sys.path.insert(0, str(PROJECT_ROOT / "openpi/packages/openpi-client/src"))
 
 from agilex_inference_forced_phase_anlation_5_3 import should_request_adjustment_end
+from agilex_inference_forced_phase_anlation_5_3 import _capture_classification_observation
 from agilex_inference_forced_phase_anlation_5_3 import validate_server_metadata
 from scripts.serve_tactile_vla_v5_3 import _validate_configs
 from scripts.serve_tactile_vla_v5_3 import _resolve_runtime_threshold
@@ -120,6 +121,51 @@ def test_adjustment_end_call_gate_is_phase_and_complete_h30_only() -> None:
     assert not should_request_adjustment_end(phase="execution", completed_raw_actions=30)
     assert not should_request_adjustment_end(phase="adjustment", completed_raw_actions=29)
     assert not should_request_adjustment_end(phase="adjustment", completed_raw_actions=0)
+
+
+def test_classification_observation_requires_fresh_but_not_time_aligned_streams() -> None:
+    def message(timestamp: float, *, image=None, position=None):
+        return SimpleNamespace(
+            header=SimpleNamespace(stamp=SimpleNamespace(to_sec=lambda: timestamp)),
+            image=image,
+            position=position,
+        )
+
+    tactile = SimpleNamespace(
+        ready=True,
+        buffer=SimpleNamespace(_frames=[SimpleNamespace(timestamp=101.5)], _lock=None),
+        caption=lambda _captioner: "Touch[test]",
+    )
+    operator = SimpleNamespace(
+        img_front_deque=[message(100.1, image=np.zeros((2, 2, 3), dtype=np.uint8))],
+        img_left_deque=[message(100.4, image=np.ones((2, 2, 3), dtype=np.uint8))],
+        puppet_arm_deque=[message(100.8, position=np.arange(7, dtype=np.float32))],
+        tactile=tactile,
+        bridge=SimpleNamespace(imgmsg_to_cv2=lambda msg, _encoding: msg.image),
+        rate=lambda _hz: SimpleNamespace(sleep=lambda: None),
+        is_shutdown=lambda: False,
+    )
+    args = SimpleNamespace(
+        observation_poll_rate=200,
+        phase_change_timeout_seconds=1.0,
+        use_state_history=False,
+    )
+
+    observation, timestamps = _capture_classification_observation(
+        args,
+        operator,
+        captioner=object(),
+        after_timestamp=100.0,
+    )
+
+    assert observation.timestamp == pytest.approx(100.8)
+    assert observation.tactile_caption == "Touch[test]"
+    assert timestamps == {
+        "front": pytest.approx(100.1),
+        "left": pytest.approx(100.4),
+        "qpos": pytest.approx(100.8),
+        "tactile": pytest.approx(101.5),
+    }
 
 
 def test_sampler_is_seed_deterministic() -> None:

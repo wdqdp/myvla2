@@ -42,7 +42,6 @@ DEFAULT_LOG_ROOT = PROJECT_ROOT / "outputs/runtime/forced_phase_ablation_v5_3"
 V5_3_DATA_PROFILE = "rotation_phase_v5_adjustment_v2"
 V7_DATA_PROFILE = "rotation_phase_v7_adjustment"
 ACTION_NOISE_SHAPE = (30, 32)
-SYNC_TOLERANCE_SECONDS = 0.050
 Phase = Literal["execution", "adjustment"]
 
 
@@ -150,12 +149,12 @@ def _capture_classification_observation(
     *,
     after_timestamp: float,
 ) -> tuple[v52.FrozenObservation, dict[str, float]]:
-    """Wait for front/left/qpos/tactile that are new and mutually synchronized."""
+    """Wait for front/left/qpos/tactile that are all newer than the H100 tail."""
     rate = operator.rate(args.observation_poll_rate)
     started = time.monotonic()
     while not operator.is_shutdown() and not runtime.shutdown_event.is_set():
         if time.monotonic() - started > args.phase_change_timeout_seconds:
-            raise FailClosedError("Timed out waiting for synchronized classification observation")
+            raise FailClosedError("Timed out waiting for fresh classification observation")
         if isinstance(operator, runtime.ReplayOperator):
             front, left, joint = runtime.get_ros_observation(args, operator, after_timestamp=after_timestamp)
             timestamp = v52._joint_timestamp(joint)
@@ -172,17 +171,13 @@ def _capture_classification_observation(
                 "left": float(left_msg.header.stamp.to_sec()),
                 "qpos": float(joint.header.stamp.to_sec()),
             }
-            if min(stamps.values()) <= after_timestamp or max(stamps.values()) - min(stamps.values()) > SYNC_TOLERANCE_SECONDS:
+            if min(stamps.values()) <= after_timestamp:
                 rate.sleep()
                 continue
             front = operator.bridge.imgmsg_to_cv2(front_msg, "passthrough")
             left = operator.bridge.imgmsg_to_cv2(left_msg, "passthrough")
         tactile_timestamp = _latest_tactile_timestamp(operator)
-        if (
-            tactile_timestamp is None
-            or tactile_timestamp <= after_timestamp
-            or abs(tactile_timestamp - stamps["qpos"]) > SYNC_TOLERANCE_SECONDS
-        ):
+        if tactile_timestamp is None or tactile_timestamp <= after_timestamp:
             rate.sleep()
             continue
         if captioner is None or operator.tactile is None or not operator.tactile.ready:
@@ -203,7 +198,7 @@ def _capture_classification_observation(
             tactile_caption=runtime.current_tactile_caption(operator, captioner),
         )
         return observation, {**stamps, "tactile": tactile_timestamp}
-    raise RuntimeError("Stopped while waiting for synchronized V5.3 classification observation")
+    raise RuntimeError("Stopped while waiting for fresh V5.3 classification observation")
 
 
 def _wait_feedback_after(args, operator, after_timestamp: float | None) -> tuple[np.ndarray, float]:
