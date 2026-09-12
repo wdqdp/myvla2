@@ -587,7 +587,7 @@ class C_PiperRosNode():
         joint_4 = round(joint[4]*factor)
         joint_5 = round(joint[5]*factor)
         gripper = round(pos_data.gripper*1000*1000)
-        if(gripper>80000): gripper = 80000
+        if(gripper>99500): gripper = 99500
         if(gripper<0): gripper = 0
         if(self.GetEnableFlag()):
             self.piper.MotionCtrl_2(0x01, 0x01, 100)
@@ -651,7 +651,7 @@ class C_PiperRosNode():
         joint_4 = round(joint_data.position[4]*factor)
         joint_5 = round(joint_data.position[5]*factor)
         joint_6 = round(joint_data.position[6]*1000*1000)
-        if(joint_6>80000): joint_6 = 80000
+        if(joint_6>99500): joint_6 = 99500
         if(joint_6<0): joint_6 = 0
         if(self.GetEnableFlag()):
             self.piper.MotionCtrl_2(0x01, 0x01, 100)

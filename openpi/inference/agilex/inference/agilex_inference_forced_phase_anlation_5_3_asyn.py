@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 from collections import deque
+from collections.abc import Callable
 from concurrent.futures import Future
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -183,9 +184,7 @@ def _report_async_adjustment_end(
         else None
     )
     actual_rate_hz = (
-        1000.0 / submit_interval_ms
-        if submit_interval_ms is not None and submit_interval_ms > 0.0
-        else None
+        1000.0 / submit_interval_ms if submit_interval_ms is not None and submit_interval_ms > 0.0 else None
     )
     lag_steps = max(0, handled_step - result.captured_step)
     rate_text = f" rate={actual_rate_hz:.2f}Hz" if actual_rate_hz is not None else ""
@@ -194,29 +193,31 @@ def _report_async_adjustment_end(
         f"result={result.adjustment_end} probs={result.probabilities.tolist()} "
         f"lag_steps={lag_steps}{rate_text}"
     )
-    logger.record({
-        "event": "adjustment_end_async_inference",
-        "generation": result.generation,
-        "phase_index": result.phase_index,
-        "captured_step": result.captured_step,
-        "handled_step": handled_step,
-        "lag_steps": lag_steps,
-        "adjustment_end": result.adjustment_end,
-        "adjustment_end_probs": result.probabilities,
-        "prompt": result.prompt,
-        "qpos_h10_discrete": result.qpos_h10_discrete,
-        "feedback_qpos_h30": result.feedback_qpos_h30,
-        "feedback_timestamps": result.feedback_timestamps,
-        "current_qpos": result.current_qpos,
-        "synchronized_timestamps": result.synchronized_timestamps,
-        "tactile_caption": result.tactile_caption,
-        "target_rate_hz": args.adjustment_end_rate_hz,
-        "submit_interval_ms": submit_interval_ms,
-        "actual_submit_rate_hz": actual_rate_hz,
-        "client_infer_ms": result.client_infer_ms,
-        "server_infer_ms": result.server_infer_ms,
-        "total_async_ms": (result.finished_monotonic - result.submitted_monotonic) * 1000.0,
-    })
+    logger.record(
+        {
+            "event": "adjustment_end_async_inference",
+            "generation": result.generation,
+            "phase_index": result.phase_index,
+            "captured_step": result.captured_step,
+            "handled_step": handled_step,
+            "lag_steps": lag_steps,
+            "adjustment_end": result.adjustment_end,
+            "adjustment_end_probs": result.probabilities,
+            "prompt": result.prompt,
+            "qpos_h10_discrete": result.qpos_h10_discrete,
+            "feedback_qpos_h30": result.feedback_qpos_h30,
+            "feedback_timestamps": result.feedback_timestamps,
+            "current_qpos": result.current_qpos,
+            "synchronized_timestamps": result.synchronized_timestamps,
+            "tactile_caption": result.tactile_caption,
+            "target_rate_hz": args.adjustment_end_rate_hz,
+            "submit_interval_ms": submit_interval_ms,
+            "actual_submit_rate_hz": actual_rate_hz,
+            "client_infer_ms": result.client_infer_ms,
+            "server_infer_ms": result.server_infer_ms,
+            "total_async_ms": (result.finished_monotonic - result.submitted_monotonic) * 1000.0,
+        }
+    )
 
 
 def _poll_key(args: argparse.Namespace, keyboard: Any, *, phase: Phase) -> str | None:
@@ -249,22 +250,24 @@ def _enter_adjustment(
         after_timestamp=time.time(),
     )
     image_paths = logger.save_trigger_images(observation.img_front, observation.img_left)
-    logger.record({
-        "event": "forced_recovery_trigger",
-        "previous_phase": "execution",
-        "phase": "adjustment",
-        "published_steps": published_steps,
-        "discarded_raw_actions": discarded_raw_actions,
-        "rotation_direction": args.rotation_direction,
-        "preset_failure_reason": args.forced_failure_reason,
-        "forced_recovery_plan": args.forced_recovery_plan,
-        "tactile_caption": observation.tactile_caption,
-        "observation_timestamp": observation.timestamp,
-        "switch_qpos": observation.qpos,
-        "reset_state_history": False,
-        "live_state_history_valid_frames": int(observation.state_history_mask.sum()),
-        **image_paths,
-    })
+    logger.record(
+        {
+            "event": "forced_recovery_trigger",
+            "previous_phase": "execution",
+            "phase": "adjustment",
+            "published_steps": published_steps,
+            "discarded_raw_actions": discarded_raw_actions,
+            "rotation_direction": args.rotation_direction,
+            "preset_failure_reason": args.forced_failure_reason,
+            "forced_recovery_plan": args.forced_recovery_plan,
+            "tactile_caption": observation.tactile_caption,
+            "observation_timestamp": observation.timestamp,
+            "switch_qpos": observation.qpos,
+            "reset_state_history": False,
+            "live_state_history_valid_frames": int(observation.state_history_mask.sum()),
+            **image_paths,
+        }
+    )
     print(
         "ADJUSTMENT started: discarded the remaining EXECUTION chunk; "
         "live H60 history was not paused or reset; "
@@ -290,13 +293,15 @@ def run_v5_3_async(
         raise ValueError("Action and asynchronous classification connections expose different metadata")
     args.use_state_history = bool(action_metadata.get("use_state_history", False))
     stats = load_state_quantiles(args.norm_stats_file)
-    logger.record({
-        "event": "run_start",
-        "server_metadata": action_metadata,
-        "args": vars(args),
-        "continuous_live_state_history": True,
-        "async_adjustment_end": True,
-    })
+    logger.record(
+        {
+            "event": "run_start",
+            "server_metadata": action_metadata,
+            "args": vars(args),
+            "continuous_live_state_history": True,
+            "async_adjustment_end": True,
+        }
+    )
     print(
         "V5.3 async controls: SPACE=execution to adjustment, q=quit; chunks continue automatically. "
         f"adjustment_end target rate={args.adjustment_end_rate_hz:g}Hz, "
@@ -327,12 +332,14 @@ def run_v5_3_async(
             result = future.result()
             future = None
             if result.generation != generation or phase != "adjustment":
-                logger.record({
-                    "event": "adjustment_end_async_stale_result",
-                    "result_generation": result.generation,
-                    "active_generation": generation,
-                    "active_phase": phase,
-                })
+                logger.record(
+                    {
+                        "event": "adjustment_end_async_stale_result",
+                        "result_generation": result.generation,
+                        "active_generation": generation,
+                        "active_phase": phase,
+                    }
+                )
                 return False
             _report_async_adjustment_end(
                 args=args,
@@ -344,15 +351,17 @@ def run_v5_3_async(
             previous_reported_submit = result.submitted_monotonic
             if not result.adjustment_end:
                 return False
-            logger.record({
-                "event": "phase_transition",
-                "previous_phase": "adjustment",
-                "phase": "execution",
-                "trigger": "asynchronous_adjustment_end",
-                "captured_step": result.captured_step,
-                "handled_step": published_steps,
-                "reset_state_history": False,
-            })
+            logger.record(
+                {
+                    "event": "phase_transition",
+                    "previous_phase": "adjustment",
+                    "phase": "execution",
+                    "trigger": "asynchronous_adjustment_end",
+                    "captured_step": result.captured_step,
+                    "handled_step": published_steps,
+                    "reset_state_history": False,
+                }
+            )
             print("[PHASE] adjustment_end=true; switching to EXECUTION before the next action.")
             phase = "execution"
             generation += 1
@@ -389,15 +398,17 @@ def run_v5_3_async(
                 submitted_monotonic=now,
             )
             last_submit = now
-            logger.record({
-                "event": "adjustment_end_async_submit",
-                "generation": generation,
-                "phase_index": phase_index,
-                "captured_step": published_steps,
-                "feedback_timestamp_first": timestamps[0],
-                "feedback_timestamp_last": timestamps[-1],
-                "target_rate_hz": args.adjustment_end_rate_hz,
-            })
+            logger.record(
+                {
+                    "event": "adjustment_end_async_submit",
+                    "generation": generation,
+                    "phase_index": phase_index,
+                    "captured_step": published_steps,
+                    "feedback_timestamp_first": timestamps[0],
+                    "feedback_timestamp_last": timestamps[-1],
+                    "target_rate_hz": args.adjustment_end_rate_hz,
+                }
+            )
 
         while published_steps < args.max_publish_step and not operator.is_shutdown():
             consume_finished_request()
@@ -444,14 +455,16 @@ def run_v5_3_async(
             phase_indices[requested_phase] += 1
 
             if consume_finished_request() and requested_phase == "adjustment":
-                logger.record({
-                    "event": "execution_chunk",
-                    "phase": requested_phase,
-                    "phase_index": phase_index,
-                    "completed_raw_actions": 0,
-                    "discarded_raw_actions": len(actions),
-                    "control_signal": "adjustment_end",
-                })
+                logger.record(
+                    {
+                        "event": "execution_chunk",
+                        "phase": requested_phase,
+                        "phase_index": phase_index,
+                        "completed_raw_actions": 0,
+                        "discarded_raw_actions": len(actions),
+                        "control_signal": "adjustment_end",
+                    }
+                )
                 continue
 
             limit = min(args.chunk_size, args.max_publish_step - published_steps, len(actions))
@@ -490,14 +503,16 @@ def run_v5_3_async(
                 if phase == "adjustment":
                     maybe_submit_request(phase_index=phase_index)
 
-            logger.record({
-                "event": "execution_chunk",
-                "phase": requested_phase,
-                "phase_index": phase_index,
-                "completed_raw_actions": complete,
-                "discarded_raw_actions": max(0, limit - complete),
-                "control_signal": control,
-            })
+            logger.record(
+                {
+                    "event": "execution_chunk",
+                    "phase": requested_phase,
+                    "phase_index": phase_index,
+                    "completed_raw_actions": complete,
+                    "discarded_raw_actions": max(0, limit - complete),
+                    "control_signal": control,
+                }
+            )
             if control == "quit":
                 runtime.shutdown_event.set()
                 return
@@ -525,7 +540,9 @@ def run_v5_3_async(
         logger.record({"event": "max_publish_step_reached", "published_steps": published_steps})
 
 
-def get_arguments() -> tuple[argparse.Namespace, argparse.ArgumentParser]:
+def get_arguments(
+    configure_parser: Callable[[argparse.ArgumentParser], None] | None = None,
+) -> tuple[argparse.Namespace, argparse.ArgumentParser]:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config_path", type=Path)
     parser.add_argument("--host", default="localhost")
@@ -582,6 +599,8 @@ def get_arguments() -> tuple[argparse.Namespace, argparse.ArgumentParser]:
         action="store_true",
         help="Acknowledge a non-official checkpoint or manual server threshold override",
     )
+    if configure_parser is not None:
+        configure_parser(parser)
     return parser.parse_args(), parser
 
 
@@ -639,10 +658,7 @@ def main() -> None:
                 )
             except Exception as exc:
                 logger.record({"event": "fail_closed_safety_stop", "error": repr(exc)})
-                print(
-                    f"FAIL-CLOSED safety stop: {exc}. "
-                    "No more actions will be published; press q to exit."
-                )
+                print(f"FAIL-CLOSED safety stop: {exc}. No more actions will be published; press q to exit.")
                 rate = operator.rate(args.observation_poll_rate)
                 while not operator.is_shutdown() and not runtime.shutdown_event.is_set():
                     if keyboard.get_key() == args.quit_key:

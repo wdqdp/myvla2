@@ -2,6 +2,7 @@ from __future__ import annotations
 
 # ruff: noqa: E402
 
+import argparse
 from collections import deque
 from pathlib import Path
 from types import SimpleNamespace
@@ -60,6 +61,7 @@ def test_sync_classifier_runs_only_after_complete_adjustment_chunk_and_h99() -> 
     assert not sync_runtime.should_classify_adjustment_end(
         phase="adjustment", completed_raw_actions=30, feedback_count=98
     )
+    assert sync_runtime.should_classify_adjustment_end(phase="adjustment", completed_raw_actions=30, feedback_count=100)
 
 
 def test_sync_cli_has_no_async_rate_or_pause_controls(
@@ -77,16 +79,58 @@ def test_sync_cli_has_no_async_rate_or_pause_controls(
     assert not hasattr(args, "history_freeze_delay_seconds")
 
 
+def test_classification_gripper_probe_remaps_only_open_seventh_dimension() -> None:
+    qpos = np.asarray(
+        [
+            [1, 2, 3, 4, 5, 6, 0.078],
+            [7, 8, 9, 10, 11, 12, 0.079],
+            [13, 14, 15, 16, 17, 18, 0.080],
+        ],
+        dtype=np.float32,
+    )
+    mapped, count = sync_runtime.v75_async._remap_classification_gripper(
+        qpos,
+        open_threshold=0.079,
+        open_value=0.0995,
+    )
+    np.testing.assert_allclose(mapped[:, :6], qpos[:, :6])
+    np.testing.assert_allclose(mapped[:, 6], [0.078, 0.0995, 0.0995])
+    np.testing.assert_array_equal(qpos[:, 6], np.asarray([0.078, 0.079, 0.080], dtype=np.float32))
+    assert count == 2
+
+
+def test_v7_5_async_cli_accepts_classification_gripper_probe() -> None:
+    parser = argparse.ArgumentParser()
+    sync_runtime.v75_async.add_classification_gripper_probe_arguments(parser)
+    args = parser.parse_args(
+        [
+            "--classification-gripper-open-threshold",
+            "0.079",
+            "--classification-gripper-open-value",
+            "0.0995",
+        ]
+    )
+    sync_runtime.v75_async.validate_classification_gripper_probe_arguments(args, parser)
+    assert args.classification_gripper_open_threshold == pytest.approx(0.079)
+    assert args.classification_gripper_open_value == pytest.approx(0.0995)
+
+
 def test_sync_classifier_converts_request_failure_to_fail_closed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    def fail(**_kwargs):
+    captured: dict[str, object] = {}
+
+    def fail(**kwargs):
+        captured.update(kwargs)
         raise RuntimeError("connection lost")
 
     monkeypatch.setattr(sync_runtime.v75_async, "_run_async_adjustment_end_once", fail)
     history = deque(
-        [(np.zeros(7, dtype=np.float32), float(index)) for index in range(sync_runtime.RUNTIME_PAST_QPOS_FRAMES)],
-        maxlen=sync_runtime.RUNTIME_PAST_QPOS_FRAMES,
+        [
+            (np.full(7, index, dtype=np.float32), float(index))
+            for index in range(sync_runtime.ROLLING_QPOS_BUFFER_FRAMES)
+        ],
+        maxlen=sync_runtime.ROLLING_QPOS_BUFFER_FRAMES,
     )
     with pytest.raises(sync_runtime.v53.FailClosedError, match="synchronous V7.5"):
         sync_runtime._classify_adjustment_end_sync(
@@ -100,16 +144,20 @@ def test_sync_classifier_converts_request_failure_to_fail_closed(
             published_steps=120,
             feedback_window=history,
         )
+    forwarded = captured["feedback_qpos_h30"]
+    assert len(forwarded) == sync_runtime.RUNTIME_PAST_QPOS_FRAMES
+    np.testing.assert_array_equal(forwarded[0], np.full(7, 1, dtype=np.float32))
+    np.testing.assert_array_equal(forwarded[-1], np.full(7, 99, dtype=np.float32))
 
 
 @pytest.mark.parametrize(
     ("classifier_result", "expected_phases", "expected_calls"),
     [
-        (False, ["adjustment"] * 5, 2),
-        (True, ["adjustment"] * 4 + ["execution"], 1),
+        (False, ["execution"] * 4 + ["adjustment"] * 2, 2),
+        (True, ["execution"] * 4 + ["adjustment", "execution"], 1),
     ],
 )
-def test_sync_false_continues_adjustment_and_true_switches_before_next_chunk(
+def test_sync_preserves_execution_history_and_switches_only_on_true(
     monkeypatch: pytest.MonkeyPatch,
     classifier_result: bool,
     expected_phases: list[str],
@@ -118,9 +166,14 @@ def test_sync_false_continues_adjustment_and_true_switches_before_next_chunk(
     requested_phases: list[str] = []
     classifier_calls: list[int] = []
     feedback_timestamp = 0
+    triggered = False
 
     def poll_key(*_args, **_kwargs):
-        return "trigger" if not requested_phases else None
+        nonlocal triggered
+        if len(requested_phases) == 4 and not triggered:
+            triggered = True
+            return "trigger"
+        return None
 
     def request_chunk(*, phase, **_kwargs):
         requested_phases.append(phase)
@@ -150,7 +203,7 @@ def test_sync_false_continues_adjustment_and_true_switches_before_next_chunk(
     monkeypatch.setattr(sync_runtime, "_classify_adjustment_end_sync", classify)
 
     args = SimpleNamespace(
-        max_publish_step=150,
+        max_publish_step=180,
         chunk_size=30,
         publish_rate=30,
         norm_stats_file=Path("unused.json"),
@@ -166,4 +219,4 @@ def test_sync_false_continues_adjustment_and_true_switches_before_next_chunk(
 
     assert requested_phases == expected_phases
     assert len(classifier_calls) == expected_calls
-    assert classifier_calls[0] == 120
+    assert classifier_calls[0] == 150

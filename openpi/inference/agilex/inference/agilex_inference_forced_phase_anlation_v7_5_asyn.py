@@ -5,7 +5,9 @@
 
 from __future__ import annotations
 
+import argparse
 from dataclasses import dataclass
+from dataclasses import replace
 from itertools import pairwise
 from pathlib import Path
 import signal
@@ -36,7 +38,39 @@ from tactile_vla.vla.v7_5_runtime_history import RUNTIME_SAMPLE_OFFSETS
 from tactile_vla.vla.v7_5_runtime_history import build_runtime_adjustment_end_prompt
 
 DEFAULT_LOG_ROOT = PROJECT_ROOT / "outputs/runtime/forced_phase_ablation_v7_5_async"
-DEFAULT_NORM_STATS = Path("/data1/qxh/tac_vla_new/tac_data/demon_data/black_box/outputs/rotation_v4/norm_stats/norm_stats.json")
+DEFAULT_NORM_STATS = Path(
+    "/data1/qxh/tac_vla_new/tac_data/demon_data/black_box/outputs/rotation_v4/norm_stats/norm_stats.json"
+)
+
+
+def add_classification_gripper_probe_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--classification-gripper-open-threshold",
+        type=float,
+        help=(
+            "TEST ONLY: classification qpos[6] values at or above this threshold "
+            "are replaced; action inference and robot commands are unchanged"
+        ),
+    )
+    parser.add_argument(
+        "--classification-gripper-open-value",
+        type=float,
+        help="TEST ONLY: replacement value for open classification qpos[6]",
+    )
+
+
+def validate_classification_gripper_probe_arguments(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
+    threshold = args.classification_gripper_open_threshold
+    value = args.classification_gripper_open_value
+    if (threshold is None) != (value is None):
+        parser.error(
+            "--classification-gripper-open-threshold and --classification-gripper-open-value must be provided together"
+        )
+    if threshold is not None:
+        if not np.isfinite(threshold) or not np.isfinite(value):
+            parser.error("classification gripper mapping values must be finite")
+        if not 0.0 <= threshold <= 0.2 or not threshold <= value <= 0.2:
+            parser.error("classification gripper mapping requires 0 <= threshold <= value <= 0.2")
 
 
 @dataclass(frozen=True)
@@ -47,8 +81,11 @@ class AsyncV75AdjustmentEndResult:
     prompt: str
     qpos_h100_11_discrete: list[list[int]]
     feedback_qpos_h100: list[np.ndarray]
+    raw_feedback_qpos_h100: list[np.ndarray]
     feedback_timestamps_h100: list[float]
     current_qpos: np.ndarray
+    raw_current_qpos: np.ndarray
+    gripper_remapped_frames: int
     synchronized_timestamps: dict[str, float]
     tactile_caption: str
     adjustment_end: bool
@@ -57,6 +94,27 @@ class AsyncV75AdjustmentEndResult:
     finished_monotonic: float
     client_infer_ms: float
     server_infer_ms: float | None
+
+
+def _remap_classification_gripper(
+    qpos: np.ndarray,
+    *,
+    open_threshold: float | None,
+    open_value: float | None,
+) -> tuple[np.ndarray, int]:
+    """Counterfactual mapping for classifier inputs only, never robot commands."""
+
+    values = np.asarray(qpos, dtype=np.float32)
+    if values.shape[-1] != 7:
+        raise ValueError(f"classification qpos must end in dimension 7, got {values.shape}")
+    if (open_threshold is None) != (open_value is None):
+        raise ValueError("classification gripper threshold and value must be provided together")
+    mapped = values.copy()
+    if open_threshold is None:
+        return mapped, 0
+    mask = mapped[..., 6] >= float(open_threshold)
+    mapped[..., 6] = np.where(mask, float(open_value), mapped[..., 6])
+    return mapped, int(np.count_nonzero(mask))
 
 
 def validate_server_metadata(args, metadata: dict[str, Any]) -> None:
@@ -89,7 +147,9 @@ def validate_server_metadata(args, metadata: dict[str, Any]) -> None:
         raise ValueError(f"V7.5 client/server metadata mismatch: {mismatch}")
     if not 0.0 <= float(metadata.get("adjustment_end_threshold", -1.0)) <= 1.0:
         raise ValueError("V7.5 server adjustment_end_threshold is invalid")
-    if metadata.get("adjustment_end_experimental_override", False) and not getattr(args, "allow_experimental_adjustment_end", False):
+    if metadata.get("adjustment_end_experimental_override", False) and not getattr(
+        args, "allow_experimental_adjustment_end", False
+    ):
         raise ValueError("Pass --allow-experimental-adjustment-end to acknowledge a threshold override")
     if float(metadata.get("phase_change_timeout_seconds", -1.0)) != args.phase_change_timeout_seconds:
         raise ValueError("V7.5 client/server phase-change timeout mismatch")
@@ -98,8 +158,18 @@ def validate_server_metadata(args, metadata: dict[str, Any]) -> None:
 
 
 def _run_async_adjustment_end_once(
-    *, args, policy, operator, captioner, stats, generation, phase_index, captured_step,
-    feedback_qpos_h30, feedback_timestamps, submitted_monotonic,
+    *,
+    args,
+    policy,
+    operator,
+    captioner,
+    stats,
+    generation,
+    phase_index,
+    captured_step,
+    feedback_qpos_h30,
+    feedback_timestamps,
+    submitted_monotonic,
 ) -> AsyncV75AdjustmentEndResult:
     """Use 99 post-action feedback points plus a synchronized current point p."""
 
@@ -110,15 +180,37 @@ def _run_async_adjustment_end_once(
     observation, synchronized_timestamps = v53._capture_classification_observation(
         args, operator, captioner, after_timestamp=feedback_timestamps[-1]
     )
+    raw_past = np.stack(feedback_qpos_h30)
+    raw_current = observation.qpos.copy()
+    open_threshold = getattr(args, "classification_gripper_open_threshold", None)
+    open_value = getattr(args, "classification_gripper_open_value", None)
+    mapped_past, past_remapped = _remap_classification_gripper(
+        raw_past,
+        open_threshold=open_threshold,
+        open_value=open_value,
+    )
+    mapped_current, current_remapped = _remap_classification_gripper(
+        raw_current,
+        open_threshold=open_threshold,
+        open_value=open_value,
+    )
+    observation = replace(observation, qpos=mapped_current)
     prompt, discrete, h100 = build_runtime_adjustment_end_prompt(
-        instruction=args.instruction, tactile_caption=observation.tactile_caption,
-        recovery_plan=args.forced_recovery_plan, past_qpos_h99=np.stack(feedback_qpos_h30),
-        current_qpos=observation.qpos, stats=stats,
+        instruction=args.instruction,
+        tactile_caption=observation.tactile_caption,
+        recovery_plan=args.forced_recovery_plan,
+        past_qpos_h99=mapped_past,
+        current_qpos=observation.qpos,
+        stats=stats,
     )
     payload = runtime.build_payload(
-        mode="adjustment_end", img_front_bgr=observation.img_front,
-        img_left_bgr=observation.img_left, qpos=observation.qpos,
-        state_history=None, state_history_mask=None, prompt=prompt,
+        mode="adjustment_end",
+        img_front_bgr=observation.img_front,
+        img_left_bgr=observation.img_left,
+        qpos=observation.qpos,
+        state_history=None,
+        state_history_mask=None,
+        prompt=prompt,
     )
     started = time.perf_counter()
     try:
@@ -128,13 +220,24 @@ def _run_async_adjustment_end_once(
     adjustment_end, probabilities = base._validate_adjustment_end_response(response)
     server_infer_ms = response.get("policy_timing", {}).get("infer_ms")
     return AsyncV75AdjustmentEndResult(
-        generation=generation, phase_index=phase_index, captured_step=captured_step, prompt=prompt,
-        qpos_h100_11_discrete=discrete.tolist(), feedback_qpos_h100=[row.copy() for row in h100],
+        generation=generation,
+        phase_index=phase_index,
+        captured_step=captured_step,
+        prompt=prompt,
+        qpos_h100_11_discrete=discrete.tolist(),
+        feedback_qpos_h100=[row.copy() for row in h100],
+        raw_feedback_qpos_h100=[row.copy() for row in np.concatenate((raw_past, raw_current[None, :]))],
         feedback_timestamps_h100=[*feedback_timestamps, float(observation.timestamp)],
-        current_qpos=observation.qpos, synchronized_timestamps=synchronized_timestamps,
-        tactile_caption=observation.tactile_caption, adjustment_end=adjustment_end,
-        probabilities=probabilities, submitted_monotonic=submitted_monotonic,
-        finished_monotonic=time.monotonic(), client_infer_ms=(time.perf_counter() - started) * 1000.0,
+        current_qpos=observation.qpos,
+        raw_current_qpos=raw_current,
+        gripper_remapped_frames=past_remapped + current_remapped,
+        synchronized_timestamps=synchronized_timestamps,
+        tactile_caption=observation.tactile_caption,
+        adjustment_end=adjustment_end,
+        probabilities=probabilities,
+        submitted_monotonic=submitted_monotonic,
+        finished_monotonic=time.monotonic(),
+        client_infer_ms=(time.perf_counter() - started) * 1000.0,
         server_infer_ms=float(server_infer_ms) if server_infer_ms is not None else None,
     )
 
@@ -142,25 +245,45 @@ def _run_async_adjustment_end_once(
 def _report_async_adjustment_end(*, args, logger, result, handled_step, previous_submit_monotonic) -> None:
     submit_interval_ms = (
         (result.submitted_monotonic - previous_submit_monotonic) * 1000.0
-        if previous_submit_monotonic is not None else None
+        if previous_submit_monotonic is not None
+        else None
     )
     lag_steps = max(0, handled_step - result.captured_step)
-    print(f"[V7.5 ADJUSTMENT_END async] result={result.adjustment_end} probs={result.probabilities.tolist()} lag_steps={lag_steps}")
-    logger.record({
-        "event": "v7_5_adjustment_end_async_inference", "generation": result.generation,
-        "phase_index": result.phase_index, "captured_step": result.captured_step,
-        "handled_step": handled_step, "lag_steps": lag_steps, "adjustment_end": result.adjustment_end,
-        "adjustment_end_probs": result.probabilities, "prompt": result.prompt,
-        "qpos_h100_11_discrete": result.qpos_h100_11_discrete,
-        "feedback_qpos_h100": result.feedback_qpos_h100,
-        "feedback_timestamps_h100": result.feedback_timestamps_h100,
-        "current_qpos": result.current_qpos, "synchronized_timestamps": result.synchronized_timestamps,
-        "tactile_caption": result.tactile_caption, "target_rate_hz": args.adjustment_end_rate_hz,
-        "submit_interval_ms": submit_interval_ms,
-        "actual_submit_rate_hz": 1000.0 / submit_interval_ms if submit_interval_ms and submit_interval_ms > 0 else None,
-        "client_infer_ms": result.client_infer_ms, "server_infer_ms": result.server_infer_ms,
-        "total_async_ms": (result.finished_monotonic - result.submitted_monotonic) * 1000.0,
-    })
+    print(
+        f"[V7.5 ADJUSTMENT_END async] result={result.adjustment_end} "
+        f"probs={result.probabilities.tolist()} lag_steps={lag_steps} "
+        f"gripper_remapped_frames={result.gripper_remapped_frames}"
+    )
+    logger.record(
+        {
+            "event": "v7_5_adjustment_end_async_inference",
+            "generation": result.generation,
+            "phase_index": result.phase_index,
+            "captured_step": result.captured_step,
+            "handled_step": handled_step,
+            "lag_steps": lag_steps,
+            "adjustment_end": result.adjustment_end,
+            "adjustment_end_probs": result.probabilities,
+            "prompt": result.prompt,
+            "qpos_h100_11_discrete": result.qpos_h100_11_discrete,
+            "feedback_qpos_h100": result.feedback_qpos_h100,
+            "raw_feedback_qpos_h100": result.raw_feedback_qpos_h100,
+            "feedback_timestamps_h100": result.feedback_timestamps_h100,
+            "current_qpos": result.current_qpos,
+            "raw_current_qpos": result.raw_current_qpos,
+            "gripper_remapped_frames": result.gripper_remapped_frames,
+            "synchronized_timestamps": result.synchronized_timestamps,
+            "tactile_caption": result.tactile_caption,
+            "target_rate_hz": args.adjustment_end_rate_hz,
+            "submit_interval_ms": submit_interval_ms,
+            "actual_submit_rate_hz": 1000.0 / submit_interval_ms
+            if submit_interval_ms and submit_interval_ms > 0
+            else None,
+            "client_infer_ms": result.client_infer_ms,
+            "server_infer_ms": result.server_infer_ms,
+            "total_async_ms": (result.finished_monotonic - result.submitted_monotonic) * 1000.0,
+        }
+    )
 
 
 def _configure_base() -> None:
@@ -177,13 +300,20 @@ def _configure_base() -> None:
     base._report_async_adjustment_end = _report_async_adjustment_end
 
 
-def main() -> None:
+def get_arguments() -> tuple[argparse.Namespace, argparse.ArgumentParser]:
     _configure_base()
-    if "--expected-data-profile" not in sys.argv and not any(value.startswith("--expected-data-profile=") for value in sys.argv[1:]):
+    if "--expected-data-profile" not in sys.argv and not any(
+        value.startswith("--expected-data-profile=") for value in sys.argv[1:]
+    ):
         sys.argv.extend(["--expected-data-profile", ROTATION_PHASE_V7_4_ADJUSTMENT])
-    args, parser = base.get_arguments()
+    return base.get_arguments(add_classification_gripper_probe_arguments)
+
+
+def main() -> None:
+    args, parser = get_arguments()
     runtime.apply_yaml_defaults(args, parser)
     base.validate_args(args, parser)
+    validate_classification_gripper_probe_arguments(args, parser)
     if not sys.stdin.isatty():
         parser.error("V7.5 asynchronous manual inference requires an interactive TTY")
     runtime.shutdown_event.clear()
@@ -200,6 +330,13 @@ def main() -> None:
         trial_id = f"{trial_id}_{time.strftime('%Y%m%d_%H%M%S')}"
     logger = v52.TrialLogger(args.log_dir, trial_id=trial_id)
     print(f"Trial log directory: {logger.directory}")
+    if args.classification_gripper_open_threshold is not None:
+        print(
+            "WARNING: TEST-ONLY classification gripper remapping is active: "
+            f"qpos[6]>={args.classification_gripper_open_threshold:.6f} -> "
+            f"{args.classification_gripper_open_value:.6f}. "
+            "Action generation and published robot commands are unchanged."
+        )
     try:
         if not args.start_immediately:
             input("Press enter to start EXECUTION")

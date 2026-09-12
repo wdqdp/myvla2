@@ -37,13 +37,14 @@ DEFAULT_NORM_STATS = Path(
 )
 DEFAULT_LOG_ROOT = PROJECT_ROOT / "outputs/runtime/forced_phase_ablation_v7_5_sync"
 Phase = Literal["execution", "adjustment"]
+ROLLING_QPOS_BUFFER_FRAMES = 100
 
 
 def should_classify_adjustment_end(*, phase: Phase, completed_raw_actions: int, feedback_count: int) -> bool:
     """Classify only after a complete adjustment chunk with a full past H99."""
 
     return (
-        phase == "adjustment" and int(completed_raw_actions) == 30 and int(feedback_count) == RUNTIME_PAST_QPOS_FRAMES
+        phase == "adjustment" and int(completed_raw_actions) == 30 and int(feedback_count) >= RUNTIME_PAST_QPOS_FRAMES
     )
 
 
@@ -61,10 +62,11 @@ def _classify_adjustment_end_sync(
 ) -> bool:
     """Block action generation until one V7.5 H100 classification finishes."""
 
-    if len(feedback_window) != RUNTIME_PAST_QPOS_FRAMES:
-        raise ValueError("V7.5 synchronous classification requires exactly 99 past qpos frames")
-    qpos = [value.copy() for value, _ in feedback_window]
-    timestamps = [float(timestamp) for _, timestamp in feedback_window]
+    if len(feedback_window) < RUNTIME_PAST_QPOS_FRAMES:
+        raise ValueError("V7.5 synchronous classification requires at least 99 past qpos frames")
+    recent = list(feedback_window)[-RUNTIME_PAST_QPOS_FRAMES:]
+    qpos = [value.copy() for value, _ in recent]
+    timestamps = [float(timestamp) for _, timestamp in recent]
     submitted = time.monotonic()
     try:
         result = v75_async._run_async_adjustment_end_once(
@@ -92,8 +94,11 @@ def _classify_adjustment_end_sync(
             "prompt": result.prompt,
             "qpos_h100_11_discrete": result.qpos_h100_11_discrete,
             "feedback_qpos_h100": result.feedback_qpos_h100,
+            "raw_feedback_qpos_h100": result.raw_feedback_qpos_h100,
             "feedback_timestamps_h100": result.feedback_timestamps_h100,
             "current_qpos": result.current_qpos,
+            "raw_current_qpos": result.raw_current_qpos,
+            "gripper_remapped_frames": result.gripper_remapped_frames,
             "synchronized_timestamps": result.synchronized_timestamps,
             "tactile_caption": result.tactile_caption,
             "client_infer_ms": result.client_infer_ms,
@@ -101,7 +106,11 @@ def _classify_adjustment_end_sync(
             "total_sync_ms": (result.finished_monotonic - submitted) * 1000.0,
         }
     )
-    print(f"[V7.5 ADJUSTMENT_END sync] result={result.adjustment_end} probs={result.probabilities.tolist()}")
+    print(
+        f"[V7.5 ADJUSTMENT_END sync] result={result.adjustment_end} "
+        f"probs={result.probabilities.tolist()} "
+        f"gripper_remapped_frames={result.gripper_remapped_frames}"
+    )
     return bool(result.adjustment_end)
 
 
@@ -117,6 +126,8 @@ def run_v7_5_sync(args, operator, policy, captioner, keyboard, logger) -> None:
             "args": vars(args),
             "sync_adjustment_end": True,
             "qpos_past_frames_required": RUNTIME_PAST_QPOS_FRAMES,
+            "rolling_qpos_buffer_frames": ROLLING_QPOS_BUFFER_FRAMES,
+            "rolling_qpos_buffer_phases": ["execution", "adjustment"],
         }
     )
     print(
@@ -127,13 +138,20 @@ def run_v7_5_sync(args, operator, policy, captioner, keyboard, logger) -> None:
     )
     if metadata.get("adjustment_end_experimental_override", False):
         print("WARNING: EXPERIMENTAL manual adjustment_end threshold is active.")
+    if getattr(args, "classification_gripper_open_threshold", None) is not None:
+        print(
+            "WARNING: TEST-ONLY classification gripper remapping is active: "
+            f"qpos[6]>={args.classification_gripper_open_threshold:.6f} -> "
+            f"{args.classification_gripper_open_value:.6f}. "
+            "Action generation and published robot commands are unchanged."
+        )
 
     phase: Phase = "execution"
     phase_indices = {"execution": 0, "adjustment": 0}
     pending_observation: v52.FrozenObservation | None = None
     pre_action: np.ndarray | None = None
     published_steps = 0
-    feedback_window: deque[tuple[np.ndarray, float]] = deque(maxlen=RUNTIME_PAST_QPOS_FRAMES)
+    feedback_window: deque[tuple[np.ndarray, float]] = deque(maxlen=ROLLING_QPOS_BUFFER_FRAMES)
 
     while published_steps < args.max_publish_step and not operator.is_shutdown():
         key = async_base._poll_key(args, keyboard, phase=phase)
@@ -150,7 +168,6 @@ def run_v7_5_sync(args, operator, policy, captioner, keyboard, logger) -> None:
                 discarded_raw_actions=0,
             )
             phase = "adjustment"
-            feedback_window.clear()
             pre_action = pending_observation.qpos.copy()
 
         observation = pending_observation or v52._capture_observation(
@@ -199,8 +216,7 @@ def run_v7_5_sync(args, operator, policy, captioner, keyboard, logger) -> None:
             feedback, timestamp = v53._wait_feedback_after(args, operator, before_timestamp)
             complete += 1
             published_steps += 1
-            if requested_phase == "adjustment":
-                feedback_window.append((feedback.copy(), float(timestamp)))
+            feedback_window.append((feedback.copy(), float(timestamp)))
 
         logger.record(
             {
@@ -227,7 +243,6 @@ def run_v7_5_sync(args, operator, policy, captioner, keyboard, logger) -> None:
                 discarded_raw_actions=max(0, limit - complete),
             )
             phase = "adjustment"
-            feedback_window.clear()
             pre_action = pending_observation.qpos.copy()
             continue
 
@@ -286,7 +301,6 @@ def run_v7_5_sync(args, operator, policy, captioner, keyboard, logger) -> None:
             )
             print("[PHASE] adjustment_end=true; switching to EXECUTION before next chunk.")
             phase = "execution"
-            feedback_window.clear()
 
     logger.record({"event": "max_publish_step_reached", "phase": phase, "published_steps": published_steps})
 
@@ -331,6 +345,19 @@ def get_arguments() -> tuple[argparse.Namespace, argparse.ArgumentParser]:
     parser.add_argument("--tactile_window_size", type=int, default=30)
     parser.add_argument("--captioner_checkpoint", type=Path, default=DEFAULT_CAPTIONER)
     parser.add_argument("--captioner_device", default="auto")
+    parser.add_argument(
+        "--classification-gripper-open-threshold",
+        type=float,
+        help=(
+            "TEST ONLY: classification qpos[6] values at or above this threshold "
+            "are replaced; action inference and robot commands are unchanged"
+        ),
+    )
+    parser.add_argument(
+        "--classification-gripper-open-value",
+        type=float,
+        help="TEST ONLY: replacement value for open classification qpos[6]",
+    )
     parser.add_argument("--start-immediately", action="store_true")
     parser.add_argument("--quit-key", default="q")
     parser.add_argument("--no-publish", action="store_true")
@@ -357,6 +384,17 @@ def validate_args(args: argparse.Namespace, parser: argparse.ArgumentParser) -> 
         parser.error("publish and observation polling rates must be positive")
     if args.replay_attempt_dir is not None:
         parser.error("V7.5 synchronous real-time inference does not support replay mode")
+    threshold = args.classification_gripper_open_threshold
+    value = args.classification_gripper_open_value
+    if (threshold is None) != (value is None):
+        parser.error(
+            "--classification-gripper-open-threshold and --classification-gripper-open-value must be provided together"
+        )
+    if threshold is not None:
+        if not np.isfinite(threshold) or not np.isfinite(value):
+            parser.error("classification gripper mapping values must be finite")
+        if not 0.0 <= threshold <= 0.2 or not threshold <= value <= 0.2:
+            parser.error("classification gripper mapping requires 0 <= threshold <= value <= 0.2")
 
 
 def main() -> None:
