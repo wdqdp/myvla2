@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Serve V7.4 actions plus the V7.5 H100 adjustment-end classifier."""
+"""Serve V7.4 actions plus the V7.6 counterfactual H100 adjustment-end classifier."""
 
 # ruff: noqa: E402, SLF001
 
@@ -25,17 +25,18 @@ from tactile_vla.vla.v5_3_adjustment_end_checkpoint import parameter_tree_sha256
 from tactile_vla.vla.v5_3_phase_change import StateQuantileStats
 from tactile_vla.vla.v7_4_adjustment_data import ROTATION_PHASE_V7_4_ADJUSTMENT
 from tactile_vla.vla.v7_4_adjustment_data import V7_4_EXPERIMENT_KIND
-from tactile_vla.vla.v7_5_adjustment_end_data import DATA_PROFILE
-from tactile_vla.vla.v7_5_adjustment_end_data import EXPERIMENT_KIND
-from tactile_vla.vla.v7_5_adjustment_end_data import HISTORY_POLICY
-from tactile_vla.vla.v7_5_adjustment_end_data import LABEL_POLICY
 from tactile_vla.vla.v7_5_phase_change import PHASE_CHANGE_MAX_TOKEN_LEN
 from tactile_vla.vla.v7_5_phase_change import PHASE_CHANGE_PROMPT_PROFILE
 from tactile_vla.vla.v7_5_runtime_history import RUNTIME_SAMPLE_OFFSETS
 from tactile_vla.vla.v7_5_runtime_history import build_runtime_adjustment_end_prompt
+from tactile_vla.vla.v7_6_adjustment_end_data import COUNTERFACTUAL_SELECTION_POLICY
+from tactile_vla.vla.v7_6_adjustment_end_data import DATA_PROFILE
+from tactile_vla.vla.v7_6_adjustment_end_data import EXPERIMENT_KIND
+from tactile_vla.vla.v7_6_adjustment_end_data import HISTORY_POLICY
+from tactile_vla.vla.v7_6_adjustment_end_data import LABEL_POLICY
 
 from scripts import serve_tactile_vla_v7 as v7
-from scripts.train_vla_adjustment_end_multitask_v7_5 import MULTITASK_CHECKPOINT_FORMAT
+from scripts.train_vla_adjustment_end_multitask_v7_6 import MULTITASK_CHECKPOINT_FORMAT
 
 
 ACTION_HORIZON = 30
@@ -73,21 +74,29 @@ def _validate_config(args, config: dict, metadata: dict) -> tuple[float, str]:
         "state_history_len": 0,
         "history_hidden_dim": 0,
         "label_policy": LABEL_POLICY,
+        "classification_sampling_ratio": {"positive": 1, "negative": 2},
     }
     mismatch = {key: (config.get(key), value) for key, value in required.items() if config.get(key) != value}
     if mismatch:
-        raise ValueError(f"V7.5 adjustment_end config mismatch: {mismatch}")
+        raise ValueError(f"V7.6 adjustment_end config mismatch: {mismatch}")
     if metadata.get("checkpoint_format") != MULTITASK_CHECKPOINT_FORMAT:
-        raise ValueError("V7.5 adjustment_end metadata checkpoint format mismatch")
+        raise ValueError("V7.6 adjustment_end metadata checkpoint format mismatch")
     if metadata.get("label_policy") != LABEL_POLICY or int(metadata.get("official_step", -1)) != 8000:
-        raise ValueError("V7.5 adjustment_end metadata label/step mismatch")
+        raise ValueError("V7.6 adjustment_end metadata label/step mismatch")
     if metadata.get("history_policy") != HISTORY_POLICY:
-        raise ValueError("V7.5 adjustment_end metadata history policy mismatch")
+        raise ValueError("V7.6 adjustment_end metadata history policy mismatch")
+    if metadata.get("counterfactual_selection_policy") != COUNTERFACTUAL_SELECTION_POLICY:
+        raise ValueError("V7.6 adjustment_end metadata counterfactual policy mismatch")
+    sampling = metadata.get("classification_sampling_policy", {})
+    if sampling.get("strategy") != "deterministic_natural_manifest_stream" or sampling.get(
+        "positive_to_negative_ratio"
+    ) != "1:2":
+        raise ValueError("V7.6 adjustment_end metadata sampling policy mismatch")
     if args.checkpoint_load_mode == "delta" and args.stage_a_checkpoint is None:
         raise ValueError("--checkpoint-load-mode=delta requires --stage-a-checkpoint")
     threshold = float(metadata.get("adjustment_end_threshold", -1.0))
     if not 0.0 <= threshold <= 1.0:
-        raise ValueError("V7.5 adjustment_end threshold is invalid")
+        raise ValueError("V7.6 adjustment_end threshold is invalid")
     stored_sha = config["caption_source"]["checkpoint"].get("sha256")
     runtime_sha = args.captioner_checkpoint_sha256 or stored_sha
     if not isinstance(runtime_sha, str) or len(runtime_sha) != 64:
@@ -97,8 +106,8 @@ def _validate_config(args, config: dict, metadata: dict) -> tuple[float, str]:
     return threshold, runtime_sha
 
 
-class V75Policy(v7.V7Policy):
-    """V7.4 action policy with V7.5 classifier prompt/identity validation."""
+class V76Policy(v7.V7Policy):
+    """V7.4 action policy with V7.6 classifier prompt/identity validation."""
 
     def __init__(self, *, args, config_path: Path, config: dict):
         del config_path
@@ -169,7 +178,7 @@ class V75Policy(v7.V7Policy):
         actual_sha = parameter_tree_sha256(v7.nnx.state(wrapper))
         expected_sha = final_metadata.get("parameter_exports", {}).get("full_params", {}).get("parameter_tree_sha256")
         if expected_sha and actual_sha != expected_sha:
-            raise ValueError("Restored V7.5 full model parameter-tree SHA mismatch")
+            raise ValueError("Restored V7.6 full model parameter-tree SHA mismatch")
         self._sample_actions = v7.nnx_utils.module_jit(wrapper.backbone.sample_actions)
         self._adjustment_end_logits = v7.nnx_utils.module_jit(wrapper.adjustment_end_logits)
         self._sample_rng = v7.jax.random.key(3)
@@ -177,8 +186,8 @@ class V75Policy(v7.V7Policy):
         if self._num_inference_steps <= 0:
             raise ValueError("num inference steps must be positive")
         self._metadata = {
-            "name": "tactile_vla_v7_5",
-            "checkpoint_kind": "full-v7-5-action-plus-adjustment-end" if args.checkpoint_load_mode == "full" else "v7-4-stage-a-plus-v7-5-delta",
+            "name": "tactile_vla_v7_6",
+            "checkpoint_kind": "full-v7-6-action-plus-adjustment-end" if args.checkpoint_load_mode == "full" else "v7-4-stage-a-plus-v7-6-delta",
             "checkpoint": str(step_dir), "checkpoint_load_mode": args.checkpoint_load_mode,
             "prompt_profile": "phase_v2", "data_profile": ROTATION_PHASE_V7_4_ADJUSTMENT,
             "experiment_kind": V7_4_EXPERIMENT_KIND, "stage_a_protocol": "v7_4_no_state_history",
@@ -191,6 +200,9 @@ class V75Policy(v7.V7Policy):
             "adjustment_end_threshold_policy": final_metadata["threshold_policy"],
             "adjustment_end_checkpoint_format": MULTITASK_CHECKPOINT_FORMAT,
             "adjustment_end_data_profile": DATA_PROFILE, "adjustment_end_label_policy": LABEL_POLICY,
+            "adjustment_end_history_policy": HISTORY_POLICY,
+            "adjustment_end_counterfactual_selection_policy": COUNTERFACTUAL_SELECTION_POLICY,
+            "adjustment_end_classification_sampling_ratio": {"positive": 1, "negative": 2},
             "phase_change_prompt_profile": PHASE_CHANGE_PROMPT_PROFILE,
             "phase_change_max_token_len": PHASE_CHANGE_MAX_TOKEN_LEN,
             "qpos_history_frames": 100, "qpos_history_includes_current": True,
@@ -210,14 +222,14 @@ class V75Policy(v7.V7Policy):
         inputs.pop("action_noise", None)
         prompt = str(inputs.get("prompt", ""))
         if not prompt.startswith("Mode: adjustment.\n") or PROMPT_MARKER not in prompt:
-            raise ValueError("adjustment_end request does not use the V7.5 H100 prompt")
+            raise ValueError("adjustment_end request does not use the V7.6 H100 prompt")
         transformed = self._phase_input(inputs)
         logits = self._adjustment_end_logits(self._observation(transformed))
         probabilities = np.asarray(v7.jax.device_get(v7.jax.nn.softmax(logits, axis=-1))[0], dtype=np.float32)
         return {"adjustment_end": bool(float(probabilities[1]) >= self._threshold), "adjustment_end_probs": probabilities}
 
 
-def warm_up(policy: V75Policy) -> dict:
+def warm_up(policy: V76Policy) -> dict:
     image = np.zeros((224, 224, 3), dtype=np.uint8)
     common = {"observation/image": image, "observation/wrist_image": image, "observation/state": np.zeros(7, dtype=np.float32)}
     action = policy.infer({
@@ -238,13 +250,13 @@ def main() -> None:
     args = parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s", force=True)
     config_path, config = v7._find_config(args.adjustment_end_checkpoint.resolve())
-    policy = V75Policy(args=args, config_path=config_path, config=config)
+    policy = V76Policy(args=args, config_path=config_path, config=config)
     summary = warm_up(policy)
-    logging.info("V7.5 action and adjustment_end warm-up complete: %s", summary)
+    logging.info("V7.6 action and adjustment_end warm-up complete: %s", summary)
     if args.dry_run:
         print(json.dumps(summary, indent=2, ensure_ascii=False))
         return
-    logging.info("Serving V7.5 on %s (%s):%d", socket.gethostname(), args.host, args.port)
+    logging.info("Serving V7.6 on %s (%s):%d", socket.gethostname(), args.host, args.port)
     v7.websocket_policy_server.WebsocketPolicyServer(policy=policy, host=args.host, port=args.port, metadata=policy.metadata).serve_forever()
 
 

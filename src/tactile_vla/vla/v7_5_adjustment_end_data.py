@@ -75,22 +75,27 @@ def idle_overlap_indices(
     return list(range(lower, upper + 1)) if lower <= upper else []
 
 
-def _largest_remainder_811(size: int) -> dict[int, int]:
-    floors = {0: size * 8 // 10, 1: size // 10, 2: size // 10}
+def _largest_remainder_counts(size: int, weights: Sequence[int]) -> dict[int, int]:
+    if len(weights) != 3 or any(int(value) <= 0 for value in weights):
+        raise ValueError("Idle keep weights must contain three positive integers")
+    total = sum(int(value) for value in weights)
+    floors = {key: size * int(weight) // total for key, weight in enumerate(weights)}
     remainder = size - sum(floors.values())
-    fractions = {0: (size * 8) % 10, 1: size % 10, 2: size % 10}
+    fractions = {
+        key: (size * int(weight)) % total for key, weight in enumerate(weights)
+    }
     for key in sorted(fractions, key=lambda value: (-fractions[value], value))[:remainder]:
         floors[key] += 1
     return floors
 
 
 def assign_idle_keep_counts(
-    candidates: Sequence[tuple[int, int]], *, seed: int
+    candidates: Sequence[tuple[int, int]], *, seed: int, weights: Sequence[int] = (8, 1, 1)
 ) -> tuple[dict[int, int], dict[str, Any]]:
-    """Assign k with an 8:1:1 target while respecting l > k*10."""
+    """Assign k with a largest-remainder target while respecting l > k*10."""
 
     pooled = [(int(identifier), int(overlap)) for identifier, overlap in candidates if int(overlap) > 0]
-    targets = _largest_remainder_811(len(pooled))
+    targets = _largest_remainder_counts(len(pooled), weights)
     rng = np.random.default_rng(seed)
     priority = {identifier: float(rng.random()) for identifier, _ in pooled}
     eligible_two = sorted(
@@ -209,6 +214,7 @@ def build_adjustment_end_artifacts(
     stage_a_config_file: Path,
     tokenizer: Any,
     seed: int = HISTORY_SEED,
+    idle_keep_weights: Sequence[int] = (8, 1, 1),
 ) -> tuple[list[dict[str, Any]], dict[str, Any], dict[str, Any]]:
     dataset_dir = dataset_dir.expanduser().resolve()
     v4_index = _load_object(v4_index_file)
@@ -265,7 +271,9 @@ def build_adjustment_end_artifacts(
     ratio_summary = {}
     for split_offset, split in enumerate(SPLITS):
         assigned, details = assign_idle_keep_counts(
-            split_candidate_ids[split], seed=seed + split_offset * 10_000
+            split_candidate_ids[split],
+            seed=seed + split_offset * 10_000,
+            weights=idle_keep_weights,
         )
         assignments.update(assigned)
         ratio_summary[split] = details

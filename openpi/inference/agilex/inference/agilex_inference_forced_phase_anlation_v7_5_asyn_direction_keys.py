@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""V7.5 async inference with keyboard-selected horizontal recovery plans."""
+"""V7.6 async inference with keyboard-selected horizontal recovery plans."""
 
 # ruff: noqa: E402, SLF001
 
@@ -26,9 +26,13 @@ sys.path.insert(0, str(OPENPI_ROOT / "packages" / "openpi-client" / "src"))
 
 import agilex_inference_forced_phase_anlation as v52
 import agilex_inference_forced_phase_anlation_v7_5_asyn as implementation
+from tactile_vla.vla.v7_6_adjustment_end_data import DATA_PROFILE as V7_6_DATA_PROFILE
+
+# Reuse the proven V7.5 online H100 implementation with the V7.6 model identity.
+implementation.DATA_PROFILE = V7_6_DATA_PROFILE
 
 Phase = Literal["execution", "adjustment"]
-DEFAULT_LOG_ROOT = PROJECT_ROOT / "outputs/runtime/forced_phase_ablation_v7_5_async_direction_keys"
+DEFAULT_LOG_ROOT = PROJECT_ROOT / "outputs/runtime/forced_phase_ablation_v7_6_async_direction_keys"
 DIRECTION_KEYS = {
     "a": ("left", "moderately"),
     "s": ("left", "slightly"),
@@ -125,7 +129,7 @@ def run_v7_5_async_direction_keys(
     keyboard: Any,
     logger: Any,
 ) -> None:
-    """Run async V7.5 with one continuous H100 feedback window across phases."""
+    """Run async V7.6 with one continuous H100 feedback window across phases."""
 
     action_metadata = action_policy.get_server_metadata()
     classification_metadata = classification_policy.get_server_metadata()
@@ -148,7 +152,7 @@ def run_v7_5_async_direction_keys(
         }
     )
     print(
-        "V7.5 async direction controls: "
+        "V7.6 async direction controls: "
         "a=left moderately, s=left slightly, d=right slightly, "
         "f=right moderately, q=quit; SPACE is disabled. "
         f"adjustment_end target rate={args.adjustment_end_rate_hz:g}Hz, "
@@ -167,7 +171,7 @@ def run_v7_5_async_direction_keys(
     previous_reported_submit: float | None = None
     last_submit: float | None = None
 
-    with ThreadPoolExecutor(max_workers=1, thread_name_prefix="v7-5-adjustment-end") as executor:
+    with ThreadPoolExecutor(max_workers=1, thread_name_prefix="v7-6-adjustment-end") as executor:
         future: Future[Any] | None = None
 
         def consume_finished_request() -> bool:
@@ -393,12 +397,15 @@ def main() -> None:
         _keyboard_selection_validate_args(original_validate, args, parser)
 
     implementation.DEFAULT_LOG_ROOT = DEFAULT_LOG_ROOT
+    # V7.6 reuses the V7.5 online H100 construction, but the server identity is
+    # the counterfactual V7.6 classifier profile.
+    implementation.DATA_PROFILE = V7_6_DATA_PROFILE
     implementation.base._poll_key = _poll_key
     implementation.v52._poll_control_key = _poll_control_key
     implementation.base.validate_args = validate_args
     implementation.base.run_v5_3_async = run_v7_5_async_direction_keys
     print(
-        "V7.5 async direction controls: "
+        "V7.6 async direction controls: "
         "a=left moderately, s=left slightly, d=right slightly, "
         "f=right moderately, q=quit; SPACE is disabled."
     )

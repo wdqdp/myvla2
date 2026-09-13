@@ -109,6 +109,11 @@ FROZEN_COMPONENTS = [
     "action_projection_layers",
 ]
 CHECKPOINT_EXPORTS = ["delta_params"]
+CLASSIFICATION_SAMPLING_RATIO = {"positive": 1, "negative": 3}
+CLASSIFICATION_SAMPLING_POLICY = {
+    "strategy": "fixed_class_ratio",
+    **CLASSIFICATION_SAMPLING_RATIO,
+}
 
 
 def parse_args() -> argparse.Namespace:
@@ -816,7 +821,8 @@ def main() -> None:
         "task_cycle": list(TASK_CYCLE),
         "updates_per_task": args.num_steps // 2,
         "loss_weights": {"action": 1.0, "adjustment_end": 1.0},
-        "classification_sampling_ratio": {"positive": 1, "negative": 3},
+        "classification_sampling_ratio": CLASSIFICATION_SAMPLING_RATIO,
+        "classification_sampling_policy": CLASSIFICATION_SAMPLING_POLICY,
         "label_policy": LABEL_POLICY,
         "trainable_components": ["paligemma_lora", "adjustment_end_head"],
         "frozen_components": FROZEN_COMPONENTS,
