@@ -217,6 +217,11 @@ V4_STAGE_B_PROTOCOL = {
 }
 V4_STAGE_B_TRAINABLE_COMPONENTS = ("paligemma_lora", "need_head")
 V4_STAGE_B_FROZEN_COMPONENTS = ("action_expert", "paligemma_non_lora")
+# Kept as a module-level extension point so later versioned trainers can reuse
+# the checkpoint/optimizer machinery without changing the V3 protocol.
+TASK_CYCLE = ("action", "need", "failure", "plan")
+CHECKPOINT_EXPORT_HOOK = None
+EXTRA_CONFIG: dict[str, Any] = {}
 
 
 def validate_v4_training_protocol(args: argparse.Namespace) -> None:
@@ -686,12 +691,13 @@ def print_dry_run_vlm_inputs(loaders: dict[str, DataLoader]) -> None:
 
     task_names = {
         "action": "execution / action chunk",
+        "adjustment": "inference / phase assessment (adjustment_end)",
         "need": "inference / shared assessment (need_recovery)",
         "failure": "inference / shared assessment (failure_reason)",
         "plan": "inference / recovery planning",
     }
     print("\n===== Dry-run VLM input examples (before tokenization) =====")
-    for task in ("action", "need", "failure", "plan"):
+    for task in TASK_CYCLE:
         transformed_dataset = loaders[task].dataset
         raw_dataset = getattr(transformed_dataset, "dataset", None)
         if raw_dataset is None:
@@ -733,6 +739,10 @@ def print_dry_run_vlm_inputs(loaders: dict[str, DataLoader]) -> None:
         elif task == "need":
             payload["training_target"] = {
                 "need_recovery": bool(np.asarray(sample["need_recovery_label"]).item()),
+            }
+        elif task == "adjustment":
+            payload["training_target"] = {
+                "adjustment_end": bool(np.asarray(sample["adjustment_end_label"]).item()),
             }
         else:
             payload["training_target"] = {
@@ -895,6 +905,32 @@ def train_need_step(
     return state, {"loss": loss, "grad_norm": optax.global_norm(grads)}
 
 
+def train_adjustment_step(
+    train_filter: nnx.filterlib.Filter,
+    loss_weight: float,
+    rng: jax.Array,
+    state: training_utils.TrainState,
+    batch: tuple[Observation, dict[str, jax.Array]],
+) -> tuple[training_utils.TrainState, dict[str, jax.Array]]:
+    """Train an optional adjustment-end head used by versioned extensions."""
+
+    model = nnx.merge(state.model_def, state.params)
+    model.train()
+    observation, targets = batch
+
+    def loss_fn(module) -> jax.Array:
+        logits = module.adjustment_end_logits(observation, rng=rng, train=True)
+        return loss_weight * optax.softmax_cross_entropy_with_integer_labels(
+            logits, targets["adjustment"]
+        ).mean()
+
+    loss, grads = nnx.value_and_grad(
+        loss_fn, argnums=nnx.DiffState(0, train_filter)
+    )(model)
+    state = _apply_gradients(state, model, grads, train_filter)
+    return state, {"loss": loss, "grad_norm": optax.global_norm(grads)}
+
+
 def train_text_step(
     train_filter: nnx.filterlib.Filter,
     loss_weight: float,
@@ -949,6 +985,11 @@ def batch_to_jax(
         payload = (observation, np.asarray(local["actions"], dtype=np.float32))
     elif task == "need":
         payload = (observation, {"need": np.asarray(local["need_recovery_label"], dtype=np.int32)})
+    elif task == "adjustment":
+        payload = (
+            observation,
+            {"adjustment": np.asarray(local["adjustment_end_label"], dtype=np.int32)},
+        )
     else:
         payload = (
             observation,
@@ -1121,6 +1162,27 @@ def evaluate_need(
     return classification_report(true, pred, num_classes=2, class_names=["false", "true"])
 
 
+def evaluate_adjustment(
+    state: training_utils.TrainState,
+    loader: DataLoader,
+    data_sharding: jax.sharding.Sharding,
+    *, max_samples: int,
+) -> dict[str, Any]:
+    model = nnx.merge(state.model_def, state.params)
+    model.eval()
+    logits_fn = nnx_utils.module_jit(model.adjustment_end_logits)
+    true, pred = [], []
+    for batch in loader:
+        observation, targets = batch_to_jax(batch, "adjustment", data_sharding)
+        logits = logits_fn(observation)
+        remaining = max_samples - len(true)
+        true.extend(np.asarray(jax.device_get(targets["adjustment"])).reshape(-1)[:remaining].tolist())
+        pred.extend(np.asarray(jax.device_get(jnp.argmax(logits, axis=-1))).reshape(-1)[:remaining].tolist())
+        if len(true) >= max_samples:
+            break
+    return classification_report(true, pred, num_classes=2, class_names=["false", "true"])
+
+
 def evaluate_text(
     state: training_utils.TrainState,
     loader: DataLoader,
@@ -1280,8 +1342,10 @@ def main() -> None:
         )
     if args.num_steps <= 0:
         raise ValueError("--num-steps must be positive")
-    if args.num_steps % 4 != 0:
-        raise ValueError("Stage B total updates must be divisible by the four-task cycle")
+    if args.num_steps % len(TASK_CYCLE) != 0:
+        raise ValueError(
+            f"Stage B total updates must be divisible by the {len(TASK_CYCLE)}-task cycle"
+        )
     if args.grammar_profile != "v3_full_v1":
         raise ValueError("This training pipeline requires grammar_profile='v3_full_v1'")
     if args.data_profile == ROTATION_MODERATELY_SUCCESS_V1:
@@ -1490,8 +1554,8 @@ def main() -> None:
         run_dir.mkdir(parents=True, exist_ok=True)
         config_payload = vars(args) | {
             "precision": precision,
-            "task_cycle": ["action", "need", "failure", "plan"],
-            "updates_per_task": args.num_steps // 4,
+            "task_cycle": list(TASK_CYCLE),
+            "updates_per_task": args.num_steps // len(TASK_CYCLE),
             "failure_grammar": list(failure_codec.texts),
             "recovery_grammar": list(plan_codec.texts),
             "grammar_profile": args.grammar_profile,
@@ -1520,6 +1584,7 @@ def main() -> None:
             "checkpoint_contents": [
                 "paligemma_lora",
                 "need_head",
+                *(["adjustment_head"] if "adjustment" in TASK_CYCLE else []),
                 "optimizer_state",
                 "step",
                 "loop_rng",
@@ -1528,7 +1593,7 @@ def main() -> None:
             "trainable_components": list(V4_STAGE_B_TRAINABLE_COMPONENTS),
             "frozen_components": list(V4_STAGE_B_FROZEN_COMPONENTS),
             "stage_a_checkpoint_step": stage_a_checkpoint_step,
-        }
+        } | EXTRA_CONFIG
         (run_dir / "config.json").write_text(
             json.dumps(config_payload, indent=2, default=str, ensure_ascii=False) + "\n"
         )
@@ -1607,11 +1672,21 @@ def main() -> None:
         "failure": pfailure,
         "plan": pplan,
     }
+    if "adjustment" in TASK_CYCLE:
+        adjustment_weight = float(getattr(args, "adjustment_loss_weight", 1.0))
+        train_functions["adjustment"] = jax.jit(
+            lambda rng, train_state, batch: train_adjustment_step(
+                filter_, adjustment_weight, rng, train_state, batch
+            ),
+            in_shardings=(replicated, state_sharding, data_sharding),
+            out_shardings=(state_sharding, replicated),
+            donate_argnums=(1,),
+        )
     iterators = {
         task: iter(cycling(loader))
         for task, loader in loaders["train"].items()
     }
-    task_cycle = ("action", "need", "failure", "plan")
+    task_cycle = TASK_CYCLE
     best_metadata_path = run_dir / "best" / "metrics.json"
     best_score = (
         float(json.loads(best_metadata_path.read_text()).get("val_score", -1.0))
@@ -1663,6 +1738,13 @@ def main() -> None:
                 data_sharding,
                 max_samples=args.eval_max_need_samples,
             )
+            adjustment_metrics = (
+                evaluate_adjustment(
+                    state, loaders["val"]["adjustment"], data_sharding,
+                    max_samples=args.eval_max_need_samples,
+                )
+                if "adjustment" in TASK_CYCLE else None
+            )
             need_support = {
                 name: int(values["support"])
                 for name, values in need_metrics["per_class"].items()
@@ -1699,14 +1781,12 @@ def main() -> None:
                 plan_metrics,
             )
             degradation = action_loss / baseline_action_loss - 1.0
-            score = float(
-                (
-                    need_metrics["macro_f1"]
-                    + failure_metrics["exact_match"]
-                    + plan_metrics["exact_match"]
-                )
-                / 3.0
-            )
+            score_terms = [
+                need_metrics["macro_f1"], failure_metrics["exact_match"], plan_metrics["exact_match"]
+            ]
+            if adjustment_metrics is not None:
+                score_terms.append(adjustment_metrics["macro_f1"])
+            score = float(np.mean(score_terms))
             metrics = {
                 "step": step,
                 "val_score": score,
@@ -1715,6 +1795,7 @@ def main() -> None:
                 "action_loss_degradation": degradation,
                 "action_gate_passed": degradation <= args.action_loss_degradation_limit,
                 "need_recovery": need_metrics,
+                **({"adjustment_end": adjustment_metrics} if adjustment_metrics is not None else {}),
                 "failure_reason": failure_metrics,
                 "recovery_plan": plan_metrics,
             }
@@ -1726,6 +1807,9 @@ def main() -> None:
 
         if step % args.save_interval == 0 or step == args.num_steps:
             save_state(manager, state, step, filter_, rng)
+            if CHECKPOINT_EXPORT_HOOK is not None:
+                manager.wait_until_finished()
+                CHECKPOINT_EXPORT_HOOK(run_dir, state, step, filter_)
 
     logging.info("Waiting for V3 checkpoint writes to finish")
     manager.wait_until_finished()
