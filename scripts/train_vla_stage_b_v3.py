@@ -1005,6 +1005,33 @@ def batch_to_jax(
     )
 
 
+def pad_eval_batch(batch: dict[str, Any], *, multiple: int) -> tuple[dict[str, Any], int]:
+    """Repeat the final eval row for sharding, returning its unpadded size."""
+
+    if multiple <= 0:
+        raise ValueError("Evaluation sharding multiple must be positive")
+    leaves = jax.tree.leaves(batch)
+    if not leaves:
+        raise ValueError("Cannot pad an empty evaluation batch")
+    batch_size = int(np.asarray(leaves[0]).shape[0])
+    if batch_size <= 0:
+        raise ValueError("Cannot pad an empty evaluation batch")
+    padding = (-batch_size) % multiple
+    if padding == 0:
+        return batch, batch_size
+
+    def pad(value: Any) -> np.ndarray:
+        array = np.asarray(value)
+        if array.ndim == 0 or array.shape[0] != batch_size:
+            raise ValueError(
+                "Every evaluation batch leaf must have the same leading dimension: "
+                f"expected {batch_size}, got {array.shape}"
+            )
+        return np.concatenate((array, np.repeat(array[-1:], padding, axis=0)), axis=0)
+
+    return jax.tree.map(pad, batch), batch_size
+
+
 def cycling(loader: DataLoader) -> Iterator[dict[str, Any]]:
     while True:
         yield from loader
@@ -1128,9 +1155,12 @@ def evaluate_action_loss(
     for batch_index, batch in enumerate(loader):
         if batch_index >= max_batches:
             break
+        batch, valid_count = pad_eval_batch(
+            batch, multiple=len(data_sharding.device_set)
+        )
         observation, actions = batch_to_jax(batch, "action", data_sharding)
         rng, step_rng = jax.random.split(rng)
-        loss = compute_loss(step_rng, observation, actions).mean()
+        loss = compute_loss(step_rng, observation, actions)[:valid_count].mean()
         values.append(float(jax.device_get(loss)))
     if not values:
         raise ValueError("Action validation loader is empty")
@@ -1150,10 +1180,13 @@ def evaluate_need(
     true: list[int] = []
     pred: list[int] = []
     for batch in loader:
+        batch, valid_count = pad_eval_batch(
+            batch, multiple=len(data_sharding.device_set)
+        )
         observation, targets = batch_to_jax(batch, "need", data_sharding)
         logits = need_logits(observation)
-        batch_true = np.asarray(jax.device_get(targets["need"])).reshape(-1)
-        batch_pred = np.asarray(jax.device_get(jnp.argmax(logits, axis=-1))).reshape(-1)
+        batch_true = np.asarray(jax.device_get(targets["need"])).reshape(-1)[:valid_count]
+        batch_pred = np.asarray(jax.device_get(jnp.argmax(logits, axis=-1))).reshape(-1)[:valid_count]
         remaining = max_samples - len(true)
         true.extend(batch_true[:remaining].tolist())
         pred.extend(batch_pred[:remaining].tolist())
@@ -1173,11 +1206,15 @@ def evaluate_adjustment(
     logits_fn = nnx_utils.module_jit(model.adjustment_end_logits)
     true, pred = [], []
     for batch in loader:
+        batch, valid_count = pad_eval_batch(
+            batch, multiple=len(data_sharding.device_set)
+        )
         observation, targets = batch_to_jax(batch, "adjustment", data_sharding)
         logits = logits_fn(observation)
         remaining = max_samples - len(true)
-        true.extend(np.asarray(jax.device_get(targets["adjustment"])).reshape(-1)[:remaining].tolist())
-        pred.extend(np.asarray(jax.device_get(jnp.argmax(logits, axis=-1))).reshape(-1)[:remaining].tolist())
+        usable = min(valid_count, remaining)
+        true.extend(np.asarray(jax.device_get(targets["adjustment"])).reshape(-1)[:usable].tolist())
+        pred.extend(np.asarray(jax.device_get(jnp.argmax(logits, axis=-1))).reshape(-1)[:usable].tolist())
         if len(true) >= max_samples:
             break
     return classification_report(true, pred, num_classes=2, class_names=["false", "true"])
@@ -1242,10 +1279,12 @@ def evaluate_text(
         }
 
     for batch in loader:
+        batch, valid_count = pad_eval_batch(
+            batch, multiple=len(data_sharding.device_set)
+        )
         observation, targets = batch_to_jax(batch, task, data_sharding)
         text_indices = np.asarray(jax.device_get(targets["text_index"])).reshape(-1)
-        batch_size = int(observation.state.shape[0])
-        for batch_index in range(batch_size):
+        for batch_index in range(valid_count):
             single = jax.tree.map(
                 lambda value: None if value is None else value[batch_index : batch_index + 1],
                 observation,
@@ -1724,6 +1763,13 @@ def main() -> None:
             write_jsonl(metrics_file, payload)
             recent = {name: [] for name in task_cycle}
 
+        should_save = step % args.save_interval == 0 or step == args.num_steps
+        if should_save:
+            save_state(manager, state, step, filter_, rng)
+            if CHECKPOINT_EXPORT_HOOK is not None:
+                manager.wait_until_finished()
+                CHECKPOINT_EXPORT_HOOK(run_dir, state, step, filter_)
+
         should_evaluate = step % args.eval_interval == 0 or step == args.num_steps
         if should_evaluate:
             action_loss = evaluate_action_loss(
@@ -1804,12 +1850,6 @@ def main() -> None:
             if metrics["action_gate_passed"] and score > best_score:
                 best_score = score
                 save_best_checkpoint(run_dir, state, metrics, filter_)
-
-        if step % args.save_interval == 0 or step == args.num_steps:
-            save_state(manager, state, step, filter_, rng)
-            if CHECKPOINT_EXPORT_HOOK is not None:
-                manager.wait_until_finished()
-                CHECKPOINT_EXPORT_HOOK(run_dir, state, step, filter_)
 
     logging.info("Waiting for V3 checkpoint writes to finish")
     manager.wait_until_finished()

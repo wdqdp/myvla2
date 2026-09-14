@@ -5,6 +5,21 @@ from types import SimpleNamespace
 
 import numpy as np
 
+from scripts.train_vla_stage_b_v3 import pad_eval_batch
+
+
+def test_stage_b_eval_tail_padding_preserves_valid_count():
+    raw = {
+        "image": np.arange(12, dtype=np.float32).reshape(2, 2, 3),
+        "structured_target_text_index": np.asarray([3, 7], dtype=np.int32),
+    }
+
+    padded, valid_count = pad_eval_batch(raw, multiple=4)
+
+    assert valid_count == 2
+    assert padded["image"].shape[0] == 4
+    assert padded["structured_target_text_index"].tolist() == [3, 7, 7, 7]
+
 
 def test_v77_trainable_filter_names_both_heads():
     source = Path("src/tactile_vla/vla/v7_7_multitask_model.py").read_text()
