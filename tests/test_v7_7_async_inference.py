@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import numpy as np
+
 from tactile_vla.vla.v7_7_async_state import AsyncPhaseState
 
 
@@ -40,6 +42,41 @@ def test_adjustment_true_holds_until_fresh_execution_chunk():
     assert not state.release_hold_with_fresh_actions(generation - 1, [1])
     assert state.release_hold_with_fresh_actions(generation, [1])
     assert not state.stop_latched
+
+
+def test_release_hold_accepts_numpy_action_chunk():
+    state = AsyncPhaseState(stop_latched=True)
+    actions = np.zeros((30, 7), dtype=np.float32)
+    assert state.release_hold_with_fresh_actions(state.action_generation, actions)
+    assert len(state.pending_actions) == 30
+    assert not state.stop_latched
+
+
+def test_classification_gripper_mapping_covers_current_qpos_and_h100():
+    import importlib.util
+    from pathlib import Path
+    path = Path("openpi/inference/agilex/inference/agilex_inference_v7_7_asyn.py")
+    spec = importlib.util.spec_from_file_location("v77_async_gripper_mapping", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    current = np.asarray([0, 0, 0, 0, 0, 0, 0.099], dtype=np.float32)
+    mapped_current, current_count = module._remap_classification_qpos(
+        current, open_threshold=0.0985, open_value=0.0995,
+    )
+    assert mapped_current[6] == np.float32(0.0995)
+    assert current_count == 1
+
+    h100 = np.zeros((100, 7), dtype=np.float32)
+    h100[:, 6] = 0.0985
+    h100[50:, 6] = 0.099
+    mapped_h100, history_count = module._remap_classification_qpos(
+        h100, open_threshold=0.0985, open_value=0.0995,
+    )
+    np.testing.assert_allclose(mapped_h100[:50, 6], 0.0985)
+    np.testing.assert_allclose(mapped_h100[50:, 6], 0.0995)
+    assert history_count == 50
+    np.testing.assert_array_equal(h100[:50, 6], np.full(50, 0.0985, dtype=np.float32))
 
 
 def test_gate_stops_h30_at_injected_decision(monkeypatch):

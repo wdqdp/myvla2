@@ -58,6 +58,27 @@ ACTION_HORIZON = 30
 ACTION_DIM = 32
 
 
+def _remap_classification_qpos(
+    qpos: np.ndarray,
+    *,
+    open_threshold: float | None,
+    open_value: float | None,
+) -> tuple[np.ndarray, int]:
+    """Map open-gripper feedback for phase-model inputs only."""
+
+    values = np.asarray(qpos, dtype=np.float32)
+    if values.shape[-1] != 7:
+        raise ValueError(f"classification qpos must end in dimension 7, got {values.shape}")
+    if (open_threshold is None) != (open_value is None):
+        raise ValueError("classification gripper threshold and value must be provided together")
+    mapped = values.copy()
+    if open_threshold is None:
+        return mapped, 0
+    mask = mapped[..., 6] > float(open_threshold)
+    mapped[..., 6] = np.where(mask, float(open_value), mapped[..., 6])
+    return mapped, int(np.count_nonzero(mask))
+
+
 class StreamingPhaseClient:
     """One-request/two-event WebSocket client used only by phase assessment."""
 
@@ -326,7 +347,15 @@ def _run_phase_assessment(
     )
     if dense_h100.shape != (100, 7):
         raise ValueError(f"runtime H100 must be [100,7], got {dense_h100.shape}")
-    discrete = discretize_state_qpos(dense_h100[np.linspace(0, 99, 11, dtype=np.int64)], stats)
+    open_threshold = args.classification_gripper_open_threshold
+    open_value = args.classification_gripper_open_value
+    mapped_h100, _ = _remap_classification_qpos(
+        dense_h100, open_threshold=open_threshold, open_value=open_value,
+    )
+    mapped_current_qpos, _ = _remap_classification_qpos(
+        observation.qpos, open_threshold=open_threshold, open_value=open_value,
+    )
+    discrete = discretize_state_qpos(mapped_h100[np.linspace(0, 99, 11, dtype=np.int64)], stats)
     prompt = build_phase_prompt(
         instruction=args.instruction,
         tactile_caption=observation.tactile_caption,
@@ -335,7 +364,7 @@ def _run_phase_assessment(
     )
     payload = runtime.build_payload(
         mode="phase", img_front_bgr=observation.img_front,
-        img_left_bgr=observation.img_left, qpos=observation.qpos,
+        img_left_bgr=observation.img_left, qpos=mapped_current_qpos,
         state_history=None, state_history_mask=None, prompt=prompt,
     )
     payload.update({
@@ -528,6 +557,15 @@ def run_v7_7_async(
             ) if wait else phase_future.result())
             phase_future = None
             logger.record(_phase_result_log(result, handled_step=published_steps))
+            if result.phase == "adjustment":
+                adjustment_probs = np.asarray(
+                    result.decision.get("adjustment_end_probs"), dtype=np.float64,
+                ).reshape(-1).tolist()
+                print(
+                    "[ADJUSTMENT_END] "
+                    f"result={result.triggered} probs={adjustment_probs} "
+                    f"threshold={float(action_metadata['adjustment_end_threshold']):g}"
+                )
             active_phase, active_attempt, _, active_generation, _ = gate.snapshot()
             if (result.phase, result.attempt_id, result.generation) != (
                 active_phase, active_attempt, active_generation
@@ -749,6 +787,16 @@ def get_arguments(argv: list[str] | None = None) -> tuple[argparse.Namespace, ar
     parser.add_argument("--no-publish", action="store_true")
     parser.add_argument("--gripper_offset", type=float, default=0.001)
     parser.add_argument("--gripper-min", dest="gripper_min", type=float, required=True)
+    parser.add_argument(
+        "--classification-gripper-open-threshold",
+        type=float,
+        help="Phase-model qpos[6] values above this threshold are replaced",
+    )
+    parser.add_argument(
+        "--classification-gripper-open-value",
+        type=float,
+        help="Replacement value for open-gripper qpos[6] in phase-model inputs",
+    )
     args = parser.parse_args(argv)
     return args, parser
 
@@ -778,6 +826,19 @@ def validate_args(args: argparse.Namespace, parser: argparse.ArgumentParser) -> 
         parser.error("--gripper_offset must be finite and non-negative")
     if not np.isfinite(args.gripper_min) or not 0.0 <= args.gripper_min <= 0.08:
         parser.error("--gripper-min must be finite and in [0,0.08]")
+    threshold = args.classification_gripper_open_threshold
+    value = args.classification_gripper_open_value
+    if (threshold is None) != (value is None):
+        parser.error(
+            "--classification-gripper-open-threshold and "
+            "--classification-gripper-open-value must be provided together"
+        )
+    if threshold is not None and (
+        not np.isfinite(threshold)
+        or not np.isfinite(value)
+        or not 0.0 <= threshold <= value <= 0.2
+    ):
+        parser.error("classification gripper mapping requires 0 <= threshold <= value <= 0.2")
     if len(args.success_key) != 1 or len(args.quit_key) != 1 or args.success_key == args.quit_key:
         parser.error("success/quit keys must be distinct single characters")
 
@@ -800,6 +861,12 @@ def main() -> None:
         trial_id = f"{trial_id}_{time.strftime('%Y%m%d_%H%M%S')}"
     logger = v52.TrialLogger(args.log_dir, trial_id=trial_id)
     print(f"Trial log directory: {logger.directory}")
+    if args.classification_gripper_open_threshold is not None:
+        print(
+            "Classification gripper remapping enabled for current qpos and H100: "
+            f"qpos[6]>{args.classification_gripper_open_threshold:.6f} -> "
+            f"{args.classification_gripper_open_value:.6f}."
+        )
     try:
         if not args.start_immediately:
             input("Press enter to start V7.7 EXECUTION")

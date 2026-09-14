@@ -24,6 +24,7 @@ sys.path[:0] = [str(PROJECT_ROOT), str(PROJECT_ROOT / "src"),
 import jax
 import jax.numpy as jnp
 import numpy as np
+import orbax.checkpoint as ocp
 import websockets
 import websockets.asyncio.server as ws_server
 import websockets.frames
@@ -34,6 +35,38 @@ from tactile_vla.vla.v7_7_multitask_data import DATA_PROFILE
 from tactile_vla.vla.v7_7_multitask_model import V77MultitaskModel
 from tactile_vla.vla.v7_7_phase_prompt import PROMPT_PROFILE
 from scripts import serve_tactile_vla_policy_v3 as v3
+
+
+def _restore_exported_full_params(path: Path, **_unused_restore_options):
+    """Restore the raw parameter tree written by the V7.7 export hook."""
+
+    path = Path(path).expanduser().resolve()
+    if path.name != "full_params":
+        raise ValueError(f"V7.7 deployment requires a full_params export, got: {path}")
+    if not path.is_dir():
+        raise FileNotFoundError(path)
+    devices = jax.devices()
+    if not devices:
+        raise RuntimeError("No JAX device is available for V7.7 checkpoint restore")
+    inference_sharding = jax.sharding.SingleDeviceSharding(devices[0])
+    with ocp.PyTreeCheckpointer() as checkpointer:
+        metadata = checkpointer.metadata(path)
+        restored = checkpointer.restore(
+            path,
+            ocp.args.PyTreeRestore(
+                item=metadata,
+                restore_args=jax.tree.map(
+                    lambda _: ocp.ArrayRestoreArgs(
+                        sharding=inference_sharding,
+                        restore_type=jax.Array,
+                    ),
+                    metadata,
+                ),
+            ),
+        )
+    if not isinstance(restored, dict) or not restored:
+        raise ValueError(f"Invalid V7.7 full parameter tree: {path}")
+    return restored
 
 
 def parse_args():
@@ -64,16 +97,19 @@ class V77Policy(v3.TactileVLAPolicyV3):
             raise ValueError("V7.7 deployment requires the no-history Action Expert")
         old = v3.StageBV3Model
         old_prompt_loader = v3.load_checkpoint_prompt_profile
+        old_restore_params = v3.openpi_model.restore_params
         requested_need_threshold = args.need_recovery_threshold
         if args.need_recovery_threshold is None:
             args.need_recovery_threshold = float(config.get("thresholds", {}).get("need_recovery", 0.5))
         v3.StageBV3Model = V77MultitaskModel
         v3.load_checkpoint_prompt_profile = lambda _config: PROMPT_PROFILE
+        v3.openpi_model.restore_params = _restore_exported_full_params
         try:
             super().__init__(args=args, config=config, model_config=model_config, norm_stats=norm_stats)
         finally:
             v3.StageBV3Model = old
             v3.load_checkpoint_prompt_profile = old_prompt_loader
+            v3.openpi_model.restore_params = old_restore_params
         self._adjustment_logits = nnx_utils.module_jit(self._model.adjustment_end_logits)
         thresholds = config.get("thresholds", {})
         self._need_threshold = float(
@@ -207,6 +243,11 @@ class StreamingPolicyServer:
 
 
 def main():
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        force=True,
+    )
     args = parse_args()
     config = v3._find_config(args.checkpoint)
     if (args.checkpoint / "full_params").is_dir():

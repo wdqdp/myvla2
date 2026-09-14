@@ -64,7 +64,7 @@ class AsyncPhaseState:
         # Hold remains latched until a fresh chunk for the new generation is ready.
 
     def release_hold_with_fresh_actions(self, generation: int, actions) -> bool:
-        if int(generation) != self.action_generation or not actions:
+        if int(generation) != self.action_generation or actions is None or len(actions) == 0:
             return False
         self.pending_actions = list(actions)
         self.stop_latched = False
