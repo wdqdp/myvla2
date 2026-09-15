@@ -29,17 +29,19 @@ from tactile_vla.vla.structured_text import legal_recovery_plans
 from tactile_vla.vla.artifacts import sha256_file
 from tactile_vla.vla.v4_data import V4_NEED_SCHEMA
 from tactile_vla.vla.v4_data import V4_REASONING_SCHEMA
+from tactile_vla.vla.v4_data import memory_plan_matches_prefix
+from tactile_vla.vla.v4_data import validate_grasp_memory
 
 
 StageName = Literal["execution", "status", "reasoning"]
 V3StageBTask = Literal["need_recovery", "failure_reason"]
 V4StageBTask = Literal["need", "failure", "plan"]
 _V4_FAILURE_RE = re.compile(
-    r"^failure_reason=rotate (right|left|front|back),grasp appropriate\.$"
+    r"^failure_reason=rotate (none|right|left|front|back),grasp (appropriate|missing|too_high|too_low)\.$"
 )
 _V4_PLAN_RE = re.compile(
-    r"^recovery_plan=move horizontally (right|left|front|back) "
-    r"(slightly|moderately), move vertically none moderately\.$"
+    r"^recovery_plan=move horizontally (none|right|left|front|back) "
+    r"(slightly|moderately|significantly), move vertically (none|up|down) moderately\.$"
 )
 
 
@@ -743,16 +745,23 @@ class V4DirectManifestDataset(torch.utils.data.Dataset):
                     if target not in legal_recovery_plans():
                         raise ValueError(f"V4 plan row {row_index} target is outside full V3 grammar")
                     target_match = _V4_PLAN_RE.fullmatch(target)
+                    grasp_recovery = validate_grasp_memory(row)
                     if target_match is None:
                         raise ValueError(f"V4 plan row {row_index} target is outside the rotation subset")
                     memory = row.get("failure_recovery_memory")
                     if not isinstance(memory, list) or len(memory) != int(row.get("memory_length", -1)):
                         raise ValueError(f"V4 plan row {row_index} has invalid memory length")
-                    if not 1 <= len(memory) <= 4:
-                        raise ValueError(f"V4 plan row {row_index} memory length is outside [1,4]")
-                    if (target_match.group(2) == "moderately" and len(memory) != 1) or (
-                        target_match.group(2) == "slightly" and len(memory) not in {2, 3, 4}
-                    ):
+                    if not 1 <= len(memory) <= 5:
+                        raise ValueError(f"V4 plan row {row_index} memory length is outside [1,5]")
+                    if (
+                        not grasp_recovery
+                        and target_match.group(2) == "moderately"
+                        and len(memory) != 1
+                    ) or (
+                        not grasp_recovery
+                        and target_match.group(2) == "slightly"
+                        and len(memory) not in {2, 3, 4, 5}
+                    ) or (grasp_recovery and len(memory) not in {2, 3, 4, 5}):
                         raise ValueError(f"V4 plan row {row_index} target/memory length mismatch")
                     variant_id = str(row.get("variant_id", ""))
                     rule_version = str(row.get("rule_version", ""))
@@ -781,19 +790,21 @@ class V4DirectManifestDataset(torch.utils.data.Dataset):
                             if plan_text != "initial plan":
                                 raise ValueError(f"V4 plan row {row_index} first pair is not initial plan")
                         else:
-                            pair_plan = _V4_PLAN_RE.fullmatch(plan_text)
-                            expected_magnitude = "moderately" if pair_index == 1 else "slightly"
-                            if (
-                                pair_plan is None
-                                or pair_plan.group(1) != failure_directions[pair_index - 1]
-                                or pair_plan.group(2) != expected_magnitude
-                            ):
+                            if not memory_plan_matches_prefix(memory, pair_index):
                                 raise ValueError(f"V4 plan row {row_index} memory chain is incompatible")
                     real_failure = str(observation.get("failure_reason", ""))
                     if str(memory[-1]["failure_reason"]) != real_failure:
                         raise ValueError(f"V4 plan row {row_index} terminal failure differs from observation")
-                    if target_match.group(1) != failure_directions[-1]:
-                        raise ValueError(f"V4 plan row {row_index} target direction differs from terminal failure")
+                    if not grasp_recovery:
+                        rotation_count = sum(direction != "none" for direction in failure_directions)
+                        expected_magnitude = "moderately" if rotation_count == 1 else "slightly"
+                        if (
+                            target_match.group(1) != failure_directions[-1]
+                            or target_match.group(2) != expected_magnitude
+                        ):
+                            raise ValueError(
+                                f"V4 plan row {row_index} target differs from terminal rotation history"
+                            )
                     target_source = row.get("target_source")
                     if not isinstance(target_source, Mapping) or target_source.get("source_type") != "real":
                         raise ValueError(f"V4 plan row {row_index} target is not real")

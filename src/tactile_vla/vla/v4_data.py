@@ -446,10 +446,59 @@ def build_need_rows(
 
 
 _PLAN_RE = re.compile(
-    r"^recovery_plan=move horizontally (right|left|front|back) (slightly|moderately), "
-    r"move vertically none moderately\.$"
+    r"^recovery_plan=move horizontally (none|right|left|front|back) (slightly|moderately|significantly), "
+    r"move vertically (none|up|down) moderately\.$"
 )
-_FAILURE_RE = re.compile(r"^failure_reason=rotate (right|left|front|back),grasp appropriate\.$")
+_FAILURE_RE = re.compile(r"^failure_reason=rotate (none|right|left|front|back),grasp (appropriate|missing|too_high|too_low)\.$")
+
+
+def validate_grasp_memory(row: Mapping[str, Any]) -> bool:
+    """Validate the real target against its terminal failure category."""
+    reason = str(row["current_observation"]["failure_reason"])
+    failure = _FAILURE_RE.fullmatch(reason)
+    if failure is None:
+        raise ValueError("Invalid failure grammar")
+    if failure.group(2) == "appropriate":
+        rotation_target = _PLAN_RE.fullmatch(str(row.get("target_recovery_plan", "")))
+        if (failure.group(1) == "none" or rotation_target is None
+                or rotation_target.group(1) != failure.group(1)
+                or rotation_target.group(2) not in {"slightly", "moderately"}
+                or rotation_target.group(3) != "none"):
+            raise ValueError("Pure rotation recovery must retain the rotation-only semantics")
+        return False
+    target = _PLAN_RE.fullmatch(str(row.get("target_recovery_plan", "")))
+    if target is None:
+        raise ValueError("Grasp recovery target has invalid grammar")
+    grasp = failure.group(2)
+    if grasp in {"too_high", "too_low"}:
+        if target.group(3) != {"too_high": "down", "too_low": "up"}[grasp]:
+            raise ValueError("Vertical recovery does not match the grasp failure")
+        if target.group(2) == "significantly":
+            raise ValueError("Significant horizontal recovery is reserved for missing grasp")
+    elif target.group(1) == "none" or target.group(2) != "significantly" or target.group(3) != "none":
+        raise ValueError("Missing grasp requires a significant horizontal recovery")
+    return True
+
+
+def memory_plan_matches_prefix(memory: Sequence[Mapping[str, Any]], pair_index: int) -> bool:
+    """Check that one synthetic plan responds to the preceding failure."""
+    plan = _PLAN_RE.fullmatch(str(memory[pair_index]["recovery_plan"]))
+    previous = _FAILURE_RE.fullmatch(str(memory[pair_index - 1]["failure_reason"]))
+    if plan is None or previous is None:
+        return False
+    rotation, grasp = previous.group(1), previous.group(2)
+    if grasp == "too_high":
+        return plan.groups() == ("none", "moderately", "down")
+    if grasp == "too_low":
+        return plan.groups() == ("none", "moderately", "up")
+    if grasp == "missing":
+        return plan.group(1) != "none" and plan.group(2) == "significantly" and plan.group(3) == "none"
+    rotation_count = sum(
+        _FAILURE_RE.fullmatch(str(pair["failure_reason"])).group(1) != "none"
+        for pair in memory[:pair_index]
+    )
+    magnitude = "moderately" if rotation_count == 1 else "slightly"
+    return plan.groups() == (rotation, magnitude, "none")
 
 
 def validate_direct_manifest_rows(
@@ -512,12 +561,13 @@ def validate_direct_manifest_rows(
                 raise ValueError(f"plan row {row_number} target outside V4/full-V3 grammar")
             memory = row.get("failure_recovery_memory")
             length = int(row.get("memory_length", -1))
-            if not isinstance(memory, list) or len(memory) != length or not 1 <= length <= 4:
+            if not isinstance(memory, list) or len(memory) != length or not 1 <= length <= 5:
                 raise ValueError(f"plan row {row_number} has invalid memory length")
             magnitude = match.group(2)
-            if (magnitude == "moderately" and length != 1) or (
-                magnitude == "slightly" and length not in {2, 3, 4}
-            ):
+            grasp_recovery = validate_grasp_memory(row)
+            if (not grasp_recovery and magnitude == "moderately" and length != 1) or (
+                not grasp_recovery and magnitude == "slightly" and length not in {2, 3, 4, 5}
+            ) or (grasp_recovery and length not in {2, 3, 4, 5}):
                 raise ValueError(f"plan row {row_number} target/memory length mismatch")
             variant_id = str(row.get("variant_id", ""))
             rule_version = str(row.get("rule_version", ""))
@@ -550,19 +600,15 @@ def validate_direct_manifest_rows(
                 assert failure_match is not None
                 failure_directions.append(failure_match.group(1))
             for pair_index in range(1, length):
-                pair_plan_match = _PLAN_RE.fullmatch(str(memory[pair_index]["recovery_plan"]))
-                if pair_plan_match is None:
-                    raise ValueError(f"plan row {row_number} pair plan is outside V4 rotation subset")
-                expected_magnitude = "moderately" if pair_index == 1 else "slightly"
-                if (
-                    pair_plan_match.group(1) != failure_directions[pair_index - 1]
-                    or pair_plan_match.group(2) != expected_magnitude
-                ):
+                if not memory_plan_matches_prefix(memory, pair_index):
                     raise ValueError(f"plan row {row_number} synthetic memory chain is incompatible")
             if str(memory[-1]["failure_reason"]) != real_failure:
                 raise ValueError(f"plan row {row_number} terminal failure differs from observation")
-            if match.group(1) != failure_directions[-1]:
-                raise ValueError(f"plan row {row_number} target direction differs from terminal failure")
+            if not grasp_recovery:
+                rotation_count = sum(direction != "none" for direction in failure_directions)
+                expected_magnitude = "moderately" if rotation_count == 1 else "slightly"
+                if match.group(1) != failure_directions[-1] or match.group(2) != expected_magnitude:
+                    raise ValueError(f"plan row {row_number} target differs from terminal rotation history")
             source = row.get("target_source")
             if not isinstance(source, Mapping) or source.get("source_type") != "real":
                 raise ValueError(f"plan row {row_number} target is not real")
