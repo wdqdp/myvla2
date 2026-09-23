@@ -210,6 +210,88 @@ def test_stage_a_v7_3_requires_phase_pure_profile_and_no_history(
         module.validate_v4_training_protocol(args)
 
 
+def test_stage_a_v8_1_reuses_v7_4_no_history_protocol(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_script()
+    monkeypatch.setattr(module, "DEFAULT_BASE_CHECKPOINT", Path("/models/pi05_base/params"))
+    args = _v4_stage_a_protocol_args(
+        data_profile="rotation_phase_v8_1_adjustment",
+        prompt_profile="phase_v2",
+        experiment_kind=(
+            "phase_prompt_h30_v7_4_policy_refreshed_small_grasp_equal_boundaries"
+        ),
+        use_state_history=False,
+        state_history_len=0,
+        history_hidden_dim=0,
+        no_norm=False,
+    )
+
+    module.validate_v5_args(args)
+    module.validate_v4_training_protocol(args)
+    protocol_name, protocol = module.selected_stage_a_protocol(args)
+    assert protocol_name == "v8_1_no_state_history"
+    assert protocol == module.V7_4_STAGE_A_PROTOCOL
+
+    args.use_state_history = True
+    args.state_history_len = 60
+    args.history_hidden_dim = 256
+    with pytest.raises(ValueError, match="protocol mismatch"):
+        module.validate_v4_training_protocol(args)
+
+
+def test_stage_a_v8_2_reuses_v7_4_no_history_protocol(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_script()
+    monkeypatch.setattr(module, "DEFAULT_BASE_CHECKPOINT", Path("/models/pi05_base/params"))
+    args = _v4_stage_a_protocol_args(
+        data_profile="rotation_phase_v8_2_adjustment",
+        prompt_profile="phase_v2",
+        experiment_kind=(
+            "phase_prompt_h30_v7_4_policy_detected_small_grasp_boundaries"
+        ),
+        use_state_history=False,
+        state_history_len=0,
+        history_hidden_dim=0,
+        no_norm=False,
+    )
+
+    module.validate_v5_args(args)
+    module.validate_v4_training_protocol(args)
+    protocol_name, protocol = module.selected_stage_a_protocol(args)
+    assert protocol_name == "v8_2_no_state_history"
+    assert protocol == module.V7_4_STAGE_A_PROTOCOL
+
+    args.use_state_history = True
+    args.state_history_len = 60
+    args.history_hidden_dim = 256
+    with pytest.raises(ValueError, match="protocol mismatch"):
+        module.validate_v4_training_protocol(args)
+
+
+def test_stage_a_v8_3_reuses_v7_4_no_history_protocol(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_script()
+    monkeypatch.setattr(module, "DEFAULT_BASE_CHECKPOINT", Path("/models/pi05_base/params"))
+    args = _v4_stage_a_protocol_args(
+        data_profile="rotation_phase_v8_3_adjustment",
+        prompt_profile="phase_v2",
+        experiment_kind="phase_prompt_h30_short_small_grasp_descent_time_warp",
+        use_state_history=False,
+        state_history_len=0,
+        history_hidden_dim=0,
+        no_norm=False,
+    )
+
+    module.validate_v5_args(args)
+    module.validate_v4_training_protocol(args)
+    protocol_name, protocol = module.selected_stage_a_protocol(args)
+    assert protocol_name == "v8_3_no_state_history"
+    assert protocol == module.V7_4_STAGE_A_PROTOCOL
+
+
 def test_stage_a_v4_requires_existing_dedicated_index_and_validates_dataset(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

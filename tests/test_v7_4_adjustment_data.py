@@ -70,6 +70,18 @@ def test_h30_ending_at_gripper_stop_does_not_need_rewrite() -> None:
     )
 
 
+def test_equal_gripper_stop_and_arm_start_has_no_idle_gap() -> None:
+    assert (
+        compressed_h30_offsets(
+            start_frame=0,
+            gripper_motion_stop=0,
+            arm_adjustment_start=0,
+            action_horizon=30,
+        )
+        is None
+    )
+
+
 def test_policy_modifies_only_trainable_attempt2_window() -> None:
     rows = [_row(70), _row(71), _row(90), _row(100), _row(101), _row(95, trainable=False)]
     transformed, modifications = apply_v7_4_target_policy(

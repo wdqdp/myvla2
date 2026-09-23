@@ -335,6 +335,20 @@ class TactileVLAFrameDataset(torch.utils.data.Dataset):
                 for global_index in self.indices:
                     phase_row = self.action_phase_by_global_index.get(global_index, {})
                     target_offsets = phase_row.get("action_target_offsets")
+                    target_values = phase_row.get("action_target_values")
+                    if target_offsets is not None and target_values is not None:
+                        raise ValueError(
+                            "An action target may use offsets or explicit values, not both: "
+                            f"global_index={global_index}"
+                        )
+                    if target_values is not None:
+                        values = np.asarray(target_values, dtype=np.float32)
+                        if values.shape != (action_horizon, 7) or not np.isfinite(values).all():
+                            raise ValueError(
+                                "Invalid action_target_values at "
+                                f"global_index={global_index}: shape={values.shape}"
+                            )
+                        continue
                     if target_offsets is None:
                         continue
                     offsets = [int(offset) for offset in target_offsets]
@@ -475,14 +489,18 @@ class TactileVLAFrameDataset(torch.utils.data.Dataset):
         if self.stage == "execution":
             terminal_hold_from_offset = None
             action_target_offsets = None
+            action_target_values = None
             phase_lookup = getattr(self, "action_phase_by_global_index", None)
             if phase_lookup is not None:
                 phase_row = phase_lookup.get(result["global_index"])
                 if phase_row is not None:
                     terminal_hold_from_offset = phase_row.get("terminal_hold_from_offset")
                     action_target_offsets = phase_row.get("action_target_offsets")
+                    action_target_values = phase_row.get("action_target_values")
             actions = item["action"]
-            if action_target_offsets is not None:
+            if action_target_values is not None:
+                actions = np.asarray(action_target_values, dtype=np.float32)
+            elif action_target_offsets is not None:
                 actions = _to_numpy(actions)[np.asarray(action_target_offsets, dtype=np.int64)]
             else:
                 actions = actions[: self.action_horizon]

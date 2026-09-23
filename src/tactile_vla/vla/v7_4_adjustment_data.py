@@ -46,8 +46,13 @@ def compressed_h30_offsets(
 
     if action_horizon <= 0:
         raise ValueError("action_horizon must be positive")
-    if gripper_motion_stop >= arm_adjustment_start:
+    if gripper_motion_stop > arm_adjustment_start:
         raise ValueError("gripper_motion_stop must precede arm_adjustment_start")
+    if gripper_motion_stop == arm_adjustment_start:
+        # Some task families have no idle interval between the two annotated
+        # events.  Their original contiguous H30 is already the desired
+        # target, so there is nothing to compress.
+        return None
     if not gripper_motion_stop - (action_horizon - 1) <= start_frame <= gripper_motion_stop:
         return None
 

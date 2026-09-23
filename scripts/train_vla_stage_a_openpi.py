@@ -125,6 +125,18 @@ from tactile_vla.vla.v7_4_adjustment_data import ROTATION_PHASE_V7_4_ADJUSTMENT
 from tactile_vla.vla.v7_4_adjustment_data import V7_4_EXPERIMENT_KIND
 from tactile_vla.vla.v7_4_adjustment_data import V7_4_TRAINING_INDEX_SCHEMA
 from tactile_vla.vla.v7_4_adjustment_data import validate_v7_4_adjustment_training_index
+from tactile_vla.vla.v8_1_adjustment_data import ROTATION_PHASE_V8_1_ADJUSTMENT
+from tactile_vla.vla.v8_1_adjustment_data import V8_1_EXPERIMENT_KIND
+from tactile_vla.vla.v8_1_adjustment_data import V8_1_TRAINING_INDEX_SCHEMA
+from tactile_vla.vla.v8_1_adjustment_data import validate_v8_1_adjustment_training_index
+from tactile_vla.vla.v8_2_adjustment_data import ROTATION_PHASE_V8_2_ADJUSTMENT
+from tactile_vla.vla.v8_2_adjustment_data import V8_2_EXPERIMENT_KIND
+from tactile_vla.vla.v8_2_adjustment_data import V8_2_TRAINING_INDEX_SCHEMA
+from tactile_vla.vla.v8_2_adjustment_data import validate_v8_2_adjustment_training_index
+from tactile_vla.vla.v8_3_adjustment_data import ROTATION_PHASE_V8_3_ADJUSTMENT
+from tactile_vla.vla.v8_3_adjustment_data import V8_3_EXPERIMENT_KIND
+from tactile_vla.vla.v8_3_adjustment_data import V8_3_TRAINING_INDEX_SCHEMA
+from tactile_vla.vla.v8_3_adjustment_data import validate_v8_3_adjustment_training_index
 
 
 PHASE_DATA_PROFILES = {
@@ -135,6 +147,9 @@ PHASE_DATA_PROFILES = {
     ROTATION_PHASE_V7_2_ADJUSTMENT,
     ROTATION_PHASE_V7_3_ADJUSTMENT,
     ROTATION_PHASE_V7_4_ADJUSTMENT,
+    ROTATION_PHASE_V8_1_ADJUSTMENT,
+    ROTATION_PHASE_V8_2_ADJUSTMENT,
+    ROTATION_PHASE_V8_3_ADJUSTMENT,
 }
 
 
@@ -220,6 +235,9 @@ def validate_v5_args(args: argparse.Namespace) -> None:
             ROTATION_PHASE_V7_2_ADJUSTMENT,
             ROTATION_PHASE_V7_3_ADJUSTMENT,
             ROTATION_PHASE_V7_4_ADJUSTMENT,
+            ROTATION_PHASE_V8_1_ADJUSTMENT,
+            ROTATION_PHASE_V8_2_ADJUSTMENT,
+            ROTATION_PHASE_V8_3_ADJUSTMENT,
         }
         else PHASE_PROMPT_PROFILE
     )
@@ -231,6 +249,9 @@ def validate_v5_args(args: argparse.Namespace) -> None:
         ROTATION_PHASE_V7_2_ADJUSTMENT: V7_2_EXPERIMENT_KIND,
         ROTATION_PHASE_V7_3_ADJUSTMENT: V7_3_EXPERIMENT_KIND,
         ROTATION_PHASE_V7_4_ADJUSTMENT: V7_4_EXPERIMENT_KIND,
+        ROTATION_PHASE_V8_1_ADJUSTMENT: V8_1_EXPERIMENT_KIND,
+        ROTATION_PHASE_V8_2_ADJUSTMENT: V8_2_EXPERIMENT_KIND,
+        ROTATION_PHASE_V8_3_ADJUSTMENT: V8_3_EXPERIMENT_KIND,
     }[args.data_profile]
     if args.prompt_profile != expected_prompt:
         raise ValueError(f"{args.data_profile} Stage A requires prompt_profile={expected_prompt!r}")
@@ -278,12 +299,24 @@ V7_3_STAGE_A_PROTOCOL_NAME = "v7_3_no_state_history"
 V7_3_STAGE_A_PROTOCOL = dict(V7_STAGE_A_PROTOCOL)
 V7_4_STAGE_A_PROTOCOL_NAME = "v7_4_no_state_history"
 V7_4_STAGE_A_PROTOCOL = dict(V7_STAGE_A_PROTOCOL)
+V8_1_STAGE_A_PROTOCOL_NAME = "v8_1_no_state_history"
+V8_1_STAGE_A_PROTOCOL = dict(V7_4_STAGE_A_PROTOCOL)
+V8_2_STAGE_A_PROTOCOL_NAME = "v8_2_no_state_history"
+V8_2_STAGE_A_PROTOCOL = dict(V7_4_STAGE_A_PROTOCOL)
+V8_3_STAGE_A_PROTOCOL_NAME = "v8_3_no_state_history"
+V8_3_STAGE_A_PROTOCOL = dict(V7_4_STAGE_A_PROTOCOL)
 
 
 def selected_stage_a_protocol(args: argparse.Namespace) -> tuple[str | None, dict[str, Any]]:
     """Resolve the pinned protocol without changing legacy V4/V5 behavior."""
     data_profile = getattr(args, "data_profile", None)
     use_state_history = bool(getattr(args, "use_state_history", True))
+    if data_profile == ROTATION_PHASE_V8_3_ADJUSTMENT:
+        return V8_3_STAGE_A_PROTOCOL_NAME, V8_3_STAGE_A_PROTOCOL
+    if data_profile == ROTATION_PHASE_V8_2_ADJUSTMENT:
+        return V8_2_STAGE_A_PROTOCOL_NAME, V8_2_STAGE_A_PROTOCOL
+    if data_profile == ROTATION_PHASE_V8_1_ADJUSTMENT:
+        return V8_1_STAGE_A_PROTOCOL_NAME, V8_1_STAGE_A_PROTOCOL
     if data_profile == ROTATION_PHASE_V7_4_ADJUSTMENT:
         return V7_4_STAGE_A_PROTOCOL_NAME, V7_4_STAGE_A_PROTOCOL
     if data_profile == ROTATION_PHASE_V7_3_ADJUSTMENT:
@@ -437,6 +470,33 @@ def ensure_index(args: argparse.Namespace) -> dict:
                 dataset_dir=args.dataset_dir,
             )
             args._v5_action_phase_lookup = lookup
+        elif args.data_profile == ROTATION_PHASE_V8_1_ADJUSTMENT:
+            if payload.get("schema_version") != V8_1_TRAINING_INDEX_SCHEMA:
+                raise ValueError("rotation_phase_v8_1_adjustment requires its dedicated V8.1 index")
+            _, lookup = validate_v8_1_adjustment_training_index(
+                payload,
+                index_path=args.index_file,
+                dataset_dir=args.dataset_dir,
+            )
+            args._v5_action_phase_lookup = lookup
+        elif args.data_profile == ROTATION_PHASE_V8_2_ADJUSTMENT:
+            if payload.get("schema_version") != V8_2_TRAINING_INDEX_SCHEMA:
+                raise ValueError("rotation_phase_v8_2_adjustment requires its dedicated V8.2 index")
+            _, lookup = validate_v8_2_adjustment_training_index(
+                payload,
+                index_path=args.index_file,
+                dataset_dir=args.dataset_dir,
+            )
+            args._v5_action_phase_lookup = lookup
+        elif args.data_profile == ROTATION_PHASE_V8_3_ADJUSTMENT:
+            if payload.get("schema_version") != V8_3_TRAINING_INDEX_SCHEMA:
+                raise ValueError("rotation_phase_v8_3_adjustment requires its dedicated V8.3 index")
+            _, lookup = validate_v8_3_adjustment_training_index(
+                payload,
+                index_path=args.index_file,
+                dataset_dir=args.dataset_dir,
+            )
+            args._v5_action_phase_lookup = lookup
         return payload
     if args.data_profile != LEGACY_DATA_PROFILE:
         raise FileNotFoundError(
@@ -481,6 +541,9 @@ def build_loader(
                 ROTATION_PHASE_V7_2_ADJUSTMENT: validate_v7_2_adjustment_training_index,
                 ROTATION_PHASE_V7_3_ADJUSTMENT: validate_v7_3_adjustment_training_index,
                 ROTATION_PHASE_V7_4_ADJUSTMENT: validate_v7_4_adjustment_training_index,
+                ROTATION_PHASE_V8_1_ADJUSTMENT: validate_v8_1_adjustment_training_index,
+                ROTATION_PHASE_V8_2_ADJUSTMENT: validate_v8_2_adjustment_training_index,
+                ROTATION_PHASE_V8_3_ADJUSTMENT: validate_v8_3_adjustment_training_index,
             }[args.data_profile]
             _, phase_lookup = validator(
                 payload, index_path=args.index_file, dataset_dir=args.dataset_dir

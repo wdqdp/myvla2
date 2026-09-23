@@ -66,6 +66,12 @@ from tactile_vla.vla.v7_3_adjustment_data import ROTATION_PHASE_V7_3_ADJUSTMENT
 from tactile_vla.vla.v7_3_adjustment_data import V7_3_EXPERIMENT_KIND
 from tactile_vla.vla.v7_4_adjustment_data import ROTATION_PHASE_V7_4_ADJUSTMENT
 from tactile_vla.vla.v7_4_adjustment_data import V7_4_EXPERIMENT_KIND
+from tactile_vla.vla.v8_1_adjustment_data import ROTATION_PHASE_V8_1_ADJUSTMENT
+from tactile_vla.vla.v8_1_adjustment_data import V8_1_EXPERIMENT_KIND
+from tactile_vla.vla.v8_2_adjustment_data import ROTATION_PHASE_V8_2_ADJUSTMENT
+from tactile_vla.vla.v8_2_adjustment_data import V8_2_EXPERIMENT_KIND
+from tactile_vla.vla.v8_3_adjustment_data import ROTATION_PHASE_V8_3_ADJUSTMENT
+from tactile_vla.vla.v8_3_adjustment_data import V8_3_EXPERIMENT_KIND
 
 
 ACTION_HORIZON = 30
@@ -77,6 +83,9 @@ V7_1_STAGE_A_PROTOCOL_NAME = "v7_1_no_state_history"
 V7_2_STAGE_A_PROTOCOL_NAME = "v7_2_no_state_history"
 V7_3_STAGE_A_PROTOCOL_NAME = "v7_3_no_state_history"
 V7_4_STAGE_A_PROTOCOL_NAME = "v7_4_no_state_history"
+V8_1_STAGE_A_PROTOCOL_NAME = "v8_1_no_state_history"
+V8_2_STAGE_A_PROTOCOL_NAME = "v8_2_no_state_history"
+V8_3_STAGE_A_PROTOCOL_NAME = "v8_3_no_state_history"
 
 PHASE_ACTION_PROFILES = {
     ROTATION_PHASE_V5: (PHASE_PROMPT_PROFILE, PHASE_EXPERIMENT_KIND),
@@ -103,6 +112,18 @@ PHASE_ACTION_PROFILES = {
     ROTATION_PHASE_V7_4_ADJUSTMENT: (
         PHASE_PROMPT_PROFILE_V2,
         V7_4_EXPERIMENT_KIND,
+    ),
+    ROTATION_PHASE_V8_1_ADJUSTMENT: (
+        PHASE_PROMPT_PROFILE_V2,
+        V8_1_EXPERIMENT_KIND,
+    ),
+    ROTATION_PHASE_V8_2_ADJUSTMENT: (
+        PHASE_PROMPT_PROFILE_V2,
+        V8_2_EXPERIMENT_KIND,
+    ),
+    ROTATION_PHASE_V8_3_ADJUSTMENT: (
+        PHASE_PROMPT_PROFILE_V2,
+        V8_3_EXPERIMENT_KIND,
     ),
 }
 VERSIONED_ACTION_PROFILES = {
@@ -317,6 +338,9 @@ def _model_config(args: argparse.Namespace, config: dict[str, Any]) -> Pi0Config
                 ROTATION_PHASE_V7_2_ADJUSTMENT: V7_2_STAGE_A_PROTOCOL_NAME,
                 ROTATION_PHASE_V7_3_ADJUSTMENT: V7_3_STAGE_A_PROTOCOL_NAME,
                 ROTATION_PHASE_V7_4_ADJUSTMENT: V7_4_STAGE_A_PROTOCOL_NAME,
+                ROTATION_PHASE_V8_1_ADJUSTMENT: V8_1_STAGE_A_PROTOCOL_NAME,
+                ROTATION_PHASE_V8_2_ADJUSTMENT: V8_2_STAGE_A_PROTOCOL_NAME,
+                ROTATION_PHASE_V8_3_ADJUSTMENT: V8_3_STAGE_A_PROTOCOL_NAME,
             }.get(config.get("data_profile"), V6_1_STAGE_A_PROTOCOL_NAME)
         )
         if config.get("stage_a_protocol") != expected_protocol:

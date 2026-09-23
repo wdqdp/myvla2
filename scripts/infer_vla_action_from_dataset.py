@@ -36,6 +36,7 @@ ACTION_HORIZON = 30
 OUTPUT_ACTION_DIM = 7
 ADJUSTMENT_DIRECTIONS = ("left", "right", "front", "back")
 ADJUSTMENT_DEGREES = ("slightly", "moderately")
+VERTICAL_DIRECTIONS = ("up", "down")
 DEFAULT_PIPER_URDF = (
     PROJECT_ROOT
     / "openpi/inference/agilex/Piper_ros_private-ros-noetic/"
@@ -108,6 +109,16 @@ def parse_args() -> argparse.Namespace:
         choices=ADJUSTMENT_DEGREES,
         help="Adjustment magnitude.",
     )
+    parser.add_argument(
+        "--vertical-direction",
+        choices=VERTICAL_DIRECTIONS,
+        help="Vertical adjustment direction; use with --vertical-degree.",
+    )
+    parser.add_argument(
+        "--vertical-degree",
+        choices=ADJUSTMENT_DEGREES,
+        help="Vertical adjustment magnitude.",
+    )
     parser.add_argument("--num-inference-steps", type=int, default=10)
     parser.add_argument("--noise-seed", type=int, default=0)
     parser.add_argument("--video-backend", default="pyav")
@@ -162,13 +173,31 @@ def find_checkpoint_config(checkpoint: Path) -> tuple[Path, dict[str, Any]]:
     raise FileNotFoundError(f"Cannot find config.json near checkpoint {checkpoint}")
 
 
-def validate_prompt_arguments(mode: str, direction: str | None, degree: str | None) -> None:
+def validate_prompt_arguments(
+    mode: str,
+    direction: str | None,
+    degree: str | None,
+    vertical_direction: str | None = None,
+    vertical_degree: str | None = None,
+) -> None:
     if mode == "adjustment":
-        if direction is None or degree is None:
-            raise ValueError("adjustment mode requires both --direction and --degree")
+        horizontal = direction is not None or degree is not None
+        vertical = vertical_direction is not None or vertical_degree is not None
+        if horizontal and (direction is None or degree is None):
+            raise ValueError("horizontal adjustment requires both --direction and --degree")
+        if vertical and (vertical_direction is None or vertical_degree is None):
+            raise ValueError(
+                "vertical adjustment requires both --vertical-direction and --vertical-degree"
+            )
+        if horizontal == vertical:
+            raise ValueError(
+                "adjustment mode requires exactly one horizontal or vertical adjustment"
+            )
         return
-    if direction is not None or degree is not None:
-        raise ValueError("--direction/--degree are only valid with --mode adjustment")
+    if any(value is not None for value in (direction, degree, vertical_direction, vertical_degree)):
+        raise ValueError(
+            "adjustment direction/degree arguments are only valid with --mode adjustment"
+        )
 
 
 def build_cli_prompt(
@@ -178,6 +207,8 @@ def build_cli_prompt(
     direction: str | None,
     degree: str | None,
     prompt_profile: str,
+    vertical_direction: str | None = None,
+    vertical_degree: str | None = None,
 ) -> tuple[str, str]:
     from tactile_vla.vla.prompts import build_phase_prompt
     from tactile_vla.vla.prompts import PHASE_PROMPT_PROFILE
@@ -185,7 +216,7 @@ def build_cli_prompt(
     from tactile_vla.vla.prompts import resolve_prompt_profile
     from tactile_vla.vla.structured_text import recovery_plan_text
 
-    validate_prompt_arguments(mode, direction, degree)
+    validate_prompt_arguments(mode, direction, degree, vertical_direction, vertical_degree)
     resolved_profile = resolve_prompt_profile(prompt_profile)
     if resolved_profile not in {PHASE_PROMPT_PROFILE, PHASE_PROMPT_PROFILE_V2}:
         raise ValueError(
@@ -193,7 +224,12 @@ def build_cli_prompt(
             f"got prompt_profile={resolved_profile!r}"
         )
     recovery_plan = (
-        recovery_plan_text(str(direction), str(degree), "none", "moderately")
+        recovery_plan_text(
+            direction or "none",
+            degree or "moderately",
+            vertical_direction or "none",
+            vertical_degree or "moderately",
+        )
         if mode == "adjustment"
         else "none"
     )
@@ -569,7 +605,13 @@ def describe_h30_cartesian_changes(
 def main() -> None:
     args = parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-    validate_prompt_arguments(args.mode, args.direction, args.degree)
+    validate_prompt_arguments(
+        args.mode,
+        args.direction,
+        args.degree,
+        args.vertical_direction,
+        args.vertical_degree,
+    )
     checkpoint = resolve_checkpoint(args.checkpoint)
     config_path, config = find_checkpoint_config(checkpoint)
     dataset_dir = (args.dataset_dir or Path(str(config.get("dataset_dir", "")))).expanduser().resolve()
@@ -607,6 +649,8 @@ def main() -> None:
         direction=args.direction,
         degree=args.degree,
         prompt_profile=str(config.get("prompt_profile", "")),
+        vertical_direction=args.vertical_direction,
+        vertical_degree=args.vertical_degree,
     )
     request["mode"] = "execution"
     request["prompt"] = prompt
@@ -663,6 +707,8 @@ def main() -> None:
         "mode": args.mode,
         "direction": args.direction,
         "degree": args.degree,
+        "vertical_direction": args.vertical_direction,
+        "vertical_degree": args.vertical_degree,
         "recovery_plan": recovery_plan,
         "prompt": prompt,
         "state_history": observation_summary["history"],

@@ -26,11 +26,15 @@ MODEL_ROOT = Path(
 @dataclass(frozen=True)
 class InferenceJob:
     gpu: int
-    direction: str
-    degree: str
+    direction: str | None = None
+    degree: str | None = None
+    vertical_direction: str | None = None
+    vertical_degree: str | None = None
 
     @property
     def name(self) -> str:
+        if self.vertical_direction is not None:
+            return f"{self.vertical_direction}_{self.vertical_degree}"
         return f"{self.direction}_{self.degree}"
 
 
@@ -42,9 +46,10 @@ JOBS = (
 )
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(*, description: str | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description=__doc__, formatter_class=argparse.ArgumentDefaultsHelpFormatter
+        description=description or __doc__,
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument("--episode", type=int, required=True, help="Original raw-data episode id.")
     parser.add_argument("--attempt", type=int, required=True, help="Attempt id within the episode.")
@@ -90,7 +95,7 @@ def build_command(
     timestamp: float,
     result_path: Path,
 ) -> list[str]:
-    return [
+    command = [
         sys.executable,
         str(INFERENCE_SCRIPT),
         "--checkpoint",
@@ -103,10 +108,6 @@ def build_command(
         repr(timestamp),
         "--mode",
         "adjustment",
-        "--direction",
-        job.direction,
-        "--degree",
-        job.degree,
         "--num-inference-steps",
         "10",
         "--noise-seed",
@@ -114,6 +115,18 @@ def build_command(
         "--output-json",
         str(result_path),
     ]
+    if job.vertical_direction is not None:
+        command.extend(
+            [
+                "--vertical-direction",
+                job.vertical_direction,
+                "--vertical-degree",
+                str(job.vertical_degree),
+            ]
+        )
+    else:
+        command.extend(["--direction", str(job.direction), "--degree", str(job.degree)])
+    return command
 
 
 def run_job(
@@ -171,39 +184,55 @@ def endpoint_change(result_path: Path) -> dict[str, Any]:
     return endpoint
 
 
-def main() -> None:
-    args = parse_args()
+def run_cli(
+    jobs: tuple[InferenceJob, ...],
+    *,
+    temporary_prefix: str,
+    description: str | None = None,
+) -> None:
+    args = parse_args(description=description)
     checkpoint = resolve_model_checkpoint(args.model)
-    with tempfile.TemporaryDirectory(prefix="vla_four_adjustments_") as temporary_dir:
+    with tempfile.TemporaryDirectory(prefix=temporary_prefix) as temporary_dir:
         temp_root = Path(temporary_dir)
-        result_paths = {job: temp_root / f"{job.name}.json" for job in JOBS}
+        result_paths = {job: temp_root / f"{job.name}.json" for job in jobs}
         failures: list[str] = []
-        with ThreadPoolExecutor(max_workers=len(JOBS)) as executor:
-            futures = {
-                executor.submit(
-                    run_job,
+
+        # Jobs on one GPU run serially, while different GPUs run concurrently.
+        # This lets the five-prompt wrapper reuse GPU 0 without loading two
+        # model copies on that device at once.
+        jobs_by_gpu: dict[int, list[InferenceJob]] = {}
+        for job in jobs:
+            jobs_by_gpu.setdefault(job.gpu, []).append(job)
+
+        def run_gpu_jobs(gpu_jobs: list[InferenceJob]) -> None:
+            for job in gpu_jobs:
+                run_job(
                     job,
                     checkpoint=checkpoint,
                     episode=args.episode,
                     attempt=args.attempt,
                     timestamp=args.timestamp,
                     result_path=result_paths[job],
-                ): job
-                for job in JOBS
+                )
+
+        with ThreadPoolExecutor(max_workers=len(jobs_by_gpu)) as executor:
+            futures = {
+                executor.submit(run_gpu_jobs, gpu_jobs): gpu_jobs
+                for gpu_jobs in jobs_by_gpu.values()
             }
             for future in as_completed(futures):
-                job = futures[future]
+                gpu_jobs = futures[future]
                 try:
                     future.result()
                 except Exception as error:
-                    failures.append(f"{job.name}: {error}")
+                    failures.append(f"GPU {gpu_jobs[0].gpu}: {error}")
         if failures:
             raise RuntimeError("One or more parallel inferences failed:\n" + "\n".join(failures))
 
         # Keep only H30's final target relative to the selected input frame.
         compact_output = {
             job.name: endpoint_change(result_paths[job])
-            for job in JOBS
+            for job in jobs
         }
 
     destination = args.output.expanduser().resolve()
@@ -213,6 +242,10 @@ def main() -> None:
         encoding="utf-8",
     )
     print(destination)
+
+
+def main() -> None:
+    run_cli(JOBS, temporary_prefix="vla_four_adjustments_")
 
 
 if __name__ == "__main__":

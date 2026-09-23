@@ -49,6 +49,27 @@ def test_adjustment_prompt_uses_cli_direction_and_degree() -> None:
     )
 
 
+def test_adjustment_prompt_supports_down_moderately() -> None:
+    prompt, plan = MODULE.build_cli_prompt(
+        mode="adjustment",
+        instruction="Pick up and transfer the object stably.",
+        direction=None,
+        degree=None,
+        vertical_direction="down",
+        vertical_degree="moderately",
+        prompt_profile="phase_v2",
+    )
+    assert plan == (
+        "recovery_plan=move horizontally none moderately, "
+        "move vertically down moderately."
+    )
+    assert prompt == (
+        "Mode: adjustment. Task: Pick up and transfer the object stably.\n"
+        "Put the object back, and follow this recovery plan: "
+        "recovery_plan=move horizontally none moderately, move vertically down moderately."
+    )
+
+
 def test_execution_prompt_has_no_adjustment_plan() -> None:
     prompt, plan = MODULE.build_cli_prompt(
         mode="execution",
