@@ -210,6 +210,37 @@ def test_stage_a_v7_3_requires_phase_pure_profile_and_no_history(
         module.validate_v4_training_protocol(args)
 
 
+def test_stage_a_v7_4_2_uses_v7_4_weights_and_10000_step_schedule(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_script()
+    checkpoint = Path("/models/v7_4/15000/params")
+    monkeypatch.setattr(module, "V7_4_2_SOURCE_CHECKPOINT", checkpoint)
+    args = _v4_stage_a_protocol_args(
+        data_profile="rotation_phase_v7_4_2_adjustment",
+        prompt_profile="phase_v2",
+        experiment_kind="phase_prompt_h30_offline_arm_adjustment_stop_raw_actions",
+        checkpoint=str(checkpoint),
+        num_steps=10_000,
+        lr=1e-5,
+        lr_final=1e-6,
+        lr_transition_steps=10_000,
+        use_state_history=False,
+        state_history_len=0,
+        history_hidden_dim=0,
+        no_norm=False,
+    )
+    module.validate_v5_args(args)
+    module.validate_v4_training_protocol(args)
+    assert module.selected_stage_a_protocol(args)[0] == "v7_4_2_finetune_no_state_history"
+    schedule = module.make_lr_schedule(args)
+    assert float(schedule(0)) == pytest.approx(1e-5)
+    assert float(schedule(5000)) == pytest.approx(5.5e-6)
+    assert float(schedule(10000)) == pytest.approx(1e-6)
+    with pytest.raises(ValueError, match="protocol mismatch"):
+        module.validate_v4_training_protocol(SimpleNamespace(**(vars(args) | {"num_steps": 9999})))
+
+
 def test_stage_a_v4_requires_existing_dedicated_index_and_validates_dataset(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

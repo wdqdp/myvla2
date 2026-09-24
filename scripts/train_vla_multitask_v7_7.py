@@ -38,15 +38,18 @@ ROOT = Path("/data1/qxh/tac_vla_new/tac_data/demon_data/black_box")
 DEFAULT_INDEX = ROOT / "outputs/rotation_v7_7_multitask/v7_7_multitask_training_index.json"
 DEFAULT_STAGE_A = ROOT / "outputs/stage_a_action/pi05_delta_tac_rotation_phase_v7_4_no_history/15000"
 DEFAULT_OUTPUT = ROOT / "outputs/multitask_v7_7"
+DEFAULT_DATASET = ROOT / "lerobot_data/tactile_vla_rotation_v4"
+DEFAULT_NORM_STATS = ROOT / "outputs/rotation_v4/norm_stats"
 RUN_NAME = "pi05_rotation_v7_7_five_task_h100_no_history"
+VERSION_TAG = "v7_7"
 _ARGS = None
 
 
 def parse_args():
     # Reuse the mature CLI, then pin/add V7.7 defaults before it is parsed.
     defaults = {
-        "--dataset-dir": str(ROOT / "lerobot_data/tactile_vla_rotation_v4"),
-        "--index-file": str(DEFAULT_INDEX), "--norm-stats-dir": str(ROOT / "outputs/rotation_v4/norm_stats"),
+        "--dataset-dir": str(DEFAULT_DATASET),
+        "--index-file": str(DEFAULT_INDEX), "--norm-stats-dir": str(DEFAULT_NORM_STATS),
         "--stage-a-checkpoint": str(DEFAULT_STAGE_A), "--output-dir": str(DEFAULT_OUTPUT),
         "--run-name": RUN_NAME, "--data-profile": DATA_PROFILE, "--prompt-profile": PROMPT_PROFILE,
         "--batch-size": "8", "--num-steps": "20000", "--eval-interval": "1000",
@@ -71,7 +74,13 @@ def ensure_index(args):
     index = json.loads(args.index_file.read_text())
     validate_index(index)
     if Path(index["stage_a_checkpoint"]).resolve() != args.stage_a_checkpoint.resolve():
-        raise ValueError("V7.7 index was built for a different V7.4 Stage-A checkpoint")
+        raise ValueError("multitask index was built for a different Stage-A checkpoint")
+    if Path(index["dataset_dir"]).resolve() != args.dataset_dir.resolve():
+        raise ValueError("multitask index was built for a different LeRobot dataset")
+    norm_file = (args.norm_stats_dir / "norm_stats.json").resolve()
+    expected_norm_hash = index.get("source_hashes", {}).get(str(norm_file))
+    if expected_norm_hash is None or sha256_file(norm_file) != expected_norm_hash:
+        raise ValueError("multitask index and norm stats differ")
     return index, scan_v4_lerobot_frames(args.dataset_dir)
 
 
@@ -80,9 +89,9 @@ def identity(index, **_):
     config_path, config = base._find_checkpoint_config(_ARGS.stage_a_checkpoint)
     result = checkpoint_artifact_identity(config)
     result.update({
-        "v7_7_training_data_hash": index["training_data_hash"],
-        "v7_7_index_sha256": sha256_file(_ARGS.index_file),
-        "v7_7_prompt_profile": PROMPT_PROFILE,
+        f"{VERSION_TAG}_training_data_hash": index["training_data_hash"],
+        f"{VERSION_TAG}_index_sha256": sha256_file(_ARGS.index_file),
+        f"{VERSION_TAG}_prompt_profile": PROMPT_PROFILE,
     })
     return result
 
@@ -101,15 +110,20 @@ def build_loaders(args, model_config, index, records, tokenizer, failure_codec, 
     _, phase_lookup = validate_v7_4_adjustment_training_index(
         action_index, index_path=Path(index["action_index_file"]), dataset_dir=args.dataset_dir
     )
-    max_offset = max(args.action_horizon - 1, *(int(row["action_target_offsets"][-1])
-        for row in phase_lookup.values() if row.get("action_target_offsets")))
+    max_offset = max(
+        [args.action_horizon - 1] + [
+            int(row["action_target_offsets"][-1])
+            for row in phase_lookup.values() if row.get("action_target_offsets")
+        ]
+    )
+    dataset_repo_id = args.dataset_dir.name
     shared = LeRobotDataset(
-        "tactile_vla_rotation_v4", root=args.dataset_dir,
+        dataset_repo_id, root=args.dataset_dir,
         delta_timestamps={"action": [step / 30.0 for step in range(max_offset + 1)]},
         download_videos=False, video_backend=args.video_backend,
     )
     plain_shared = LeRobotDataset(
-        "tactile_vla_rotation_v4", root=args.dataset_dir, download_videos=False,
+        dataset_repo_id, root=args.dataset_dir, download_videos=False,
         video_backend=args.video_backend,
     )
     action_transform = build_transform(
@@ -135,7 +149,7 @@ def build_loaders(args, model_config, index, records, tokenizer, failure_codec, 
             dataset_dir=args.dataset_dir, indices=split_index["action"]["indices"], stage="execution",
             action_horizon=args.action_horizon, state_history_len=0, video_backend=args.video_backend,
             prompt_profile="phase_v2", action_phase_by_global_index=phase_lookup,
-            dataset_repo_id="tactile_vla_rotation_v4", lerobot_dataset=shared,
+            dataset_repo_id=dataset_repo_id, lerobot_dataset=shared,
         )
         output[split]["action"] = base._loader(
             TransformedTactileVLADataset(action_raw, action_transform), batch_size=args.batch_size,
@@ -172,7 +186,7 @@ def export_checkpoint(run_dir, state, step, filter_):
         metadata["exports"][name] = {
             "path": str(path.resolve()), "parameter_tree_sha256": parameter_tree_sha256(source_state)
         }
-    (step_dir / "v7_7_export.json").write_text(json.dumps(metadata, indent=2) + "\n")
+    (step_dir / f"{VERSION_TAG}_export.json").write_text(json.dumps(metadata, indent=2) + "\n")
 
 
 def configure():
@@ -194,7 +208,7 @@ def configure():
         "norm_stats_sha256": sha256_file(Path(path).parent / "norm_stats.json")
     }
     base.validate_reasoning_manifests = lambda *args, **kwargs: {
-        "v7_7_training_data_hash": json.loads(_ARGS.index_file.read_text())["training_data_hash"]
+        f"{VERSION_TAG}_training_data_hash": json.loads(_ARGS.index_file.read_text())["training_data_hash"]
     }
     base.validate_stage_a_checkpoint_step = lambda profile, checkpoint: int(Path(checkpoint).name)
     base.resolve_prompt_profile = lambda value: value

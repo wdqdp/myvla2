@@ -27,6 +27,8 @@ ROTATION_V7_3_ADJUSTMENT_DATA_PROFILE = "rotation_phase_v7_3_adjustment"
 ROTATION_V7_3_ADJUSTMENT_INDEX_SCHEMA = "tactile_vla_v7_3_adjustment_training_index_v1"
 ROTATION_V7_4_ADJUSTMENT_DATA_PROFILE = "rotation_phase_v7_4_adjustment"
 ROTATION_V7_4_ADJUSTMENT_INDEX_SCHEMA = "tactile_vla_v7_4_adjustment_training_index_v1"
+ROTATION_V7_4_2_ADJUSTMENT_DATA_PROFILE = "rotation_phase_v7_4_2_adjustment"
+ROTATION_V7_4_2_ADJUSTMENT_INDEX_SCHEMA = "tactile_vla_v7_4_2_adjustment_training_index_v1"
 
 BASE_IDENTITY_KEYS = (
     "data_profile",
@@ -142,6 +144,20 @@ V7_3_ADJUSTMENT_IDENTITY_KEYS = (
 V7_4_ADJUSTMENT_IDENTITY_KEYS = V7_3_ADJUSTMENT_IDENTITY_KEYS + (
     "target_policy",
     "h30_modifications",
+)
+V7_4_2_ADJUSTMENT_IDENTITY_KEYS = (
+    "experiment_kind",
+    "target_policy",
+    "selection_hash",
+    "v4_profile_config_hash",
+    "training_data_hash",
+    "source_file_hashes",
+    "action_phase_manifest_identity",
+    "candidate_action_indices_identity",
+    "boundary_identity",
+    "v4_training_data_hash",
+    "v4_lerobot_identity",
+    "v4_norm_stats_sha256",
 )
 ALL_IDENTITY_KEYS = BASE_IDENTITY_KEYS + V4_IDENTITY_KEYS
 
@@ -533,6 +549,30 @@ def artifact_identity(
                 "source_file_hashes": hashes_only(source_files, version="V7.4"),
             }
         )
+    elif data_profile == ROTATION_V7_4_2_ADJUSTMENT_DATA_PROFILE:
+        if payload.get("schema_version") != ROTATION_V7_4_2_ADJUSTMENT_INDEX_SCHEMA:
+            raise ValueError("V7.4.2 requires its dedicated training index schema")
+        stored_training_hash = str(payload.get("training_data_hash", ""))
+        if stored_training_hash != sha256_json(
+            {key: value for key, value in payload.items() if key != "training_data_hash"}
+        ):
+            raise ValueError("V7.4.2 training_data_hash mismatch")
+        required = {
+            key: payload.get(key)
+            for key in V7_4_2_ADJUSTMENT_IDENTITY_KEYS
+            if key not in {"training_data_hash", "source_file_hashes"}
+        }
+        missing = sorted(key for key, value in required.items() if not value)
+        if missing:
+            raise ValueError(f"V7.4.2 index lacks identity fields: {missing}")
+        source_files = payload.get("source_files")
+        if not isinstance(source_files, Mapping) or not source_files:
+            raise ValueError("V7.4.2 index lacks source files")
+        identity.update({
+            **required,
+            "training_data_hash": stored_training_hash,
+            "source_file_hashes": hashes_only(source_files, version="V7.4.2"),
+        })
     return identity
 
 
@@ -559,6 +599,8 @@ def assert_identity_matches(
             keys = BASE_IDENTITY_KEYS + V7_3_ADJUSTMENT_IDENTITY_KEYS
         elif ROTATION_V7_4_ADJUSTMENT_DATA_PROFILE in profiles:
             keys = BASE_IDENTITY_KEYS + V7_4_ADJUSTMENT_IDENTITY_KEYS
+        elif ROTATION_V7_4_2_ADJUSTMENT_DATA_PROFILE in profiles:
+            keys = BASE_IDENTITY_KEYS + V7_4_2_ADJUSTMENT_IDENTITY_KEYS
         elif ROTATION_V5_DATA_PROFILE in profiles:
             keys = BASE_IDENTITY_KEYS + V5_IDENTITY_KEYS
         else:
@@ -592,6 +634,7 @@ def checkpoint_artifact_identity(config: Mapping[str, Any]) -> dict[str, Any]:
             **{key: config.get(key) for key in V7_2_ADJUSTMENT_IDENTITY_KEYS},
             **{key: config.get(key) for key in V7_3_ADJUSTMENT_IDENTITY_KEYS},
             **{key: config.get(key) for key in V7_4_ADJUSTMENT_IDENTITY_KEYS},
+            **{key: config.get(key) for key in V7_4_2_ADJUSTMENT_IDENTITY_KEYS},
         }
     return dict(identity)
 
@@ -615,6 +658,7 @@ def validate_norm_stats_identity(
         ROTATION_V7_2_ADJUSTMENT_DATA_PROFILE,
         ROTATION_V7_3_ADJUSTMENT_DATA_PROFILE,
         ROTATION_V7_4_ADJUSTMENT_DATA_PROFILE,
+        ROTATION_V7_4_2_ADJUSTMENT_DATA_PROFILE,
     }:
         if norm_identity.get("data_profile") != ROTATION_V4_DATA_PROFILE:
             raise ValueError(f"{context} must reuse rotation_v4 norm stats")
@@ -626,6 +670,7 @@ def validate_norm_stats_identity(
                 ROTATION_V7_2_ADJUSTMENT_DATA_PROFILE,
                 ROTATION_V7_3_ADJUSTMENT_DATA_PROFILE,
                 ROTATION_V7_4_ADJUSTMENT_DATA_PROFILE,
+                ROTATION_V7_4_2_ADJUSTMENT_DATA_PROFILE,
             }
             else expected.get("action_indices_identity")
         )
