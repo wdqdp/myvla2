@@ -53,6 +53,15 @@ def test_resolve_model_checkpoint_uses_stage_a_root(tmp_path: Path, monkeypatch:
     assert MODULE.resolve_model_checkpoint("pi05_test_model") == model
 
 
+def test_resolve_model_checkpoint_accepts_v7_7_2_alias(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    run = tmp_path / "multitask_v7_7_2" / "run"
+    run.mkdir(parents=True)
+    monkeypatch.setattr(MODULE, "V7_7_2_RUN", run)
+    assert MODULE.resolve_model_checkpoint("v7_7_2") == run
+
+
 def test_resolve_model_checkpoint_accepts_explicit_step_path(tmp_path: Path) -> None:
     checkpoint = tmp_path / "pi05_test_model" / "15000"
     checkpoint.mkdir(parents=True)

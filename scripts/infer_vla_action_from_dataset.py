@@ -34,6 +34,7 @@ DEFAULT_MAX_TIMESTAMP_ERROR = 0.02
 DEFAULT_STATE_HISTORY_FPS = 30.0
 ACTION_HORIZON = 30
 OUTPUT_ACTION_DIM = 7
+V7_7_2_DATA_PROFILE = "rotation_phase_v7_7_2_five_task_h100"
 ADJUSTMENT_DIRECTIONS = ("left", "right", "front", "back")
 ADJUSTMENT_DEGREES = ("slightly", "moderately")
 DEFAULT_PIPER_URDF = (
@@ -63,9 +64,11 @@ def parse_args() -> argparse.Namespace:
         "--checkpoint",
         type=Path,
         required=True,
-        help="Stage-A run directory, numbered step directory, or params directory.",
+        help="Stage-A or V7.7.2 run directory, numbered step directory, or parameter directory.",
     )
-    parser.add_argument("--checkpoint-kind", choices=("stage-a", "stage-b"), default="stage-a")
+    parser.add_argument(
+        "--checkpoint-kind", choices=("auto", "stage-a", "stage-b", "v7-7-2"), default="auto"
+    )
     parser.add_argument(
         "--dataset-dir",
         type=Path,
@@ -123,24 +126,34 @@ def parse_args() -> argparse.Namespace:
 
 
 def resolve_checkpoint(path: Path) -> Path:
-    """Accept a params/step path or choose the latest numbered step in a run."""
+    """Accept a parameter/step path or select a checkpoint from a run."""
 
     resolved = path.expanduser().resolve()
     if not resolved.is_dir():
         raise FileNotFoundError(resolved)
-    if resolved.name == "params" or (resolved / "params").is_dir():
+    if resolved.name in {"params", "full_params"} or any(
+        (resolved / name).is_dir() for name in ("params", "full_params")
+    ):
         return resolved
+    best_metrics = resolved / "best" / "metrics.json"
+    if best_metrics.is_file():
+        best_step = json.loads(best_metrics.read_text())["step"]
+        best_checkpoint = resolved / str(best_step)
+        if not (best_checkpoint / "full_params").is_dir():
+            raise FileNotFoundError(f"Best checkpoint has no full_params export: {best_checkpoint}")
+        return best_checkpoint
     numbered = sorted(
         (
             child
             for child in resolved.iterdir()
-            if child.is_dir() and child.name.isdigit() and (child / "params").is_dir()
+            if child.is_dir() and child.name.isdigit()
+            and any((child / name).is_dir() for name in ("params", "full_params"))
         ),
         key=lambda child: int(child.name),
     )
     if not numbered:
         raise FileNotFoundError(
-            f"{resolved} is neither a params/step directory nor a run containing numbered checkpoints"
+            f"{resolved} is neither a parameter/step directory nor a run containing numbered checkpoints"
         )
     return numbered[-1]
 
@@ -151,7 +164,7 @@ def find_checkpoint_config(checkpoint: Path) -> tuple[Path, dict[str, Any]]:
         checkpoint.parent / "config.json",
         checkpoint.parent.parent / "config.json",
     ]
-    if checkpoint.name == "params":
+    if checkpoint.name in {"params", "full_params"}:
         candidates.insert(0, checkpoint.parent / "config.json")
     for candidate in dict.fromkeys(candidates):
         if candidate.is_file():
@@ -160,6 +173,17 @@ def find_checkpoint_config(checkpoint: Path) -> tuple[Path, dict[str, Any]]:
                 raise ValueError(f"Checkpoint config is not a JSON object: {candidate}")
             return candidate, payload
     raise FileNotFoundError(f"Cannot find config.json near checkpoint {checkpoint}")
+
+
+def checkpoint_kind(requested_kind: str, config: dict[str, Any]) -> str:
+    detected = (
+        "v7-7-2" if config.get("data_profile") == V7_7_2_DATA_PROFILE
+        else "stage-b" if str(config.get("checkpoint_format", "")).startswith("stage_b_v3_merged_full")
+        else "stage-a"
+    )
+    if requested_kind != "auto" and requested_kind != detected:
+        raise ValueError(f"Checkpoint is {detected}, but --checkpoint-kind={requested_kind}")
+    return detected
 
 
 def validate_prompt_arguments(mode: str, direction: str | None, degree: str | None) -> None:
@@ -572,6 +596,7 @@ def main() -> None:
     validate_prompt_arguments(args.mode, args.direction, args.degree)
     checkpoint = resolve_checkpoint(args.checkpoint)
     config_path, config = find_checkpoint_config(checkpoint)
+    kind = checkpoint_kind(args.checkpoint_kind, config)
     dataset_dir = (args.dataset_dir or Path(str(config.get("dataset_dir", "")))).expanduser().resolve()
     norm_stats_dir = (
         args.norm_stats_dir or Path(str(config.get("norm_stats_dir", "")))
@@ -606,7 +631,10 @@ def main() -> None:
         instruction=observation_summary["instruction"],
         direction=args.direction,
         degree=args.degree,
-        prompt_profile=str(config.get("prompt_profile", "")),
+        # The V7.7.2 action stream was trained with the Stage-A phase_v2 prompt.
+        prompt_profile=(
+            "phase_v2" if kind == "v7-7-2" else str(config.get("prompt_profile", ""))
+        ),
     )
     request["mode"] = "execution"
     request["prompt"] = prompt
@@ -614,31 +642,57 @@ def main() -> None:
 
     # Import the model-serving implementation only after the PyArrow frame
     # lookup, preserving the repository's CUDA/PyArrow import-order rule.
-    import serve_tactile_vla_action_ablation as action_server
     from openpi.shared import normalize
+    if kind == "v7-7-2":
+        import serve_tactile_vla_v7_7 as multitask_server
 
-    policy_args = argparse.Namespace(
-        checkpoint_kind=args.checkpoint_kind,
-        checkpoint=checkpoint,
-        norm_stats_dir=norm_stats_dir,
-        expected_data_profile=config.get("data_profile"),
-        num_inference_steps=args.num_inference_steps,
-        precision=args.precision,
-    )
-    action_server.validate_v4_norm_artifacts(policy_args, config)
-    model_config = action_server._model_config(policy_args, config)
-    policy = action_server.ActionOnlyAblationPolicy(
-        args=policy_args,
-        config_path=config_path,
-        config=config,
-        model_config=model_config,
-        norm_stats=normalize.load(norm_stats_dir),
-    )
+        multitask_server.DATA_PROFILE = V7_7_2_DATA_PROFILE
+        full_params = checkpoint if checkpoint.name == "full_params" else checkpoint / "full_params"
+        if not full_params.is_dir():
+            raise FileNotFoundError(f"V7.7.2 full_params export not found: {full_params}")
+        policy_args = argparse.Namespace(
+            checkpoint=full_params,
+            norm_stats_dir=norm_stats_dir,
+            num_inference_steps=args.num_inference_steps,
+            precision=args.precision,
+            output_action_dim=OUTPUT_ACTION_DIM,
+            need_recovery_threshold=None,
+            adjustment_end_threshold=None,
+            reasoning_max_token_len=None,
+            no_norm=False,
+        )
+        model_config = multitask_server.v3._model_config(policy_args, config)
+        policy = multitask_server.V77Policy(
+            args=policy_args,
+            config=config,
+            model_config=model_config,
+            norm_stats=normalize.load(norm_stats_dir),
+        )
+    else:
+        import serve_tactile_vla_action_ablation as action_server
+
+        policy_args = argparse.Namespace(
+            checkpoint_kind=kind,
+            checkpoint=checkpoint,
+            norm_stats_dir=norm_stats_dir,
+            expected_data_profile=config.get("data_profile"),
+            num_inference_steps=args.num_inference_steps,
+            precision=args.precision,
+        )
+        action_server.validate_v4_norm_artifacts(policy_args, config)
+        model_config = action_server._model_config(policy_args, config)
+        policy = action_server.ActionOnlyAblationPolicy(
+            args=policy_args,
+            config_path=config_path,
+            config=config,
+            model_config=model_config,
+            norm_stats=normalize.load(norm_stats_dir),
+        )
     noise = np.random.default_rng(args.noise_seed).standard_normal(
         (model_config.action_horizon, model_config.action_dim), dtype=np.float32
     )
     request["action_noise"] = noise
-    response = policy.infer(request)
+    response = next(policy.infer_events(request)) if kind == "v7-7-2" else policy.infer(request)
     actions = np.asarray(response["actions"], dtype=np.float32)
     if actions.shape != (ACTION_HORIZON, OUTPUT_ACTION_DIM):
         raise ValueError(f"Expected output H30 action [30,7], got {actions.shape}")

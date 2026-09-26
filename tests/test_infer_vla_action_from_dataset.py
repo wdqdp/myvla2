@@ -30,6 +30,22 @@ def test_resolve_checkpoint_selects_latest_numbered_step(tmp_path: Path) -> None
     assert MODULE.resolve_checkpoint(tmp_path / "5000" / "params") == tmp_path / "5000" / "params"
 
 
+def test_resolve_checkpoint_selects_best_multitask_step(tmp_path: Path) -> None:
+    for step in (4000, 5000):
+        (tmp_path / str(step) / "full_params").mkdir(parents=True)
+    (tmp_path / "best").mkdir()
+    (tmp_path / "best" / "metrics.json").write_text('{"step": 4000}')
+    assert MODULE.resolve_checkpoint(tmp_path) == tmp_path / "4000"
+    assert MODULE.resolve_checkpoint(tmp_path / "5000" / "full_params") == tmp_path / "5000" / "full_params"
+
+
+def test_checkpoint_kind_detects_v7_7_2() -> None:
+    config = {"data_profile": MODULE.V7_7_2_DATA_PROFILE}
+    assert MODULE.checkpoint_kind("auto", config) == "v7-7-2"
+    with pytest.raises(ValueError, match="Checkpoint is v7-7-2"):
+        MODULE.checkpoint_kind("stage-a", config)
+
+
 def test_adjustment_prompt_uses_cli_direction_and_degree() -> None:
     prompt, plan = MODULE.build_cli_prompt(
         mode="adjustment",

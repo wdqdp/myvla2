@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import json
 import os
 from pathlib import Path
@@ -20,6 +20,10 @@ INFERENCE_SCRIPT = PROJECT_ROOT / "scripts" / "infer_vla_action_from_dataset.py"
 MODEL_ROOT = Path(
     "/data1/qxh/tac_vla_new/tac_data/demon_data/black_box/outputs/"
     "stage_a_action"
+)
+V7_7_2_RUN = Path(
+    "/data1/qxh/tac_vla_new/tac_data/demon_data/black_box/outputs/"
+    "multitask_v7_7_2/pi05_rotation_v7_7_2_five_task_h100_no_history"
 )
 
 
@@ -55,23 +59,31 @@ def parse_args() -> argparse.Namespace:
         dest="model",
         required=True,
         help=(
-            f"Model folder name under {MODEL_ROOT}, or a checkpoint/run/params directory path."
+            f"Model folder name under {MODEL_ROOT}, 'v7_7_2', or a checkpoint/run directory path."
         ),
     )
     parser.add_argument(
         "--output", type=Path, required=True, help="Compact combined JSON output path."
     )
+    parser.add_argument(
+        "--gpus", type=int, nargs=4, metavar=("G0", "G1", "G2", "G3"),
+        default=[0, 1, 2, 3], help="GPU indices for the four adjustment jobs in output order.",
+    )
     return parser.parse_args()
 
 
 def resolve_model_checkpoint(model: str) -> Path:
-    """Resolve a stage_a_action folder name or an explicit checkpoint path."""
+    """Resolve a Stage-A model, V7.7.2 alias, or explicit checkpoint path."""
 
     if not model:
         raise ValueError("--model must not be empty")
     requested = Path(model).expanduser()
-    if requested.is_absolute() or len(requested.parts) > 1:
+    if model in {"v7_7_2", "multitask_v7_7_2", V7_7_2_RUN.name}:
+        checkpoint = V7_7_2_RUN.resolve()
+    elif requested.is_absolute() or len(requested.parts) > 1:
         checkpoint = requested.resolve()
+        if checkpoint == V7_7_2_RUN.parent.resolve():
+            checkpoint = V7_7_2_RUN.resolve()
     else:
         if model in {".", ".."}:
             raise ValueError("--model must be a model folder name or checkpoint path")
@@ -173,12 +185,15 @@ def endpoint_change(result_path: Path) -> dict[str, Any]:
 
 def main() -> None:
     args = parse_args()
+    if any(gpu < 0 for gpu in args.gpus) or len(set(args.gpus)) != len(JOBS):
+        raise ValueError("--gpus requires four distinct non-negative GPU indices")
     checkpoint = resolve_model_checkpoint(args.model)
+    jobs = tuple(replace(job, gpu=gpu) for job, gpu in zip(JOBS, args.gpus, strict=True))
     with tempfile.TemporaryDirectory(prefix="vla_four_adjustments_") as temporary_dir:
         temp_root = Path(temporary_dir)
-        result_paths = {job: temp_root / f"{job.name}.json" for job in JOBS}
+        result_paths = {job: temp_root / f"{job.name}.json" for job in jobs}
         failures: list[str] = []
-        with ThreadPoolExecutor(max_workers=len(JOBS)) as executor:
+        with ThreadPoolExecutor(max_workers=len(jobs)) as executor:
             futures = {
                 executor.submit(
                     run_job,
@@ -189,7 +204,7 @@ def main() -> None:
                     timestamp=args.timestamp,
                     result_path=result_paths[job],
                 ): job
-                for job in JOBS
+                for job in jobs
             }
             for future in as_completed(futures):
                 job = futures[future]
@@ -203,7 +218,7 @@ def main() -> None:
         # Keep only H30's final target relative to the selected input frame.
         compact_output = {
             job.name: endpoint_change(result_paths[job])
-            for job in JOBS
+            for job in jobs
         }
 
     destination = args.output.expanduser().resolve()
