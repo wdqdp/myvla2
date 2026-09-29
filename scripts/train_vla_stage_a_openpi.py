@@ -129,6 +129,10 @@ from tactile_vla.vla.v7_4_2_adjustment_data import DATA_PROFILE as ROTATION_PHAS
 from tactile_vla.vla.v7_4_2_adjustment_data import EXPERIMENT_KIND as V7_4_2_EXPERIMENT_KIND
 from tactile_vla.vla.v7_4_2_adjustment_data import INDEX_SCHEMA as V7_4_2_TRAINING_INDEX_SCHEMA
 from tactile_vla.vla.v7_4_2_adjustment_data import validate_training_index as validate_v7_4_2_training_index
+from tactile_vla.vla.book_stage_a_data import DATA_PROFILE as BOOK_STAGE_A_V1
+from tactile_vla.vla.book_stage_a_data import EXPERIMENT_KIND as BOOK_STAGE_A_EXPERIMENT_KIND
+from tactile_vla.vla.book_stage_a_data import INDEX_SCHEMA as BOOK_STAGE_A_INDEX_SCHEMA
+from tactile_vla.vla.book_stage_a_data import validate_training_index as validate_book_stage_a_index
 
 V7_4_2_SOURCE_CHECKPOINT = Path(
     "/data1/qxh/tac_vla_new/tac_data/demon_data/black_box/outputs/"
@@ -145,6 +149,7 @@ PHASE_DATA_PROFILES = {
     ROTATION_PHASE_V7_3_ADJUSTMENT,
     ROTATION_PHASE_V7_4_ADJUSTMENT,
     ROTATION_PHASE_V7_4_2_ADJUSTMENT,
+    BOOK_STAGE_A_V1,
 }
 
 
@@ -231,6 +236,7 @@ def validate_v5_args(args: argparse.Namespace) -> None:
             ROTATION_PHASE_V7_3_ADJUSTMENT,
             ROTATION_PHASE_V7_4_ADJUSTMENT,
             ROTATION_PHASE_V7_4_2_ADJUSTMENT,
+            BOOK_STAGE_A_V1,
         }
         else PHASE_PROMPT_PROFILE
     )
@@ -243,6 +249,7 @@ def validate_v5_args(args: argparse.Namespace) -> None:
         ROTATION_PHASE_V7_3_ADJUSTMENT: V7_3_EXPERIMENT_KIND,
         ROTATION_PHASE_V7_4_ADJUSTMENT: V7_4_EXPERIMENT_KIND,
         ROTATION_PHASE_V7_4_2_ADJUSTMENT: V7_4_2_EXPERIMENT_KIND,
+        BOOK_STAGE_A_V1: BOOK_STAGE_A_EXPERIMENT_KIND,
     }[args.data_profile]
     if args.prompt_profile != expected_prompt:
         raise ValueError(f"{args.data_profile} Stage A requires prompt_profile={expected_prompt!r}")
@@ -298,12 +305,21 @@ V7_4_2_STAGE_A_PROTOCOL = {
     "lr_final": 1e-6,
     "lr_transition_steps": 10_000,
 }
+BOOK_STAGE_A_PROTOCOL_NAME = "book_stage_a_v1_no_state_history"
+BOOK_STAGE_A_PROTOCOL = {
+    **V7_4_STAGE_A_PROTOCOL,
+    "batch_size": 8,
+    "num_steps": 15_000,
+    "fsdp_devices": 2,
+}
 
 
 def selected_stage_a_protocol(args: argparse.Namespace) -> tuple[str | None, dict[str, Any]]:
     """Resolve the pinned protocol without changing legacy V4/V5 behavior."""
     data_profile = getattr(args, "data_profile", None)
     use_state_history = bool(getattr(args, "use_state_history", True))
+    if data_profile == BOOK_STAGE_A_V1:
+        return BOOK_STAGE_A_PROTOCOL_NAME, BOOK_STAGE_A_PROTOCOL
     if data_profile == ROTATION_PHASE_V7_4_2_ADJUSTMENT:
         return V7_4_2_STAGE_A_PROTOCOL_NAME, V7_4_2_STAGE_A_PROTOCOL
     if data_profile == ROTATION_PHASE_V7_4_ADJUSTMENT:
@@ -496,6 +512,13 @@ def ensure_index(args: argparse.Namespace) -> dict:
                 payload, index_path=args.index_file, dataset_dir=args.dataset_dir,
             )
             args._v5_action_phase_lookup = lookup
+        elif args.data_profile == BOOK_STAGE_A_V1:
+            if payload.get("schema_version") != BOOK_STAGE_A_INDEX_SCHEMA:
+                raise ValueError("book_stage_a_v1 requires its dedicated index")
+            _, lookup = validate_book_stage_a_index(
+                payload, index_path=args.index_file, dataset_dir=args.dataset_dir,
+            )
+            args._v5_action_phase_lookup = lookup
         return payload
     if args.data_profile != LEGACY_DATA_PROFILE:
         raise FileNotFoundError(
@@ -541,6 +564,7 @@ def build_loader(
                 ROTATION_PHASE_V7_3_ADJUSTMENT: validate_v7_3_adjustment_training_index,
                 ROTATION_PHASE_V7_4_ADJUSTMENT: validate_v7_4_adjustment_training_index,
                 ROTATION_PHASE_V7_4_2_ADJUSTMENT: validate_v7_4_2_training_index,
+                BOOK_STAGE_A_V1: validate_book_stage_a_index,
             }[args.data_profile]
             _, phase_lookup = validator(
                 payload, index_path=args.index_file, dataset_dir=args.dataset_dir
