@@ -46,6 +46,8 @@ from tactile_vla.vla.artifacts import checkpoint_artifact_identity
 from tactile_vla.vla.artifacts import checkpoint_step_number
 from tactile_vla.vla.artifacts import validate_merged_best_metrics
 from tactile_vla.vla.artifacts import validate_norm_stats_identity
+from tactile_vla.vla.book_stage_a_data import DATA_PROFILE as BOOK_STAGE_A_V1
+from tactile_vla.vla.book_stage_a_data import EXPERIMENT_KIND as BOOK_STAGE_A_EXPERIMENT_KIND
 from tactile_vla.vla.prompts import build_execution_prompt
 from tactile_vla.vla.prompts import MINIMAL_PROMPT_PROFILE
 from tactile_vla.vla.prompts import PHASE_PROMPT_PROFILE
@@ -77,8 +79,10 @@ V7_1_STAGE_A_PROTOCOL_NAME = "v7_1_no_state_history"
 V7_2_STAGE_A_PROTOCOL_NAME = "v7_2_no_state_history"
 V7_3_STAGE_A_PROTOCOL_NAME = "v7_3_no_state_history"
 V7_4_STAGE_A_PROTOCOL_NAME = "v7_4_no_state_history"
+BOOK_STAGE_A_PROTOCOL_NAME = "book_stage_a_v1_no_state_history"
 
 PHASE_ACTION_PROFILES = {
+    BOOK_STAGE_A_V1: (PHASE_PROMPT_PROFILE_V2, BOOK_STAGE_A_EXPERIMENT_KIND),
     ROTATION_PHASE_V5: (PHASE_PROMPT_PROFILE, PHASE_EXPERIMENT_KIND),
     ROTATION_PHASE_V5_ADJUSTMENT_V2: (
         PHASE_PROMPT_PROFILE_V2,
@@ -317,6 +321,7 @@ def _model_config(args: argparse.Namespace, config: dict[str, Any]) -> Pi0Config
                 ROTATION_PHASE_V7_2_ADJUSTMENT: V7_2_STAGE_A_PROTOCOL_NAME,
                 ROTATION_PHASE_V7_3_ADJUSTMENT: V7_3_STAGE_A_PROTOCOL_NAME,
                 ROTATION_PHASE_V7_4_ADJUSTMENT: V7_4_STAGE_A_PROTOCOL_NAME,
+                BOOK_STAGE_A_V1: BOOK_STAGE_A_PROTOCOL_NAME,
             }.get(config.get("data_profile"), V6_1_STAGE_A_PROTOCOL_NAME)
         )
         if config.get("stage_a_protocol") != expected_protocol:

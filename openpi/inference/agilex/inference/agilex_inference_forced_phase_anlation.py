@@ -36,12 +36,15 @@ from tactile_vla.vla.prompts import PHASE_PROMPT_PROFILE_V2
 from tactile_vla.vla.prompts import build_execution_prompt
 from tactile_vla.vla.prompts import build_phase_prompt
 from tactile_vla.vla.prompts import resolve_prompt_profile
+from tactile_vla.vla.book_stage_a_data import DATA_PROFILE as BOOK_STAGE_A_V1
+from tactile_vla.vla.book_stage_a_data import EXPERIMENT_KIND as BOOK_STAGE_A_EXPERIMENT_KIND
 from tactile_vla.vla.structured_text import failure_reason_text
 from tactile_vla.vla.structured_text import legal_failure_reasons
 from tactile_vla.vla.structured_text import legal_recovery_plans
 from tactile_vla.vla.structured_text import recovery_plan_text
 
 DEFAULT_INSTRUCTION = "Pick up and transfer the object stably."
+BOOK_INSTRUCTION = "Pick up the book and place it horizontally on the bookshelf."
 DEFAULT_CAPTIONER = Path("/data1/outputs/tactile_captioner/tcn_v3_w30_rotation_head/best.pt")
 DEFAULT_LOG_ROOT = PROJECT_ROOT / "outputs" / "runtime" / "forced_phase_ablation"
 ACTION_NOISE_SHAPE = (30, 32)
@@ -51,6 +54,7 @@ V7_1_STAGE_A_PROTOCOL_NAME = "v7_1_no_state_history"
 V7_2_STAGE_A_PROTOCOL_NAME = "v7_2_no_state_history"
 V7_3_STAGE_A_PROTOCOL_NAME = "v7_3_no_state_history"
 V7_4_STAGE_A_PROTOCOL_NAME = "v7_4_no_state_history"
+BOOK_STAGE_A_PROTOCOL_NAME = "book_stage_a_v1_no_state_history"
 ROTATION_DIRECTIONS = ("right", "left", "front", "back")
 Phase = Literal["execution", "reposition", "adjustment"]
 LEGACY_PHASE_KEYS: dict[str, Phase] = {
@@ -64,6 +68,7 @@ V2_PHASE_KEYS: dict[str, Phase] = {
 }
 ALL_PHASE_CONTROL_KEYS = frozenset(LEGACY_PHASE_KEYS) | frozenset(V2_PHASE_KEYS)
 DATA_PROFILE_SPECS = {
+    BOOK_STAGE_A_V1: (PHASE_PROMPT_PROFILE_V2, BOOK_STAGE_A_EXPERIMENT_KIND),
     "rotation_v4": (MINIMAL_PROMPT_PROFILE, None),
     "rotation_phase_v5": (PHASE_PROMPT_PROFILE, "phase_prompt_only"),
     "rotation_phase_v5_adjustment_v2": (
@@ -264,6 +269,8 @@ def validate_server_metadata(args: argparse.Namespace, metadata: dict[str, Any])
         raise ValueError("Connected server is not the action-only forced-recovery ablation server")
     expected_data_profile = getattr(args, "expected_data_profile", None)
     server_data_profile = str(metadata.get("data_profile", "legacy"))
+    if server_data_profile == BOOK_STAGE_A_V1 and expected_data_profile != BOOK_STAGE_A_V1:
+        raise ValueError("Book Stage A requires --expected-data-profile book_stage_a_v1")
     if expected_data_profile is not None and server_data_profile != expected_data_profile:
         raise ValueError(
             "Client/server data profile mismatch: "
@@ -305,6 +312,7 @@ def validate_server_metadata(args: argparse.Namespace, metadata: dict[str, Any])
                 "rotation_phase_v7_2_adjustment": V7_2_STAGE_A_PROTOCOL_NAME,
                 "rotation_phase_v7_3_adjustment": V7_3_STAGE_A_PROTOCOL_NAME,
                 "rotation_phase_v7_4_adjustment": V7_4_STAGE_A_PROTOCOL_NAME,
+                BOOK_STAGE_A_V1: BOOK_STAGE_A_PROTOCOL_NAME,
             }.get(metadata.get("data_profile"), V6_1_STAGE_A_PROTOCOL_NAME)
         )
         if stage_a_protocol != expected_protocol:
@@ -321,7 +329,7 @@ def validate_server_metadata(args: argparse.Namespace, metadata: dict[str, Any])
     if data_profile not in DATA_PROFILE_SPECS:
         raise ValueError(
             "Forced phase ablation supports only V4 minimal_v1, V5 phase_v1, "
-            "or V5.2/V7/V7.1/V7.2/V7.3/V7.4 phase_v2 checkpoints"
+            "or phase_v2 Stage A checkpoints including Book"
         )
     expected_prompt_profile, expected_experiment = DATA_PROFILE_SPECS[data_profile]
     if profile != expected_prompt_profile:
@@ -384,7 +392,7 @@ def _capture_delayed_history_snapshot(
     *,
     chunk_completed_timestamp: float,
 ) -> FrozenObservation:
-    """Let post-command feedback enter history, then snapshot only its values.
+    """Capture a post-command snapshot, including history when enabled.
 
     The images and qpos in this object are diagnostic.  They are not reused for
     the next model request; pressing the continue key captures those fields
@@ -708,9 +716,10 @@ def _wait_for_chunk_continue(
     published_steps: int,
     locked_history: FrozenObservation,
 ) -> ControlSignal:
-    """Pause with history locked, then capture live image/qpos on continue."""
+    """Pause after a chunk, then capture live image/qpos on continue."""
 
-    if getattr(args, "use_state_history", True):
+    uses_history = bool(getattr(args, "use_state_history", True))
+    if uses_history:
         _pause_state_history(operator)
     pause_started = time.monotonic()
     logger.record(
@@ -719,7 +728,10 @@ def _wait_for_chunk_continue(
             "phase": phase,
             "phase_index": phase_index,
             "published_steps": published_steps,
-            "history_freeze_delay_seconds": args.history_freeze_delay_seconds,
+            "uses_state_history": uses_history,
+            "history_freeze_delay_seconds": (
+                args.history_freeze_delay_seconds if uses_history else 0.0
+            ),
             "history_freeze_timestamp": locked_history.timestamp,
             "history_freeze_qpos": locked_history.qpos,
             "locked_state_history": locked_history.state_history,
@@ -738,7 +750,8 @@ def _wait_for_chunk_continue(
     if phase == "execution":
         controls += ", SPACE for a new forced-recovery attempt"
     controls += f", or {args.quit_key!r} to quit."
-    print(f"[{phase.upper()}] chunk={phase_index} complete; history locked. {controls}")
+    pause_state = "history locked" if uses_history else "paused; no state history used"
+    print(f"[{phase.upper()}] chunk={phase_index} complete; {pause_state}. {controls}")
     pause_rate = operator.rate(args.observation_poll_rate)
     while not operator.is_shutdown() and not runtime.shutdown_event.is_set():
         signal_value = _poll_control_key(
@@ -763,11 +776,14 @@ def _wait_for_chunk_continue(
                     "phase_index": phase_index,
                     "published_steps": published_steps,
                     "paused_seconds": paused_seconds,
-                    "history_remains_locked": True,
+                    "history_remains_locked": uses_history,
                 }
             )
+            selected_state = (
+                "history remains locked" if uses_history else "no state history is used"
+            )
             print(
-                f"Selected {selected_phase.upper()} for the next chunk; history remains locked. "
+                f"Selected {selected_phase.upper()} for the next chunk; {selected_state}. "
                 f"Press {args.continue_key!r} to execute."
             )
             continue
@@ -780,7 +796,7 @@ def _wait_for_chunk_continue(
                 reset_history=False,
                 after_timestamp=continue_requested_timestamp,
             )
-            if getattr(args, "use_state_history", True):
+            if uses_history:
                 realtime_observation = replace(
                     realtime_observation,
                     state_history=locked_history.state_history.copy(),
@@ -788,7 +804,7 @@ def _wait_for_chunk_continue(
                 )
                 anchor_timestamp = _resume_state_history(args, operator, realtime_observation)
             else:
-                anchor_timestamp = realtime_observation.timestamp
+                anchor_timestamp = None
             logger.record(
                 {
                     "event": "chunk_continue",
@@ -859,14 +875,25 @@ def run_ablation(
         "Gripper safety floor enabled on the final published joint-7 command: "
         f"min={args.gripper_min:.6f} m (offset={args.gripper_offset:.6f} m)"
     )
+    if args.use_state_history:
+        pause_description = (
+            f"Each complete chunk records {args.history_freeze_delay_seconds:g} more seconds "
+            "of feedback, then pauses with history frozen; pressing s captures live images/qpos "
+            "for the next request. "
+        )
+        trigger_description = "resets history, and enters"
+    else:
+        pause_description = (
+            "Each complete chunk pauses without state history; pressing s captures live "
+            "images/qpos for the next request. "
+        )
+        trigger_description = "enters"
     print(
-        "Each complete chunk records "
-        f"{args.history_freeze_delay_seconds:g} more seconds of feedback, then pauses with "
-        "history frozen; pressing s captures live images/qpos for the next request. "
-        f"{phase_control_description(args.prompt_profile)} selects the next phase and "
-        f"{args.continue_key} executes it; q=quit. "
-        "During EXECUTION, SPACE discards the remaining chunk, starts a new attempt, "
-        f"resets history, and enters {forced_attempt_start_phase(args.prompt_profile).upper()}."
+        pause_description
+        + f"{phase_control_description(args.prompt_profile)} selects the next phase and "
+        + f"{args.continue_key} executes it; q=quit. "
+        + "During EXECUTION, SPACE discards the remaining chunk, starts a new attempt, "
+        + f"{trigger_description} {forced_attempt_start_phase(args.prompt_profile).upper()}."
     )
 
     phase: Phase = "execution"
@@ -1161,6 +1188,22 @@ def get_arguments() -> tuple[argparse.Namespace, argparse.ArgumentParser]:
 
 
 def validate_args(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
+    if getattr(args, "expected_data_profile", None) == BOOK_STAGE_A_V1:
+        if args.instruction not in {DEFAULT_INSTRUCTION, BOOK_INSTRUCTION}:
+            parser.error(f"Book Stage A requires --instruction={BOOK_INSTRUCTION!r}")
+        if args.rotation_direction not in {None, "right"} or args.rotation_magnitude != "moderately":
+            parser.error("Book Stage A requires a right, moderately sized adjustment")
+        book_failure, book_plan = rotation_targets("right", "moderately")
+        if args.forced_failure_reason not in {None, book_failure}:
+            parser.error(f"Book Stage A requires --forced-failure-reason={book_failure!r}")
+        if args.forced_recovery_plan not in {None, book_plan}:
+            parser.error(f"Book Stage A requires --forced-recovery-plan={book_plan!r}")
+        args.instruction = BOOK_INSTRUCTION
+        args.rotation_direction = "right"
+        args.forced_failure_reason = book_failure
+        args.forced_recovery_plan = book_plan
+        args.no_captioner = True
+
     direction = getattr(args, "rotation_direction", None)
     if direction is not None:
         expected_failure, expected_plan = rotation_targets(direction, args.rotation_magnitude)
