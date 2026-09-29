@@ -245,7 +245,7 @@ class _FakePolicy:
             "state_history_dim": 7,
             "state_history_fps": 30.0,
             "supports_step_monitor": True,
-            "max_memory_pairs": 4,
+            "max_memory_pairs": 5,
             "max_supported_attempts": 5,
         }
 

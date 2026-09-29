@@ -171,7 +171,7 @@ def test_omitted_checkpoint_prompt_profile_falls_back_to_legacy() -> None:
     assert legacy.endswith("monitor whether recovery is needed.")
 
 
-def test_minimal_runtime_memory_accumulates_without_sliding_the_initial_pair() -> None:
+def test_minimal_runtime_memory_keeps_latest_training_sized_window() -> None:
     old = [{"recovery_plan": "old", "failure_reason": "old reason"}]
     latest = {"recovery_plan": "new", "failure_reason": "new reason"}
     assert update_failure_recovery_memory(
@@ -189,9 +189,24 @@ def test_minimal_runtime_memory_accumulates_without_sliding_the_initial_pair() -
         {"recovery_plan": f"plan-{index}", "failure_reason": f"reason-{index}"}
         for index in range(MAX_MEMORY_PAIRS)
     ]
-    with pytest.raises(ValueError, match="refusing to discard the initial pair"):
-        update_failure_recovery_memory(
-            full,
-            latest,
+    assert update_failure_recovery_memory(
+        full,
+        latest,
+        prompt_profile=MINIMAL_PROMPT_PROFILE,
+    ) == [*full[1:], latest]
+    assert update_failure_recovery_memory(
+        full,
+        latest,
+        prompt_profile="legacy",
+    ) == [*full, latest]
+
+    sliding: list[dict[str, str]] = []
+    for index in range(7):
+        sliding = update_failure_recovery_memory(
+            sliding,
+            {"recovery_plan": f"plan-{index}", "failure_reason": f"reason-{index}"},
             prompt_profile=MINIMAL_PROMPT_PROFILE,
         )
+    assert [item["recovery_plan"] for item in sliding] == [
+        "plan-2", "plan-3", "plan-4", "plan-5", "plan-6",
+    ]

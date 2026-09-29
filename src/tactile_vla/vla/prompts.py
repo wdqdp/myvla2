@@ -18,8 +18,7 @@ PROMPT_PROFILES = (
 )
 ACTION_PHASES = ("execution", "reposition", "adjustment")
 V2_ACTION_PHASES = ("execution", "adjustment")
-MAX_MEMORY_PAIRS = 4
-MAX_SUPPORTED_ATTEMPTS = MAX_MEMORY_PAIRS + 1
+MAX_MEMORY_PAIRS = 5
 
 
 def resolve_prompt_profile(profile: str | None) -> str:
@@ -84,7 +83,12 @@ def update_failure_recovery_memory(
     *,
     prompt_profile: str | None,
 ) -> list[dict[str, Any]]:
-    """Apply the checkpoint-specific runtime memory retention policy."""
+    """Apply the checkpoint-specific runtime memory retention policy.
+
+    Modern checkpoints were trained with at most ``MAX_MEMORY_PAIRS`` pairs.
+    Runtime attempts may continue beyond that limit, so retain a sliding
+    window containing the most recent pairs instead of rejecting the update.
+    """
 
     updated_entry = dict(entry)
     if resolve_prompt_profile(prompt_profile) in {
@@ -92,12 +96,7 @@ def update_failure_recovery_memory(
         PHASE_PROMPT_PROFILE,
         PHASE_PROMPT_PROFILE_V2,
     }:
-        if len(memory) >= MAX_MEMORY_PAIRS:
-            raise ValueError(
-                f"{resolve_prompt_profile(prompt_profile)} recovery memory already contains the maximum "
-                f"{MAX_MEMORY_PAIRS} pairs; refusing to discard the initial pair"
-            )
-        return [*memory, updated_entry]
+        return [*memory, updated_entry][-MAX_MEMORY_PAIRS:]
     return [*memory, updated_entry]
 
 

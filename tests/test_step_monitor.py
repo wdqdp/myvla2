@@ -193,7 +193,7 @@ class _FiveFailurePolicy(_FakeV3RecoveryPolicy):
         return {
             **super().get_server_metadata(),
             "prompt_profile": "minimal_v1",
-            "max_memory_pairs": 4,
+            "max_memory_pairs": 5,
             "max_supported_attempts": 5,
         }
 
@@ -360,11 +360,10 @@ def test_five_failures_send_four_reasoning_prompts_with_memory_lengths_1_to_4(
     ("metadata_overrides", "max_attempts", "message"),
     [
         ({"max_memory_pairs": 3}, 5, "memory mismatch"),
-        ({"max_supported_attempts": 4}, 5, "attempt limit mismatch"),
-        ({}, 6, "supports at most"),
+        ({}, 0, "must be positive"),
     ],
 )
-def test_client_rejects_server_memory_or_attempt_limit_mismatch(
+def test_client_rejects_server_memory_mismatch_or_nonpositive_attempt_limit(
     metadata_overrides: dict[str, int],
     max_attempts: int,
     message: str,

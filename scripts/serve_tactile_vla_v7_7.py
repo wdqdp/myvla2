@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
 import http
 import json
 import logging
@@ -31,9 +32,10 @@ import websockets.frames
 from openpi_client import msgpack_numpy
 from openpi.shared import nnx_utils, normalize
 from tactile_vla.vla.structured_generation import constrained_greedy_generate_from_prefill
+from tactile_vla.vla.prompts import MINIMAL_PROMPT_PROFILE, build_recovery_prompt
 from tactile_vla.vla.v7_7_multitask_data import DATA_PROFILE
 from tactile_vla.vla.v7_7_multitask_model import V77MultitaskModel
-from tactile_vla.vla.v7_7_phase_prompt import PROMPT_PROFILE
+from tactile_vla.vla.v7_7_phase_prompt import PROMPT_PROFILE, build_phase_prompt
 from scripts import serve_tactile_vla_policy_v3 as v3
 
 
@@ -212,6 +214,15 @@ class V77Policy(v3.TactileVLAPolicyV3):
 class StreamingPolicyServer:
     def __init__(self, policy, host, port):
         self.policy, self.host, self.port = policy, host, port
+        # JAX inference must be serialized, but must not block WebSocket ping/pong.
+        self._model_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="v77-model")
+
+    @staticmethod
+    def _next_event(events):
+        try:
+            return True, next(events)
+        except StopIteration:
+            return False, None
 
     async def _health(self, connection, request):
         if request.path == "/healthz":
@@ -221,10 +232,17 @@ class StreamingPolicyServer:
     async def _handler(self, websocket):
         packer = msgpack_numpy.Packer()
         await websocket.send(packer.pack(self.policy.metadata))
+        loop = asyncio.get_running_loop()
         while True:
             try:
                 request = msgpack_numpy.unpackb(await websocket.recv())
-                for event in self.policy.infer_events(request):
+                events = self.policy.infer_events(request)
+                while True:
+                    has_event, event = await loop.run_in_executor(
+                        self._model_executor, self._next_event, events,
+                    )
+                    if not has_event:
+                        break
                     await websocket.send(packer.pack(event))
             except websockets.ConnectionClosed:
                 return
@@ -239,7 +257,64 @@ class StreamingPolicyServer:
             async with ws_server.serve(self._handler, self.host, self.port, compression=None,
                                        max_size=None, process_request=self._health) as server:
                 await server.serve_forever()
-        asyncio.run(run())
+        try:
+            asyncio.run(run())
+        finally:
+            self._model_executor.shutdown(wait=True)
+
+
+def warm_up_v77(policy: V77Policy) -> None:
+    """Compile every live V7.7 path before clients can connect."""
+
+    image = np.zeros((224, 224, 3), dtype=np.uint8)
+    base = {
+        "observation/image": image,
+        "observation/wrist_image": image,
+        "observation/state": np.zeros((7,), dtype=np.float32),
+    }
+    phase_prompt = build_phase_prompt(
+        instruction="dry run", tactile_caption="Touch[rotation=none]",
+        recovery_plan="none", qpos_h100_11_discrete=np.zeros((11, 7), dtype=np.int32),
+    )
+    requests = (
+        ("action", base | {
+            "mode": "execution", "prompt": "Mode: execution. Task: dry run.",
+            "action_noise": np.zeros((30, 32), dtype=np.float32),
+        }),
+        ("execution_phase_and_failure", base | {
+            "mode": "phase", "phase": "execution", "request_id": "warmup-execution",
+            "prompt": phase_prompt,
+        }),
+        ("adjustment_phase", base | {
+            "mode": "phase", "phase": "adjustment", "request_id": "warmup-adjustment",
+            "prompt": phase_prompt,
+        }),
+        ("recovery_plan", base | {
+            "mode": "reasoning",
+            "prompt": build_recovery_prompt(
+                instruction="dry run", failed_tactile_caption="Touch[rotation=none]",
+                failure_recovery_memory=[{
+                    "recovery_plan": "initial plan",
+                    "failure_reason": "failure_reason=rotate right,grasp appropriate.",
+                }], prompt_profile=MINIMAL_PROMPT_PROFILE,
+            ),
+        }),
+    )
+    original_threshold = policy._need_threshold
+    try:
+        # Ensure warm-up also compiles the conditional failure decoder.
+        policy._need_threshold = -1.0
+        for name, request in requests:
+            started = time.monotonic()
+            events = list(policy.infer_events(request))
+            if not events:
+                raise RuntimeError(f"V7.7 warm-up produced no {name} response")
+            if name == "execution_phase_and_failure":
+                if [event.get("event") for event in events] != ["phase_decision", "failure_reason"]:
+                    raise RuntimeError("V7.7 warm-up did not run the failure decoder")
+            logging.info("V7.7 warm-up %s complete in %.2fs", name, time.monotonic() - started)
+    finally:
+        policy._need_threshold = original_threshold
 
 
 def main():
@@ -255,6 +330,7 @@ def main():
     model_config = v3._model_config(args, config)
     norm_stats = None if args.no_norm else normalize.load(args.norm_stats_dir)
     policy = V77Policy(args=args, config=config, model_config=model_config, norm_stats=norm_stats)
+    warm_up_v77(policy)
     if args.dry_run:
         print(json.dumps(policy.metadata, indent=2, default=str))
         return

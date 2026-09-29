@@ -54,7 +54,6 @@ from tactile_vla.vla.prompts import build_execution_prompt
 from tactile_vla.vla.prompts import build_failure_prompt
 from tactile_vla.vla.prompts import build_reasoning_prompt
 from tactile_vla.vla.prompts import MAX_MEMORY_PAIRS
-from tactile_vla.vla.prompts import MAX_SUPPORTED_ATTEMPTS
 from tactile_vla.vla.prompts import MINIMAL_PROMPT_PROFILE
 from tactile_vla.vla.artifacts import assert_identity_matches
 from tactile_vla.vla.artifacts import checkpoint_artifact_identity
@@ -315,7 +314,7 @@ class TactileVLAPolicyV3:
             "reasoning_max_token_len": reasoning_max_len,
             "reasoning_window_frames": int(config.get("reasoning_window_frames", 15)),
             "max_memory_pairs": MAX_MEMORY_PAIRS,
-            "max_supported_attempts": MAX_SUPPORTED_ATTEMPTS,
+            "memory_retention": "sliding_latest",
             "training_target_coverage": config.get("training_target_coverage"),
             "config": config,
         }

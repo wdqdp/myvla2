@@ -44,7 +44,6 @@ from tactile_vla.vla.prompts import build_failure_prompt
 from tactile_vla.vla.prompts import build_monitor_prompt
 from tactile_vla.vla.prompts import build_reasoning_prompt
 from tactile_vla.vla.prompts import MAX_MEMORY_PAIRS
-from tactile_vla.vla.prompts import MAX_SUPPORTED_ATTEMPTS
 from tactile_vla.vla.prompts import resolve_prompt_profile
 from tactile_vla.vla.prompts import update_failure_recovery_memory
 
@@ -907,22 +906,13 @@ def run_closed_loop(args: argparse.Namespace, operator: RosOperator | ReplayOper
     args.prompt_profile = resolve_prompt_profile(server_metadata.get("prompt_profile"))
     print(f"Using checkpoint prompt profile: {args.prompt_profile}")
     server_max_memory_pairs = int(server_metadata.get("max_memory_pairs", MAX_MEMORY_PAIRS))
-    server_max_attempts = int(server_metadata.get("max_supported_attempts", MAX_SUPPORTED_ATTEMPTS))
     if server_max_memory_pairs != MAX_MEMORY_PAIRS:
         raise ValueError(
             "Client/server recovery memory mismatch: "
             f"client={MAX_MEMORY_PAIRS}, server={server_max_memory_pairs}"
         )
-    if server_max_attempts != MAX_SUPPORTED_ATTEMPTS:
-        raise ValueError(
-            "Client/server attempt limit mismatch: "
-            f"client={MAX_SUPPORTED_ATTEMPTS}, server={server_max_attempts}"
-        )
-    if not 1 <= args.max_attempts <= MAX_SUPPORTED_ATTEMPTS:
-        raise ValueError(
-            f"Requested max_attempts={args.max_attempts}, but server supports at most "
-            f"{MAX_SUPPORTED_ATTEMPTS} attempts"
-        )
+    if args.max_attempts < 1:
+        raise ValueError("max_attempts must be positive")
     args.v3_autoregressive = str(server_metadata.get("stage_b_version", "")).startswith("v3_")
     args.v3_shared_assessment = args.v3_autoregressive and bool(
         server_metadata.get("supports_shared_assessment", False)
@@ -1264,7 +1254,10 @@ def get_arguments() -> tuple[argparse.Namespace, argparse.ArgumentParser]:
         help="Optional YAML topic override file. By default all runtime topics are hard-coded in this script.",
     )
     parser.add_argument("--max_publish_step", type=int, default=10000)
-    parser.add_argument("--max_attempts", type=int, default=5)
+    parser.add_argument(
+        "--max_attempts", type=int, default=5,
+        help="Maximum attempts for this run; recovery memory keeps only the latest 5 pairs.",
+    )
     parser.add_argument("--seed", type=int)
     parser.add_argument("--instruction", type=str, default=DEFAULT_INSTRUCTION)
     parser.add_argument("--case_id", type=str, default="runtime")
@@ -1348,8 +1341,8 @@ def main() -> None:
     apply_yaml_defaults(args, parser)
     if args.publish_rate <= 0:
         parser.error("--publish_rate must be positive")
-    if not 1 <= args.max_attempts <= 5:
-        parser.error("--max_attempts must be in [1, 5]")
+    if args.max_attempts < 1:
+        parser.error("--max_attempts must be positive")
     if args.observation_poll_rate <= 0:
         parser.error("--observation-poll-rate must be positive")
     if args.chunk_size <= 0:

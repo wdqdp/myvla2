@@ -5,6 +5,24 @@ import numpy as np
 from tactile_vla.vla.v7_7_async_state import AsyncPhaseState
 
 
+def test_cli_accepts_attempt_limit_above_training_history_length(tmp_path):
+    import importlib.util
+    from pathlib import Path
+
+    path = Path("openpi/inference/agilex/inference/agilex_inference_v7_7_asyn.py")
+    spec = importlib.util.spec_from_file_location("v77_async_attempt_limit", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    norm_stats = tmp_path / "norm_stats.json"
+    norm_stats.write_text("{}")
+    args, parser = module.get_arguments([
+        "--noise-seed", "1", "--gripper-min", "0",
+        "--norm-stats-file", str(norm_stats), "--max-attempts", "9",
+    ])
+    module.validate_args(args, parser)
+    assert args.max_attempts == 9
+
+
 def test_true_decision_discards_chunk_and_invalidates_action_generation():
     state = AsyncPhaseState(pending_actions=list(range(30)))
     old_generation = state.begin_action_request()

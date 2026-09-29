@@ -342,22 +342,13 @@ def _configure_from_server_metadata(args: argparse.Namespace, metadata: dict[str
     print(f"Using checkpoint prompt profile: {args.prompt_profile}")
 
     server_max_memory_pairs = int(metadata.get("max_memory_pairs", base.MAX_MEMORY_PAIRS))
-    server_max_attempts = int(metadata.get("max_supported_attempts", base.MAX_SUPPORTED_ATTEMPTS))
     if server_max_memory_pairs != base.MAX_MEMORY_PAIRS:
         raise ValueError(
             "Client/server recovery memory mismatch: "
             f"client={base.MAX_MEMORY_PAIRS}, server={server_max_memory_pairs}"
         )
-    if server_max_attempts != base.MAX_SUPPORTED_ATTEMPTS:
-        raise ValueError(
-            "Client/server attempt limit mismatch: "
-            f"client={base.MAX_SUPPORTED_ATTEMPTS}, server={server_max_attempts}"
-        )
-    if not 1 <= args.max_attempts <= base.MAX_SUPPORTED_ATTEMPTS:
-        raise ValueError(
-            f"Requested max_attempts={args.max_attempts}, but server supports at most "
-            f"{base.MAX_SUPPORTED_ATTEMPTS} attempts"
-        )
+    if args.max_attempts < 1:
+        raise ValueError("max_attempts must be positive")
 
     args.v3_autoregressive = str(metadata.get("stage_b_version", "")).startswith("v3_")
     args.v3_shared_assessment = args.v3_autoregressive and bool(
@@ -798,8 +789,8 @@ def main() -> None:
         parser.error("--action-inference-rate must be positive")
     if args.action_inference_rate > args.publish_rate:
         parser.error("--action-inference-rate cannot exceed --publish_rate")
-    if not 1 <= args.max_attempts <= base.MAX_SUPPORTED_ATTEMPTS:
-        parser.error(f"--max_attempts must be in [1, {base.MAX_SUPPORTED_ATTEMPTS}]")
+    if args.max_attempts < 1:
+        parser.error("--max_attempts must be positive")
     if args.observation_poll_rate <= 0:
         parser.error("--observation-poll-rate must be positive")
     if args.chunk_size <= 0:

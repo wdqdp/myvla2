@@ -760,7 +760,10 @@ def get_arguments(argv: list[str] | None = None) -> tuple[argparse.Namespace, ar
     parser.add_argument("--need-recovery-rate-hz", type=float, default=7.0)
     parser.add_argument("--adjustment-end-rate-hz", type=float, default=7.0)
     parser.add_argument("--max_publish_step", type=int, default=10000)
-    parser.add_argument("--max-attempts", type=int, default=5)
+    parser.add_argument(
+        "--max-attempts", type=int, default=5,
+        help="Maximum attempts for this run; plan-recovery memory keeps the latest 5 pairs.",
+    )
     parser.add_argument("--chunk_size", type=int, default=30)
     parser.add_argument("--publish_rate", type=int, default=25)
     parser.add_argument("--observation-poll-rate", type=int, default=200)
@@ -808,8 +811,8 @@ def validate_args(args: argparse.Namespace, parser: argparse.ArgumentParser) -> 
         parser.error("V7.7 phase inference requires the tactile captioner")
     if not args.norm_stats_file.is_file():
         parser.error(f"--norm-stats-file does not exist: {args.norm_stats_file}")
-    if not 1 <= args.max_attempts <= 5:
-        parser.error("--max-attempts must be in [1,5]")
+    if args.max_attempts < 1:
+        parser.error("--max-attempts must be positive")
     if not 1 <= args.chunk_size <= ACTION_HORIZON:
         parser.error(f"--chunk_size must be in [1,{ACTION_HORIZON}]")
     if args.max_publish_step <= 0 or args.publish_rate <= 0 or args.observation_poll_rate <= 0:
