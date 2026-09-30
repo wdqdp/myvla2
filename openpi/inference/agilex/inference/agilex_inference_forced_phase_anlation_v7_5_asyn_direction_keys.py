@@ -152,7 +152,7 @@ def run_v7_5_async_direction_keys(
         }
     )
     print(
-        "V7.6 async direction controls: "
+        f"{getattr(args, 'deployment_label', 'V7.6')} async direction controls: "
         "a=left moderately, s=left slightly, d=right slightly, "
         "f=right moderately, q=quit; SPACE is disabled. "
         f"adjustment_end target rate={args.adjustment_end_rate_hz:g}Hz, "

@@ -250,7 +250,7 @@ def _report_async_adjustment_end(*, args, logger, result, handled_step, previous
     )
     lag_steps = max(0, handled_step - result.captured_step)
     print(
-        f"[V7.5 ADJUSTMENT_END async] result={result.adjustment_end} "
+        f"[{getattr(args, 'deployment_label', 'V7.5')} ADJUSTMENT_END async] result={result.adjustment_end} "
         f"probs={result.probabilities.tolist()} lag_steps={lag_steps} "
         f"gripper_remapped_frames={result.gripper_remapped_frames}"
     )
