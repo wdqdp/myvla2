@@ -11,6 +11,8 @@ from torch import nn
 
 from tactile_vla.common.labels import LABEL_FIELDS
 from tactile_vla.common.labels import LABEL_MAPS
+from tactile_vla.common.labels_v4 import LABEL_FIELDS as V4_LABEL_FIELDS
+from tactile_vla.common.labels_v4 import LABEL_MAPS as V4_LABEL_MAPS
 
 
 class FrameGridEncoder(nn.Module):
@@ -75,9 +77,15 @@ class TactileCaptioner(nn.Module):
         self.mesh_channels = mesh_channels
         self.force_channels = force_channels
         provided_head_sizes = dict(head_num_classes or {field: len(LABEL_MAPS[field]) for field in LABEL_FIELDS})
-        if set(provided_head_sizes) != set(LABEL_FIELDS):
-            raise ValueError(f"head_num_classes fields must be {LABEL_FIELDS}, got {tuple(provided_head_sizes)}")
-        self.head_num_classes = {field: int(provided_head_sizes[field]) for field in LABEL_FIELDS}
+        if set(provided_head_sizes) == set(V4_LABEL_FIELDS):
+            fields, maps = V4_LABEL_FIELDS, V4_LABEL_MAPS
+        elif set(provided_head_sizes) == set(LABEL_FIELDS):
+            fields, maps = LABEL_FIELDS, LABEL_MAPS
+        else:
+            raise ValueError(f"Expected five V3 or six V4 classification heads, got {tuple(provided_head_sizes)}")
+        self.head_num_classes = {field: int(provided_head_sizes[field]) for field in fields}
+        if self.head_num_classes != {field: len(maps[field]) for field in fields}:
+            raise ValueError(f"Classification head sizes do not match tactile labels: {self.head_num_classes}")
         if any(num_classes <= 1 for num_classes in self.head_num_classes.values()):
             raise ValueError(f"Each tactile classification head needs at least two classes: {self.head_num_classes}")
         self.frame_encoder = FrameGridEncoder(

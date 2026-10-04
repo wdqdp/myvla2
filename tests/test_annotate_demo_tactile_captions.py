@@ -199,3 +199,37 @@ def test_preflight_requires_explicit_existing_file_policy(tmp_path: Path) -> Non
         overwrite=True,
         skip_existing=False,
     )
+
+
+class SixHeadPredictor(FakeBatchPredictor):
+    schema_version = "tactile_multifield_v4_masked"
+
+    def predict_batch(self, mesh_motion, force):
+        from tactile_vla.common.labels_v4 import labels_to_caption
+        predictions = super().predict_batch(mesh_motion, force)
+        for prediction in predictions:
+            prediction.label_names["fz_bias"] = "left"
+            prediction.caption = labels_to_caption(prediction.label_names)
+        return predictions
+
+
+@pytest.mark.parametrize("frame_count", [1, 2, 3, 6])
+def test_six_head_annotation_warmup_counts_and_provenance(tmp_path, frame_count):
+    data = make_tactile_data(frame_count)
+    captions, counts = annotation.predict_frame_captions(data, SixHeadPredictor(), batch_size=2)
+    warmup = min(frame_count, 2)
+    assert all("Fz_bias=balanced" in caption for caption in captions[:warmup])
+    assert all("Fz_bias=left" in caption for caption in captions[warmup:])
+    assert counts["fz_bias"]["balanced"] == warmup
+    assert counts["fz_bias"]["left"] == frame_count - warmup
+    assert all(sum(values.values()) == frame_count for values in counts.values())
+    payload = annotation.make_label_payload(
+        existing={"_keep": "unchanged"}, captions=captions, data=data,
+        checkpoint=tmp_path / "best.pt", window_size=3, field_counts=counts,
+        label_schema_version=SixHeadPredictor.schema_version, checkpoint_sha256="abc123",
+    )
+    assert payload["_keep"] == "unchanged"
+    provenance = payload["_tactile_caption_annotation"]
+    assert provenance["checkpoint_sha256"] == "abc123"
+    assert provenance["label_schema_version"] == SixHeadPredictor.schema_version
+    assert "fz_bias" in provenance["field_counts"]

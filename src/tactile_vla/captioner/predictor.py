@@ -1,4 +1,4 @@
-"""Runtime predictor wrapper for the V3 multi-head tactile captioner."""
+"""Predict captions from six-head V4 or legacy five-head V3 checkpoints."""
 
 from __future__ import annotations
 
@@ -10,10 +10,9 @@ import numpy as np
 import torch
 
 from tactile_vla.captioner.training import load_model_from_checkpoint
-from tactile_vla.common.labels import LABEL_FIELDS
-from tactile_vla.common.labels import label_id_to_name
-from tactile_vla.common.labels import labels_to_caption
-from tactile_vla.common.labels import validate_label_maps
+from tactile_vla.common.labels_v4 import label_id_to_name
+from tactile_vla.common.labels_v4 import labels_to_caption
+from tactile_vla.common.labels_v4 import validate_label_maps
 
 
 @dataclasses.dataclass(frozen=True)
@@ -28,7 +27,9 @@ class TactileCaptionerPredictor:
     def __init__(self, checkpoint_path: str | Path, *, device: str = "auto") -> None:
         self.model, self.checkpoint = load_model_from_checkpoint(checkpoint_path, device=device)
         self.device = next(self.model.parameters()).device
-        validate_label_maps(self.checkpoint.get("label_maps", {}))
+        self.label_fields = tuple(self.model.head_num_classes)
+        self.schema_version = self.checkpoint["label_schema_version"]
+        validate_label_maps(self.checkpoint.get("label_maps", {}), schema_version=self.schema_version)
         self.window_size = int(self.checkpoint["dataset_meta"]["window_size"])
         normalization = self.checkpoint["normalization"]
         self.mesh_mean = self._stat_tensor(normalization["mesh_motion_mean"], channels=12)
@@ -82,32 +83,32 @@ class TactileCaptionerPredictor:
         ).view(1, 1, -1, 1, 1)
         return mesh, force_grid
 
-    @staticmethod
     def _decode_predictions(
+        self,
         probabilities: dict[str, torch.Tensor],
     ) -> list[CaptionerPrediction]:
-        batch_size = int(probabilities[LABEL_FIELDS[0]].shape[0])
+        batch_size = int(probabilities[self.label_fields[0]].shape[0])
         predictions: list[CaptionerPrediction] = []
         for batch_index in range(batch_size):
             label_ids = {
                 field: int(torch.argmax(probabilities[field][batch_index]).item())
-                for field in LABEL_FIELDS
+                for field in self.label_fields
             }
             label_names = {
                 field: label_id_to_name(field, label_ids[field])
-                for field in LABEL_FIELDS
+                for field in self.label_fields
             }
             predictions.append(
                 CaptionerPrediction(
                     label_ids=label_ids,
                     label_names=label_names,
-                    caption=labels_to_caption(label_names),
+                    caption=labels_to_caption(label_names, schema_version=self.schema_version),
                     probabilities={
                         field: [
                             float(value)
                             for value in probabilities[field][batch_index].detach().cpu().tolist()
                         ]
-                        for field in LABEL_FIELDS
+                        for field in self.label_fields
                     },
                 )
             )
@@ -119,7 +120,7 @@ class TactileCaptionerPredictor:
         mesh, force_grid = self._normalize(mesh, force_grid)
         with torch.no_grad():
             logits = self.model(mesh, force_grid)
-            probabilities = {field: torch.softmax(logits[field], dim=-1) for field in LABEL_FIELDS}
+            probabilities = {field: torch.softmax(logits[field], dim=-1) for field in self.label_fields}
         return self._decode_predictions(probabilities)[0]
 
     def predict_batch(
@@ -143,5 +144,5 @@ class TactileCaptionerPredictor:
         mesh, force_grid = self._normalize(mesh, force_grid)
         with torch.no_grad():
             logits = self.model(mesh, force_grid)
-            probabilities = {field: torch.softmax(logits[field], dim=-1) for field in LABEL_FIELDS}
+            probabilities = {field: torch.softmax(logits[field], dim=-1) for field in self.label_fields}
         return self._decode_predictions(probabilities)

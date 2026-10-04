@@ -1,4 +1,4 @@
-"""Training and evaluation utilities for the V3 multi-head tactile captioner."""
+"""Train the six-head captioner using only explicitly supervised labels."""
 
 from __future__ import annotations
 
@@ -16,10 +16,13 @@ from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
 from tactile_vla.captioner.model import TactileCaptioner
-from tactile_vla.common.labels import LABEL_FIELDS
-from tactile_vla.common.labels import LABEL_MAPS
-from tactile_vla.common.labels import LABEL_SCHEMA_VERSION
-from tactile_vla.common.labels import class_names
+from tactile_vla.common.labels_v4 import LABEL_FIELDS
+from tactile_vla.common.labels_v4 import LABEL_MAPS
+from tactile_vla.common.labels_v4 import LABEL_SCHEMA_VERSION
+from tactile_vla.common.labels_v4 import class_names
+from tactile_vla.common.labels_v4 import DATASET_FORMAT
+from tactile_vla.common.labels_v4 import schema_for_version
+from tactile_vla.common.labels_v4 import validate_label_maps
 from tactile_vla.common.metrics import classification_report
 from tactile_vla.common.seed import set_seed
 from tactile_vla.data.tactile_captioner_dataset import TactileCaptionerDataset
@@ -31,9 +34,9 @@ CLASS_WEIGHTING_MODES = ("sqrt_inverse", "none")
 
 @dataclasses.dataclass
 class CaptionerTrainConfig:
-    dataset_dir: Path = Path("data/tactile_captioner_data")
+    dataset_dir: Path = Path("/data1/qxh/tac_vla_new/tac_data/tac_cap_data/captioner_dataset_30_window_random")
     output_dir: Path = Path("outputs/tactile_captioner")
-    run_name: str = "tcn_v3_multifield"
+    run_name: str = "tcn_v4_w30_window_random"
     batch_size: int = 128
     epochs: int = 50
     lr: float = 3e-4
@@ -108,7 +111,7 @@ def make_dataloader(
         num_workers=num_workers,
         pin_memory=device.type == "cuda",
         persistent_workers=num_workers > 0,
-        drop_last=shuffle,
+        drop_last=False,
     )
 
 
@@ -145,14 +148,15 @@ def make_scheduler(optimizer: torch.optim.Optimizer, *, total_steps: int) -> tor
 def _move_batch(
     batch: dict[str, Any],
     device: torch.device,
-) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
+    fields: tuple[str, ...],
+) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor], dict[str, torch.Tensor]]:
     mesh_motion = batch["mesh_motion"].to(device, non_blocking=True)
     force = batch["force"].to(device, non_blocking=True)
-    labels = {
-        field: batch["labels"][field].to(device, non_blocking=True)
-        for field in LABEL_FIELDS
-    }
-    return mesh_motion, force, labels
+    labels = {field: batch["labels"][field].to(device, non_blocking=True) for field in fields}
+    if "masks" not in batch:
+        raise ValueError("Captioner batches must provide supervision masks")
+    masks = {field: batch["masks"][field].to(device, non_blocking=True) for field in fields}
+    return mesh_motion, force, labels, masks
 
 
 def _make_criteria(
@@ -161,9 +165,30 @@ def _make_criteria(
     label_smoothing: float,
 ) -> dict[str, nn.CrossEntropyLoss]:
     return {
-        field: nn.CrossEntropyLoss(weight=class_weights[field], label_smoothing=label_smoothing)
-        for field in LABEL_FIELDS
+        field: nn.CrossEntropyLoss(
+            weight=weights, label_smoothing=label_smoothing, reduction="none"
+        )
+        for field, weights in class_weights.items()
     }
+
+
+def _masked_head_losses(
+    logits: dict[str, torch.Tensor],
+    labels: dict[str, torch.Tensor],
+    masks: dict[str, torch.Tensor],
+    criteria: dict[str, nn.CrossEntropyLoss],
+) -> dict[str, torch.Tensor]:
+    """Return per-label losses after masking; inactive -1 targets never enter CE."""
+    losses = {}
+    for field, values in logits.items():
+        mask = masks[field]
+        if mask.dtype != torch.bool or mask.shape != labels[field].shape:
+            raise ValueError(f"Invalid supervision mask for {field}")
+        if mask.any():
+            losses[field] = criteria[field](values[mask], labels[field][mask])
+    if not losses:
+        raise ValueError("Batch has no supervised tactile labels")
+    return losses
 
 
 def _run_epoch(
@@ -180,26 +205,27 @@ def _run_epoch(
 ) -> dict[str, Any]:
     training = optimizer is not None
     model.train(training)
-    labels_all: dict[str, list[torch.Tensor]] = {field: [] for field in LABEL_FIELDS}
-    preds_all: dict[str, list[torch.Tensor]] = {field: [] for field in LABEL_FIELDS}
-    total_head_losses = {field: 0.0 for field in LABEL_FIELDS}
+    fields = tuple(model.head_num_classes)
+    labels_all: dict[str, list[torch.Tensor]] = {field: [] for field in fields}
+    preds_all: dict[str, list[torch.Tensor]] = {field: [] for field in fields}
+    total_head_losses = {field: 0.0 for field in fields}
+    head_samples = {field: 0 for field in fields}
     total_loss = 0.0
     total_samples = 0
+    total_supervised_labels = 0
     last_grad_norm = 0.0
 
     iterator = tqdm(loader, desc=desc, leave=False)
     for batch_idx, batch in enumerate(iterator):
         if max_batches is not None and batch_idx >= max_batches:
             break
-        mesh_motion, force, labels = _move_batch(batch, device)
+        mesh_motion, force, labels, masks = _move_batch(batch, device, fields)
 
         with torch.set_grad_enabled(training):
             logits = model(mesh_motion, force)
-            head_losses = {
-                field: criteria[field](logits[field], labels[field])
-                for field in LABEL_FIELDS
-            }
-            loss = torch.stack(tuple(head_losses.values())).mean()
+            head_losses = _masked_head_losses(logits, labels, masks, criteria)
+            # Each valid target contributes once, independent of inactive heads.
+            loss = torch.cat(tuple(head_losses.values())).mean()
             if training:
                 optimizer.zero_grad(set_to_none=True)
                 loss.backward()
@@ -209,31 +235,41 @@ def _run_epoch(
                 if scheduler is not None:
                     scheduler.step()
 
-        batch_size = int(labels[LABEL_FIELDS[0]].shape[0])
-        total_loss += float(loss.detach().cpu()) * batch_size
+        batch_size = int(mesh_motion.shape[0])
+        supervised_count = sum(values.numel() for values in head_losses.values())
+        total_loss += float(loss.detach().cpu()) * supervised_count
         total_samples += batch_size
-        for field in LABEL_FIELDS:
-            total_head_losses[field] += float(head_losses[field].detach().cpu()) * batch_size
-            labels_all[field].append(labels[field].detach().cpu())
-            preds_all[field].append(torch.argmax(logits[field].detach(), dim=-1).cpu())
-        iterator.set_postfix(loss=total_loss / max(1, total_samples))
+        total_supervised_labels += supervised_count
+        for field, values in head_losses.items():
+            mask = masks[field]
+            head_samples[field] += values.numel()
+            total_head_losses[field] += float(values.detach().sum().cpu())
+            labels_all[field].append(labels[field][mask].detach().cpu())
+            preds_all[field].append(torch.argmax(logits[field][mask].detach(), dim=-1).cpu())
+        iterator.set_postfix(loss=total_loss / max(1, total_supervised_labels))
 
-    if not labels_all[LABEL_FIELDS[0]]:
+    if total_samples == 0:
         raise RuntimeError(f"No batches were processed for {desc}")
 
     heads: dict[str, dict[str, Any]] = {}
-    for field in LABEL_FIELDS:
+    for field in fields:
+        targets = torch.cat(labels_all[field]).numpy() if labels_all[field] else np.empty(0, dtype=np.int64)
+        predictions = torch.cat(preds_all[field]).numpy() if preds_all[field] else np.empty(0, dtype=np.int64)
         report = classification_report(
-            torch.cat(labels_all[field]).numpy(),
-            torch.cat(preds_all[field]).numpy(),
-            num_classes=len(LABEL_MAPS[field]),
+            targets,
+            predictions,
+            num_classes=model.head_num_classes[field],
             class_names=class_names(field),
         )
-        report["loss"] = total_head_losses[field] / max(1, total_samples)
+        report["loss"] = total_head_losses[field] / max(1, head_samples[field])
         heads[field] = report
+    supervised_heads = [field for field in fields if head_samples[field] > 0]
     result: dict[str, Any] = {
-        "loss": total_loss / max(1, total_samples),
-        "mean_macro_f1": float(np.mean([heads[field]["macro_f1"] for field in LABEL_FIELDS])),
+        "loss": total_loss / total_supervised_labels,
+        "num_samples": total_samples,
+        "num_supervised_labels": total_supervised_labels,
+        "supervised_heads": supervised_heads,
+        "mean_macro_f1": float(np.mean([heads[field]["macro_f1"] for field in supervised_heads])),
         "heads": heads,
     }
     if training:
@@ -273,6 +309,11 @@ def save_checkpoint(
             "label_maps": train_dataset.meta["label_maps"],
             "mesh_motion_shape": train_dataset.meta.get("mesh_motion_shape"),
             "force_shape": train_dataset.meta.get("force_shape"),
+            "label_policy": train_dataset.meta.get("label_policy"),
+            "supervision_policy": train_dataset.meta.get("supervision_policy"),
+            "split_policy": train_dataset.meta.get("split_policy", "episode"),
+            "split_seed": train_dataset.meta.get("split_seed"),
+            "split_ratios": train_dataset.meta.get("split_ratios"),
         },
         "saved_at": time.time(),
     }
@@ -286,12 +327,14 @@ def load_model_from_checkpoint(
 ) -> tuple[TactileCaptioner, dict[str, Any]]:
     resolved_device = resolve_device(device) if isinstance(device, str) else device
     checkpoint = torch.load(checkpoint_path, map_location=resolved_device, weights_only=False)
-    if checkpoint.get("label_schema_version") != LABEL_SCHEMA_VERSION:
-        raise ValueError(
-            f"Checkpoint uses label schema {checkpoint.get('label_schema_version')!r}; "
-            f"V3 requires {LABEL_SCHEMA_VERSION!r}"
-        )
+    version = checkpoint.get("label_schema_version")
+    fields, maps = schema_for_version(version)
+    validate_label_maps(checkpoint.get("label_maps", {}), schema_version=version)
     model_config = dict(checkpoint["model_config"])
+    expected_sizes = {field: len(maps[field]) for field in fields}
+    if model_config.get("head_num_classes", expected_sizes) != expected_sizes:
+        raise ValueError("Checkpoint classification heads differ from its label schema")
+    model_config["head_num_classes"] = expected_sizes
     if "temporal_dilations" in model_config:
         model_config["temporal_dilations"] = tuple(model_config["temporal_dilations"])
     model = TactileCaptioner(**model_config)
@@ -321,6 +364,8 @@ def train(config: CaptionerTrainConfig) -> dict[str, Any]:
     )
     val_dataset = TactileCaptionerDataset(config.dataset_dir, split="val", balanced=False, normalize=config.normalize)
     test_dataset = TactileCaptionerDataset(config.dataset_dir, split="test", balanced=False, normalize=config.normalize)
+    if any(dataset.meta["dataset_format"] != DATASET_FORMAT for dataset in (train_dataset, val_dataset, test_dataset)):
+        raise ValueError(f"Six-head training requires the current masked format {DATASET_FORMAT!r}")
     if not (train_dataset.head_num_classes == val_dataset.head_num_classes == test_dataset.head_num_classes):
         raise ValueError("train/val/test tactile label maps do not match")
 
@@ -371,7 +416,7 @@ def train(config: CaptionerTrainConfig) -> dict[str, Any]:
         label_smoothing=0.0,
     )
     optimizer = torch.optim.AdamW(model.parameters(), lr=config.lr, weight_decay=config.weight_decay)
-    train_steps_per_epoch = config.max_train_batches or len(train_loader)
+    train_steps_per_epoch = min(config.max_train_batches, len(train_loader)) if config.max_train_batches else len(train_loader)
     scheduler = make_scheduler(optimizer, total_steps=max(1, train_steps_per_epoch * config.epochs))
 
     best_mean_macro_f1 = -1.0
@@ -481,6 +526,11 @@ def evaluate_checkpoint(
     if dataset_dir is None:
         dataset_dir = checkpoint["config"]["dataset_dir"]
     dataset = TactileCaptionerDataset(dataset_dir, split=split, balanced=False, normalize=normalize)
+    if dataset.meta["label_schema_version"] != checkpoint["label_schema_version"]:
+        raise ValueError("Dataset label schema differs from checkpoint label schema")
+    checkpoint_policy = checkpoint["dataset_meta"].get("split_policy", "episode")
+    if dataset.meta.get("split_policy", "episode") != checkpoint_policy:
+        raise ValueError("Dataset split policy differs from checkpoint split policy")
     checkpoint_window = int(checkpoint["dataset_meta"]["window_size"])
     if dataset.window_size != checkpoint_window:
         raise ValueError(
@@ -495,8 +545,8 @@ def evaluate_checkpoint(
     )
     criteria = _make_criteria(
         {
-            field: torch.ones((len(LABEL_MAPS[field]),), dtype=torch.float32, device=resolved_device)
-            for field in LABEL_FIELDS
+            field: torch.ones((size,), dtype=torch.float32, device=resolved_device)
+            for field, size in model.head_num_classes.items()
         },
         label_smoothing=0.0,
     )

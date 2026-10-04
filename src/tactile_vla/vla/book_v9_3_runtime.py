@@ -16,6 +16,7 @@ DEFAULT_NORM_DIR = BOOK_ROOT / "outputs/rotation_v4/norm_stats"
 DEFAULT_INDEX = BOOK_ROOT / "outputs/book_v9_3_multitask/book_v9_3_multitask_training_index.json"
 SERVER_NAME = "tactile_vla_book_v9_3"
 THRESHOLD_SCHEMA = "book_v9_3_val_thresholds_v1"
+DEFAULT_THRESHOLD = 0.5
 HISTORY_OFFSETS = uniform_positions(100).tolist()
 MEMORY_POLICY = "latest_failed_plan_reason_pair_only"
 
@@ -68,10 +69,11 @@ def resolve_thresholds(
             raise ValueError(f"Book V9.3 threshold identity mismatch: {mismatch}")
     thresholds, overrides = {}, {}
     for task, override in (("need_recovery", need_override), ("adjustment_end", adjustment_override)):
-        value = override if override is not None else (calibration or {}).get("thresholds", {}).get(task)
+        value = override if override is not None else (
+            DEFAULT_THRESHOLD if calibration is None else calibration.get("thresholds", {}).get(task)
+        )
         if value is None:
-            raise ValueError(f"{task}: supply --thresholds-file or an explicit threshold override; "
-                             "training 0.5 placeholders are not deployment thresholds")
+            raise ValueError(f"{task}: supplied thresholds file is missing this threshold")
         value = float(value)
         if not math.isfinite(value) or not 0.0 <= value <= 1.0:
             raise ValueError(f"{task} threshold must be finite and in [0,1]")
@@ -101,6 +103,7 @@ def validate_server_metadata(metadata: dict[str, Any]) -> None:
         value = float(metadata.get(f"{task}_threshold", -1))
         if not math.isfinite(value) or not 0.0 <= value <= 1.0:
             raise ValueError(f"Invalid {task} threshold")
-    if metadata.get("thresholds_status") not in {"calibrated_on_book_val", "explicit_manual_override"}:
-        raise ValueError("Book V9.3 requires calibrated or explicitly overridden thresholds")
-
+    if metadata.get("thresholds_status") not in {
+        "default_0_5", "calibrated_on_book_val", "explicit_manual_override",
+    }:
+        raise ValueError("Book V9.3 requires default, calibrated or explicitly overridden thresholds")

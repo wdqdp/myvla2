@@ -16,9 +16,9 @@ from tactile_vla.captioner.training import train  # noqa: E402
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--dataset-dir", type=Path, default=PROJECT_ROOT / "data" / "tactile_captioner_data")
+    parser.add_argument("--dataset-dir", type=Path, default=Path("/data1/qxh/tac_vla_new/tac_data/tac_cap_data/captioner_dataset_30_window_random"))
     parser.add_argument("--output-dir", type=Path, default=PROJECT_ROOT / "outputs" / "tactile_captioner")
-    parser.add_argument("--run-name", default="tcn_v3_multifield")
+    parser.add_argument("--run-name", default="tcn_v4_w30_window_random")
     parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--lr", type=float, default=3e-4)

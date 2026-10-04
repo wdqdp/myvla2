@@ -36,9 +36,11 @@ def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     parser.add_argument("--checkpoint", type=Path, default=DEFAULT_RUN / "4000")
     parser.add_argument("--norm-stats-dir", type=Path, default=DEFAULT_NORM_DIR)
-    parser.add_argument("--thresholds-file", type=Path)
-    parser.add_argument("--need-recovery-threshold", type=float)
-    parser.add_argument("--adjustment-end-threshold", type=float)
+    parser.add_argument("--thresholds-file", type=Path, help="Optional calibrated thresholds; omitted by default")
+    parser.add_argument("--need-recovery-threshold", type=float,
+                        help="Override need_recovery threshold; defaults to 0.5 without a thresholds file")
+    parser.add_argument("--adjustment-end-threshold", type=float,
+                        help="Override adjustment_end threshold; defaults to 0.5 without a thresholds file")
     parser.add_argument("--captioner-checkpoint-sha256", required=True,
                         help="SHA256 of the captioner used by the robot (runtime identity, not training provenance)")
     parser.add_argument("--host", default="0.0.0.0")
@@ -96,7 +98,10 @@ def resolve_deployment(args, identity):
     args.adjustment_end_threshold = thresholds["adjustment_end"]
     return {
         "thresholds": thresholds, "threshold_manual_overrides": overrides,
-        "thresholds_status": "explicit_manual_override" if any(overrides.values()) else "calibrated_on_book_val",
+        "thresholds_status": (
+            "explicit_manual_override" if any(overrides.values())
+            else "calibrated_on_book_val" if calibration is not None else "default_0_5"
+        ),
         "thresholds_file": str(args.thresholds_file.resolve()) if args.thresholds_file else None,
         "accepted_for_robot": False,
     }
@@ -243,6 +248,8 @@ def main():
     args = parse_args()
     config, identity = inspect_artifacts(args)
     deployment = resolve_deployment(args, identity)
+    logging.info("Book V9.3 runtime thresholds: need_recovery=%s adjustment_end=%s source=%s",
+                 args.need_recovery_threshold, args.adjustment_end_threshold, deployment["thresholds_status"])
     if args.validate_only:
         print(json.dumps(identity | deployment, indent=2, ensure_ascii=False))
         return

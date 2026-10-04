@@ -354,6 +354,14 @@ def _run_phase_assessment(
         if event.get("event") == "phase_decision":
             decision_received = time.monotonic()
         gate.handle_phase_event(event)
+        if phase == "execution" and event.get("event") == "phase_decision":
+            print(
+                f"[NEED_RECOVERY] request_id={request_id} "
+                f"caption={observation.tactile_caption} "
+                f"result={bool(event.get('need_recovery'))} "
+                f"probs(false,true)={event.get('need_recovery_probs')}",
+                flush=True,
+            )
         events.append(event)
     if not events:
         raise ValueError("Book V9.3 phase request returned no events")
@@ -460,8 +468,6 @@ def run_book_v9_3_async(
         raise ValueError("Book client/server norm stats differ")
     if action_metadata.get("captioner_checkpoint_sha256") != sha256_file(args.captioner_checkpoint):
         raise ValueError("Book client/server captioner identities differ")
-    if any(action_metadata.get("threshold_manual_overrides", {}).values()) and not args.allow_experimental_thresholds:
-        raise ValueError("Pass --allow-experimental-thresholds to acknowledge manual thresholds")
     if action_metadata != phase_client.metadata:
         raise ValueError("Book V9.3 action and phase connections expose different metadata")
     args.use_state_history = False
@@ -774,7 +780,7 @@ def get_arguments(argv: list[str] | None = None) -> tuple[argparse.Namespace, ar
     parser.add_argument("--success-key", default="s")
     parser.add_argument("--quit-key", default="q")
     parser.add_argument("--no-publish", action="store_true")
-    parser.add_argument("--allow-experimental-thresholds", action="store_true")
+    parser.add_argument("--allow-experimental-thresholds", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--gripper_offset", type=float, default=0.001)
     parser.add_argument("--gripper-min", dest="gripper_min", type=float, required=True)
     parser.add_argument(

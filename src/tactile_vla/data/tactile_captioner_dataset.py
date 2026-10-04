@@ -1,4 +1,4 @@
-"""PyTorch loader for the V3 tactile-captioner shard dataset."""
+"""Load six-head masked tactile shards and legacy five-head shards."""
 
 from __future__ import annotations
 
@@ -11,10 +11,12 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
-from tactile_vla.common.labels import LABEL_FIELDS
-from tactile_vla.common.labels import LABEL_MAPS
-from tactile_vla.common.labels import LABEL_SCHEMA_VERSION
-from tactile_vla.common.labels import validate_label_maps
+from tactile_vla.common.labels import LABEL_SCHEMA_VERSION as LEGACY_SCHEMA_VERSION
+from tactile_vla.common.labels_v4 import DATASET_FORMAT
+from tactile_vla.common.labels_v4 import INVALID_LABEL_ID
+from tactile_vla.common.labels_v4 import LABEL_SCHEMA_VERSION
+from tactile_vla.common.labels_v4 import schema_for_version
+from tactile_vla.common.labels_v4 import validate_label_maps
 
 
 class TactileCaptionerDataset(Dataset):
@@ -56,19 +58,19 @@ class TactileCaptionerDataset(Dataset):
         self.mesh_std = self._stat_tensor("mesh_motion", "std", expected_channels=12)
         self.force_mean = self._stat_tensor("force", "mean", expected_channels=6)
         self.force_std = self._stat_tensor("force", "std", expected_channels=6)
+        self._validate_windows()
 
     def _validate_meta(self) -> None:
-        if self.meta.get("dataset_format") != "tactile_captioner_shards_v2":
-            raise ValueError(
-                f"Unsupported tactile dataset format: {self.meta.get('dataset_format')!r}; "
-                "expected 'tactile_captioner_shards_v2'"
-            )
-        if self.meta.get("label_schema_version") != LABEL_SCHEMA_VERSION:
-            raise ValueError(
-                f"Unsupported tactile label schema: {self.meta.get('label_schema_version')!r}; "
-                f"expected {LABEL_SCHEMA_VERSION!r}"
-            )
-        validate_label_maps(self.meta.get("label_maps", {}))
+        self.masked = self.meta.get("dataset_format") == DATASET_FORMAT
+        if not self.masked and self.meta.get("dataset_format") != "tactile_captioner_shards_v2":
+            raise ValueError(f"Unsupported tactile dataset format: {self.meta.get('dataset_format')!r}")
+        expected_schema = LABEL_SCHEMA_VERSION if self.masked else LEGACY_SCHEMA_VERSION
+        if self.meta.get("label_schema_version") != expected_schema:
+            raise ValueError(f"Dataset format requires label schema {expected_schema!r}")
+        self.label_fields, self.label_maps = schema_for_version(expected_schema)
+        validate_label_maps(self.meta.get("label_maps", {}), schema_version=expected_schema)
+        if self.masked and self.meta.get("label_policy") != "episode_constant":
+            raise ValueError("Masked tactile data must use label_policy='episode_constant'")
         if not isinstance(self.meta.get("sequences"), list):
             raise ValueError("meta.json is missing the sequences list")
         if int(self.meta.get("window_size", 0)) <= 0:
@@ -76,7 +78,9 @@ class TactileCaptionerDataset(Dataset):
 
     def _validate_index(self, index_path: Path) -> None:
         required = {"sequence_index", "end_frame_index"}
-        required.update(f"{field}_label" for field in LABEL_FIELDS)
+        required.update(f"{field}_label" for field in self.label_fields)
+        if self.masked:
+            required.update(f"{field}_mask" for field in self.label_fields)
         missing = required - set(self.index)
         if missing:
             raise ValueError(f"{index_path} is missing index arrays: {sorted(missing)}")
@@ -84,12 +88,48 @@ class TactileCaptionerDataset(Dataset):
         for key in required:
             if self.index[key].shape != (length,):
                 raise ValueError(f"{index_path} {key} shape {self.index[key].shape} != {(length,)}")
-        for field in LABEL_FIELDS:
+        active_count = np.zeros(length, dtype=np.int64)
+        for field in self.label_fields:
             values = self.index[f"{field}_label"]
-            valid_ids = set(LABEL_MAPS[field].values())
-            found = set(int(value) for value in np.unique(values).tolist())
+            if not np.issubdtype(values.dtype, np.integer):
+                raise ValueError(f"{index_path} {field} labels must be integers")
+            mask = self.index[f"{field}_mask"] if self.masked else np.ones(length, dtype=np.bool_)
+            if mask.dtype != np.bool_:
+                raise ValueError(f"{index_path} {field} mask must be boolean")
+            active_count += mask
+            valid_ids = set(self.label_maps[field].values())
+            found = set(int(value) for value in np.unique(values[mask]).tolist())
             if not found.issubset(valid_ids):
-                raise ValueError(f"{index_path} has invalid {field} ids: {sorted(found - valid_ids)}")
+                raise ValueError(f"{index_path} has invalid supervised {field} ids: {sorted(found - valid_ids)}")
+            if self.masked and np.any(values[~mask] != INVALID_LABEL_ID):
+                raise ValueError(f"{index_path} inactive {field} labels must be -1")
+        if self.masked and np.any(active_count != 1):
+            raise ValueError(f"{index_path} requires exactly one supervised head per window")
+
+    def _validate_windows(self) -> None:
+        sequence_ids = self.index["sequence_index"]
+        ends = self.index["end_frame_index"]
+        for sequence_id in np.unique(sequence_ids):
+            record = self.sequences.get(int(sequence_id))
+            if record is None:
+                raise ValueError(f"Unknown sequence_index={sequence_id}")
+            if self.meta.get("split_policy") != "window_random" and record.get("split", self.split) != self.split:
+                raise ValueError(f"Sequence {sequence_id} belongs to a different split")
+            selected = sequence_ids == sequence_id
+            sequence_ends = ends[selected]
+            if np.any(sequence_ends < self.window_size - 1):
+                raise ValueError(f"Sequence {sequence_id} has incomplete windows")
+            if "num_frames" in record and np.any(sequence_ends >= int(record["num_frames"])):
+                raise ValueError(f"Sequence {sequence_id} window exceeds frame count")
+            if self.masked:
+                field = record.get("label_task")
+                target = record.get("target_label")
+                if field not in self.label_maps or target not in self.label_maps[field]:
+                    raise ValueError(f"Sequence {sequence_id} has invalid episode target")
+                if not self.index[f"{field}_mask"][selected].all():
+                    raise ValueError(f"Sequence {sequence_id} mask differs from episode target")
+                if np.any(self.index[f"{field}_label"][selected] != self.label_maps[field][target]):
+                    raise ValueError(f"Sequence {sequence_id} labels differ from episode target")
 
     @property
     def window_size(self) -> int:
@@ -97,7 +137,7 @@ class TactileCaptionerDataset(Dataset):
 
     @property
     def head_num_classes(self) -> dict[str, int]:
-        return {field: len(self.meta["label_maps"][field]) for field in LABEL_FIELDS}
+        return {field: len(self.label_maps[field]) for field in self.label_fields}
 
     def __len__(self) -> int:
         return int(len(self.index["end_frame_index"]))
@@ -164,8 +204,12 @@ class TactileCaptionerDataset(Dataset):
             "force": force,
             "labels": {
                 field: torch.tensor(int(self.index[f"{field}_label"][index]), dtype=torch.long)
-                for field in LABEL_FIELDS
+                for field in self.label_fields
             },
+        }
+        item["masks"] = {
+            field: torch.tensor(bool(self.index[f"{field}_mask"][index]) if self.masked else True, dtype=torch.bool)
+            for field in self.label_fields
         }
         if self.include_metadata:
             item.update(
@@ -190,10 +234,12 @@ class TactileCaptionerDataset(Dataset):
 
 def label_counts(dataset: TactileCaptionerDataset) -> dict[str, dict[int, int]]:
     result: dict[str, dict[int, int]] = {}
-    for field in LABEL_FIELDS:
+    for field in dataset.label_fields:
         values = np.asarray(dataset.index[f"{field}_label"]).astype(np.int64)
+        if dataset.masked:
+            values = values[dataset.index[f"{field}_mask"]]
         result[field] = {
             label_id: int((values == label_id).sum())
-            for label_id in range(len(LABEL_MAPS[field]))
+            for label_id in range(len(dataset.label_maps[field]))
         }
     return result

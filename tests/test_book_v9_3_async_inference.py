@@ -76,16 +76,18 @@ def resolve(document, **kwargs):
                               need_override=kwargs.get("need"), adjustment_override=kwargs.get("adjustment"))
 
 
-def test_thresholds_require_calibration_or_explicit_override():
-    with pytest.raises(ValueError, match="placeholders"):
-        resolve(None)
+def test_thresholds_default_to_half_and_allow_independent_overrides():
+    thresholds, overrides = resolve(None)
+    assert thresholds == {"need_recovery": 0.5, "adjustment_end": 0.5}
+    assert not any(overrides.values())
     thresholds, overrides = resolve(calibration())
     assert thresholds == {"need_recovery": 0.6, "adjustment_end": 0.7}
     assert not any(overrides.values())
     thresholds, overrides = resolve(None, need=0.4, adjustment=0.8)
     assert thresholds["adjustment_end"] == 0.8 and all(overrides.values())
-    with pytest.raises(ValueError, match="adjustment_end"):
-        resolve(None, need=0.4)
+    thresholds, overrides = resolve(None, need=0.4)
+    assert thresholds == {"need_recovery": 0.4, "adjustment_end": 0.5}
+    assert overrides == {"need_recovery": True, "adjustment_end": False}
 
 
 @pytest.mark.parametrize("field,value", [("checkpoint_step", 3500), ("full_params_sha256", "d" * 64),
@@ -104,6 +106,8 @@ def test_invalid_manual_thresholds_rejected(threshold):
 def test_metadata_rejects_v9_2_history_or_multi_pair_memory():
     metadata = valid_metadata()
     validate_server_metadata(metadata)
+    validate_server_metadata(metadata | {"thresholds_status": "default_0_5",
+                                        "need_recovery_threshold": 0.5, "adjustment_end_threshold": 0.5})
     for field, value in (("qpos_h100_sample_offsets", [0, 10, 20, 30, 40, 50, 59, 69, 79, 89, 99]),
                          ("max_memory_pairs", 4), ("max_supported_attempts", 5),
                          ("thresholds_status", "uncalibrated_placeholders_not_for_robot")):

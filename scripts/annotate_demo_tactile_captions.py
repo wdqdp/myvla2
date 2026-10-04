@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Annotate synchronized V3 demonstrations with a fine-tuned W30 captioner."""
+"""Annotate synchronized demonstrations with a V3 or six-head V4 W30 captioner."""
 
 from __future__ import annotations
 
@@ -8,6 +8,7 @@ from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import json
+import hashlib
 from pathlib import Path
 import re
 import sys
@@ -22,9 +23,9 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 from tactile_vla.captioner.predictor import TactileCaptionerPredictor  # noqa: E402
-from tactile_vla.common.labels import DEFAULT_TACTILE_CAPTION  # noqa: E402
-from tactile_vla.common.labels import LABEL_FIELDS  # noqa: E402
 from tactile_vla.common.labels import NEUTRAL_LABELS  # noqa: E402
+from tactile_vla.common.labels import LABEL_SCHEMA_VERSION as LEGACY_SCHEMA_VERSION  # noqa: E402
+from tactile_vla.common.labels_v4 import labels_to_caption, schema_for_version  # noqa: E402
 
 
 DEFAULT_DATASET_DIR = Path("/data1/tac_data/raw_data")
@@ -204,8 +205,12 @@ def predict_frame_captions(
     window_size = int(predictor.window_size)
     frame_count = len(data.timestamps)
     warmup_frames = min(frame_count, window_size - 1)
-    captions = [DEFAULT_TACTILE_CAPTION] * warmup_frames
-    field_counts = {field: Counter({NEUTRAL_LABELS[field]: warmup_frames}) for field in LABEL_FIELDS}
+    schema_version = getattr(predictor, "schema_version", LEGACY_SCHEMA_VERSION)
+    fields, _ = schema_for_version(schema_version)
+    neutral = {**NEUTRAL_LABELS, "fz_bias": "balanced"}
+    neutral_caption = labels_to_caption(neutral, schema_version=schema_version)
+    captions = [neutral_caption] * warmup_frames
+    field_counts = {field: Counter({neutral[field]: warmup_frames}) for field in fields}
 
     offsets = np.arange(window_size - 1, -1, -1, dtype=np.int64)
     for batch_start in range(window_size - 1, frame_count, batch_size):
@@ -222,7 +227,7 @@ def predict_frame_captions(
             )
         for prediction in predictions:
             captions.append(str(prediction.caption))
-            for field in LABEL_FIELDS:
+            for field in fields:
                 field_counts[field][str(prediction.label_names[field])] += 1
 
     if len(captions) != frame_count:
@@ -255,12 +260,16 @@ def make_label_payload(
     checkpoint: Path,
     window_size: int,
     field_counts: dict[str, Counter[str]],
+    label_schema_version: str = LEGACY_SCHEMA_VERSION,
+    checkpoint_sha256: str | None = None,
 ) -> dict[str, Any]:
     payload = dict(existing or {})
     payload["tactile_caption"] = captions
     payload["_tactile_caption_annotation"] = {
         "schema_version": ANNOTATION_SCHEMA_VERSION,
         "checkpoint": str(checkpoint.resolve()),
+        "checkpoint_sha256": checkpoint_sha256,
+        "label_schema_version": label_schema_version,
         "window_size": int(window_size),
         "warmup_policy": "first window_size-1 frames use the neutral caption",
         "num_frames": len(captions),
@@ -268,7 +277,7 @@ def make_label_payload(
         "last_timestamp": float(data.timestamps[-1]),
         "field_counts": {
             field: {name: int(count) for name, count in sorted(field_counts[field].items())}
-            for field in LABEL_FIELDS
+            for field in field_counts
         },
         "generated_at_utc": datetime.now(timezone.utc).isoformat(),
     }
@@ -279,7 +288,7 @@ def _merge_counts(
     destination: dict[str, Counter[str]],
     source: dict[str, Counter[str]],
 ) -> None:
-    for field in LABEL_FIELDS:
+    for field in destination:
         destination[field].update(source[field])
 
 
@@ -400,7 +409,10 @@ def main() -> None:
         f"offline batch_size={args.batch_size}"
     )
 
-    aggregate_counts = {field: Counter() for field in LABEL_FIELDS}
+    fields, _ = schema_for_version(predictor.schema_version)
+    with args.checkpoint.open("rb") as stream:
+        checkpoint_hash = hashlib.file_digest(stream, "sha256").hexdigest()
+    aggregate_counts = {field: Counter() for field in fields}
     attempt_reports: list[dict[str, Any]] = []
     annotated_count = 0
     skipped_count = 0
@@ -433,6 +445,8 @@ def main() -> None:
             checkpoint=args.checkpoint,
             window_size=predictor.window_size,
             field_counts=field_counts,
+            label_schema_version=predictor.schema_version,
+            checkpoint_sha256=checkpoint_hash,
         )
         _atomic_write_json(destination, payload)
         _merge_counts(aggregate_counts, field_counts)
@@ -454,6 +468,8 @@ def main() -> None:
         "schema_version": ANNOTATION_SCHEMA_VERSION,
         "dataset_dir": str(args.dataset_dir.resolve()),
         "checkpoint": str(args.checkpoint.resolve()),
+        "checkpoint_sha256": checkpoint_hash,
+        "label_schema_version": predictor.schema_version,
         "window_size": int(predictor.window_size),
         "warmup_policy": "first window_size-1 frames use the neutral caption",
         "selected_attempts": len(attempts),
@@ -462,7 +478,7 @@ def main() -> None:
         "annotated_frames": total_frames,
         "field_counts": {
             field: {name: int(count) for name, count in sorted(aggregate_counts[field].items())}
-            for field in LABEL_FIELDS
+            for field in fields
         },
         "attempts": attempt_reports,
         "generated_at_utc": datetime.now(timezone.utc).isoformat(),
