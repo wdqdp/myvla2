@@ -75,7 +75,8 @@ def selected_train_frames(reexecution_frame: int, *, episode_id: int, seed: int 
 
 def build_artifacts(
     *, dataset_dir: Path, v4_index_file: Path, action_index_file: Path,
-    norm_stats_file: Path, stage_a_checkpoint: Path, tokenizer: Any, seed: int = 42,
+    norm_stats_file: Path, stage_a_checkpoint: Path | None, tokenizer: Any, seed: int = 42,
+    expected_counts: Mapping[str, tuple[int, int, int]] = EXPECTED_COUNTS,
 ) -> tuple[list[dict[str, Any]], dict[str, Any], dict[str, Any]]:
     dataset_dir = dataset_dir.expanduser().resolve()
     v4_index = json.loads(v4_index_file.read_text())
@@ -89,15 +90,23 @@ def build_artifacts(
     events, timing_identity = native_reexecution_events(v4_index=v4_index, frames=frames)
     if timing_identity != action_index["native_reexecution_timing_identity"]:
         raise ValueError("Native rexecution event identity changed")
-    stage_a_checkpoint = stage_a_checkpoint.expanduser().resolve()
-    if stage_a_checkpoint.name != "15000" or not (stage_a_checkpoint / "params/_METADATA").is_file():
-        raise ValueError("Book V9.2 requires the Stage A step 15000 checkpoint")
-    stage_a_config = stage_a_checkpoint.parent / "config.json"
-    config = json.loads(stage_a_config.read_text())
-    if (config.get("data_profile"), config.get("num_steps"), config.get("use_state_history")) != (
-        "book_stage_a_v1", 15000, False,
-    ):
-        raise ValueError("Stage A config is not the book V9.1 no-history model")
+    # V9.2 still passes a checkpoint; V9.4 constructs model-independent data.
+    model_identity, model_sources = {}, {}
+    if stage_a_checkpoint is not None:
+        stage_a_checkpoint = stage_a_checkpoint.expanduser().resolve()
+        if stage_a_checkpoint.name != "15000" or not (stage_a_checkpoint / "params/_METADATA").is_file():
+            raise ValueError("Book V9.2 requires the Stage A step 15000 checkpoint")
+        stage_a_config = stage_a_checkpoint.parent / "config.json"
+        config = json.loads(stage_a_config.read_text())
+        if (config.get("data_profile"), config.get("num_steps"), config.get("use_state_history")) != (
+            "book_stage_a_v1", 15000, False,
+        ):
+            raise ValueError("Stage A config is not the book V9.1 no-history model")
+        model_identity = {"stage_a_checkpoint": {"path": str(stage_a_checkpoint), "step": 15000}}
+        model_sources = {
+            "backbone_config": file_identity(stage_a_config),
+            "stage_a_params_metadata": file_identity(stage_a_checkpoint / "params/_METADATA"),
+        }
 
     groups: dict[tuple[int, int], list[Any]] = defaultdict(list)
     for frame in frames:
@@ -177,8 +186,8 @@ def build_artifacts(
     splits = {}
     for split in SPLITS:
         actual = (attempt_counts[split], selected_counts[split]["positive"], selected_counts[split]["negative"])
-        if actual != EXPECTED_COUNTS[split]:
-            raise ValueError(f"Book V9.2 {split} counts changed: {actual} != {EXPECTED_COUNTS[split]}")
+        if actual != expected_counts[split]:
+            raise ValueError(f"Book adjustment {split} counts changed: {actual} != {expected_counts[split]}")
         splits[split] = {
             "manifest_row_indices": split_rows[split], "global_indices": split_globals[split],
             "sample_count": len(split_rows[split]), "positive_count": actual[1],
@@ -200,13 +209,12 @@ def build_artifacts(
         "state_norm": {"method": "q01_q99_pi05", "norm_stats_sha256": sha256_file(norm_stats_file),
                        "q01": stats.q01.tolist(), "q99": stats.q99.tolist()},
         "caption_source": {"field": "tactile_caption", "source": "book_v4_lerobot"},
-        "stage_a_checkpoint": {"path": str(stage_a_checkpoint), "step": 15000},
+        **model_identity,
         "source_files": {
             "v4_training_index": file_identity(v4_index_file),
             "book_stage_a_index": file_identity(action_index_file),
             "v4_norm_stats": file_identity(norm_stats_file),
-            "backbone_config": file_identity(stage_a_config),
-            "stage_a_params_metadata": file_identity(stage_a_checkpoint / "params/_METADATA"),
+            **model_sources,
         },
     }
     summary = {

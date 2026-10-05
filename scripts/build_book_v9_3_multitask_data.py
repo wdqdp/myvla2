@@ -49,9 +49,9 @@ def _load(path: Path):
     return json.loads(path.read_text())
 
 
-def _base_row(frame, split: str, source: str):
+def _base_row(frame, split: str, source: str, *, data_profile=DATA_PROFILE, manifest_schema=MANIFEST_SCHEMA):
     return {
-        "schema_version": MANIFEST_SCHEMA, "data_profile": DATA_PROFILE,
+        "schema_version": manifest_schema, "data_profile": data_profile,
         "split": split, "global_index": frame.global_index,
         "episode_id": frame.episode_id, "attempt_id": frame.attempt_id,
         "frame_index": frame.frame_index, "timestamp": frame.ros_timestamp,
@@ -86,7 +86,13 @@ def need_negative_source(frame, meta):
     return None
 
 
-def build(args):
+def build(args, *, expected_counts=EXPECTED_COUNTS, data_profile=DATA_PROFILE,
+          index_schema=INDEX_SCHEMA, manifest_schema=MANIFEST_SCHEMA,
+          validate_stage_a_model=True):
+    # Defaults preserve V9.3 exactly; incremental versions derive counts from their sources.
+    def base_row(frame, split, source):
+        return _base_row(frame, split, source, data_profile=data_profile, manifest_schema=manifest_schema)
+
     if args.seed != 42:
         raise ValueError("Book V9.3 fixes the sampling seed to 42")
     v4_index_path = args.v4_dir / "v4_training_index.json"
@@ -95,12 +101,13 @@ def build(args):
     norm_path = args.v4_dir / "norm_stats/norm_stats.json"
     adjustment_index_path = args.adjustment_dir / "adjustment_end_training_index.json"
     adjustment_manifest_path = args.adjustment_dir / "adjustment_end_manifest.jsonl"
-    stage_a_config_path = args.stage_a_checkpoint.parent / "config.json"
     required = [
         v4_index_path, profile_path, splits_path, norm_path, args.action_index,
         adjustment_index_path, adjustment_manifest_path,
-        stage_a_config_path, args.stage_a_checkpoint / "params/_METADATA",
     ]
+    if validate_stage_a_model:
+        stage_a_config_path = args.stage_a_checkpoint.parent / "config.json"
+        required += [stage_a_config_path, args.stage_a_checkpoint / "params/_METADATA"]
     for split in ("train", "val", "test"):
         required += [
             args.v4_dir / f"need/{split}.jsonl",
@@ -127,16 +134,17 @@ def build(args):
         or sha256_json(source_adjustment) != adjustment_index["manifest_identity"]["content_sha256"]
     ):
         raise ValueError("Book V9.2 adjustment manifest content changed")
-    stage_a_config = _load(stage_a_config_path)
-    if (
-        args.stage_a_checkpoint.name != "15000"
-        or stage_a_config.get("data_profile") != "book_stage_a_v1"
-        or stage_a_config.get("use_state_history") is not False
-        or stage_a_config.get("artifact_identity", {}).get("training_data_hash") != action_index["training_data_hash"]
-    ):
-        raise ValueError("Book V9.3 must initialize the matching no-history Stage A step 15000")
-    if Path(adjustment_index["stage_a_checkpoint"]["path"]).resolve() != args.stage_a_checkpoint.resolve():
-        raise ValueError("Book V9.2 adjustment data references another Stage A checkpoint")
+    if validate_stage_a_model:
+        stage_a_config = _load(stage_a_config_path)
+        if (
+            args.stage_a_checkpoint.name != "15000"
+            or stage_a_config.get("data_profile") != "book_stage_a_v1"
+            or stage_a_config.get("use_state_history") is not False
+            or stage_a_config.get("artifact_identity", {}).get("training_data_hash") != action_index["training_data_hash"]
+        ):
+            raise ValueError("Book V9.3 must initialize the matching no-history Stage A step 15000")
+        if Path(adjustment_index["stage_a_checkpoint"]["path"]).resolve() != args.stage_a_checkpoint.resolve():
+            raise ValueError("Book V9.2 adjustment data references another Stage A checkpoint")
 
     frames = scan_v4_lerobot_frames(args.dataset_dir)
     _validate_timeline_order(frames)
@@ -174,7 +182,7 @@ def build(args):
             or bool(old["adjustment_end"]) != (frame.frame_index >= int(old["rexecution_frame"]) - 10)
         ):
             raise ValueError(f"Book V9.2 adjustment row {source_index} identity/label mismatch")
-        adjustment.append(_base_row(frame, old["split"], "book_v9_2_factual") | {
+        adjustment.append(base_row(frame, old["split"], "book_v9_2_factual") | {
             "rexecution_frame": int(old["rexecution_frame"]),
             "adjustment_end": bool(old["adjustment_end"]),
             "v9_2_manifest_row_index": source_index,
@@ -199,14 +207,14 @@ def build(args):
             source = need_negative_source(frame, meta)
             if source is None:
                 continue
-            negative[source].append(_base_row(frame, split, source) | {"need_recovery": False})
+            negative[source].append(base_row(frame, split, source) | {"need_recovery": False})
         sampled, need_summary[split] = select_need_rows(positives, negative, seed=args.seed)
         rows = []
         for old in sampled:
             frame = frame_by_global[int(old["global_index"])]
             if split_by_episode[frame.episode_id] != split:
                 raise ValueError("Book need row crosses split")
-            rows.append(_base_row(frame, split, old.get("source", "failure_active")) | {
+            rows.append(base_row(frame, split, old.get("source", "failure_active")) | {
                 "need_recovery": bool(old["need_recovery"]),
             } | phase_fields(frame))
         need_by_split[split] = rows
@@ -220,7 +228,7 @@ def build(args):
             frame = frame_by_key[key]
             if split_by_episode[frame.episode_id] != split:
                 raise ValueError("Book failure row crosses split")
-            failure.append(_base_row(frame, split, "failure_active") | {
+            failure.append(base_row(frame, split, "failure_active") | {
                 "frame_offset": int(old["frame_offset"]),
                 "target_failure_reason": old["target_failure_reason"],
             } | phase_fields(frame))
@@ -230,7 +238,7 @@ def build(args):
             frame = frame_by_key[key]
             if split_by_episode[frame.episode_id] != split:
                 raise ValueError("Book plan row crosses split")
-            plan.append(_base_row(frame, split, "book_v4_rotation_grasp_interleaved_v2") | {
+            plan.append(base_row(frame, split, "book_v4_rotation_grasp_interleaved_v2") | {
                 "frame_offset": int(old["frame_offset"]),
                 "memory_length": int(old["memory_length"]),
                 "failure_recovery_memory": old["failure_recovery_memory"],
@@ -266,8 +274,8 @@ def build(args):
                 "global_indices": [int(rows[index]["global_index"]) for index in chosen],
                 "sample_count": len(chosen),
             }
-            if len(chosen) != EXPECTED_COUNTS[split][task]:
-                raise ValueError(f"Book V9.3 unexpected {split}/{task} sample count: {len(chosen)}")
+            if len(chosen) != expected_counts[split][task]:
+                raise ValueError(f"Book multitask unexpected {split}/{task} sample count: {len(chosen)}")
     selected_adjustment_globals = {
         split: [source_adjustment[index]["current_global_index"]
                 for index in adjustment_index["splits"][split]["manifest_row_indices"]]
@@ -277,11 +285,11 @@ def build(args):
         if selected_adjustment_globals[split] != split_payload[split]["adjustment"]["global_indices"]:
             raise ValueError(f"Book V9.3 {split} adjustment selection differs from V9.2")
     index = {
-        "schema_version": INDEX_SCHEMA, "data_profile": DATA_PROFILE,
+        "schema_version": index_schema, "data_profile": data_profile,
         "prompt_profile": PROMPT_PROFILE, "task_cycle": list(TASK_CYCLE), "seed": args.seed,
         "selection_hash": v4_index["selection_hash"],
         "dataset_dir": str(args.dataset_dir.resolve()),
-        "stage_a_checkpoint": str(args.stage_a_checkpoint.resolve()),
+        **({"stage_a_checkpoint": str(args.stage_a_checkpoint.resolve())} if validate_stage_a_model else {}),
         "action_index_file": str(args.action_index.resolve()),
         "action_training_data_hash": action_index["training_data_hash"],
         "adjustment_source_index": str(adjustment_index_path.resolve()),
