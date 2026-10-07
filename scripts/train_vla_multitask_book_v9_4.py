@@ -81,9 +81,9 @@ def parse_args():
     sys.argv[:] = normalized
     for flag, value in {
         "--num-steps": "4000",
-        "--eval-interval": "1000",
-        "--save-interval": "1000",
-        "--keep-period": "1000",
+        "--eval-interval": "2000",
+        "--save-interval": "2000",
+        "--keep-period": "2000",
         "--eval-max-need-samples": "2147483647",
     }.items():
         if flag not in sys.argv:
