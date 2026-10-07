@@ -2,16 +2,18 @@
 
 from __future__ import annotations
 
+import threading
 from collections import deque
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
-import threading
 from typing import Any
 
 import numpy as np
 
 from tactile_vla.common.labels import DEFAULT_TACTILE_CAPTION
+from tactile_vla.common.labels import LABEL_SCHEMA_VERSION as LEGACY_SCHEMA_VERSION
+from tactile_vla.common.labels_v4 import neutral_caption
 
 GRID_SHAPE = (35, 20, 3)
 WINDOW_SIZE = 30
@@ -199,7 +201,9 @@ class TactileWindowBuffer:
 
         window = self.latest_window()
         if window is None or predictor is None:
-            return DEFAULT_TACTILE_CAPTION
+            if predictor is None:
+                return DEFAULT_TACTILE_CAPTION
+            return neutral_caption(schema_version=getattr(predictor, "schema_version", LEGACY_SCHEMA_VERSION))
         mesh_motion, force = window
         return str(predictor.predict(mesh_motion, force).caption)
 

@@ -21,6 +21,13 @@ LABEL_MAPS = {
 LABEL_MAPS = {field: LABEL_MAPS[field] for field in LABEL_FIELDS}
 
 
+def neutral_caption(*, schema_version: str = LABEL_SCHEMA_VERSION) -> str:
+    """Use the same warm-up caption as offline annotation for either schema."""
+    return labels_to_caption(
+        {**legacy.NEUTRAL_LABELS, "fz_bias": "balanced"}, schema_version=schema_version,
+    )
+
+
 def schema_for_version(version: str) -> tuple[tuple[str, ...], dict[str, dict[str, int]]]:
     if version == LABEL_SCHEMA_VERSION:
         return LABEL_FIELDS, LABEL_MAPS

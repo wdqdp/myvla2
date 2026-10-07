@@ -2,12 +2,11 @@
 
 from __future__ import annotations
 
-from collections import deque
 import math
 import threading
+from collections import deque
 
 import numpy as np
-
 
 DEFAULT_STATE_HISTORY_FPS = 30.0
 
@@ -92,13 +91,16 @@ class StateHistoryBuffer:
             while self._samples and self._samples[0][0] < cutoff:
                 self._samples.popleft()
 
-    def snapshot(self, *, current_timestamp: float, current_state: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    def snapshot(
+        self, *, current_timestamp: float, current_state: np.ndarray, return_diagnostics: bool = False,
+    ) -> tuple[np.ndarray, np.ndarray] | tuple[np.ndarray, np.ndarray, dict[str, np.ndarray]]:
         """Return nearest-neighbor history ending at the image-synchronized state.
 
         The output timestamps are ``current_timestamp + [-T+1, ..., 0] /
         history_fps``. Targets preceding the first callback after ``clear`` are
         left-padded and masked. A nearest callback farther than
         ``max_sample_gap_seconds`` is also masked.
+        When requested, diagnostics use the same sample copy as the history.
         """
 
         current_timestamp = float(current_timestamp)
@@ -141,4 +143,10 @@ class StateHistoryBuffer:
         # current images, independent of timestamp roundoff or duplicate messages.
         history[-1] = current_state
         mask[-1] = True
+        if return_diagnostics:
+            return history, mask.astype(np.bool_), {
+                "target_timestamps": target_timestamps,
+                "nearest_timestamps": timestamps[nearest],
+                "nearest_gap_seconds": nearest_distance,
+            }
         return history, mask.astype(np.bool_)
