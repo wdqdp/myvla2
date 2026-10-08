@@ -33,6 +33,7 @@ from tactile_vla.vla.book_v9_4_runtime import (
     HISTORY_OFFSETS,
     MEMORY_POLICY,
     SERVER_NAME,
+    deployment_policy_fields,
     deployment_version,
     resolve_thresholds,
     validate_tactile_caption,
@@ -92,8 +93,10 @@ def inspect_artifacts(args):
         export.get("experiment_version") != version or export.get("data_profile") != config["data_profile"]
     ):
         raise ValueError(f"{version} export version/profile differs from training config")
-    if version == "book_v9_4_4" and export.get("reasoning_window_policy") != config["reasoning_window_policy"]:
-        raise ValueError("Book V9.4.4 export reasoning window differs from training config")
+    policy_fields = deployment_policy_fields(version)
+    mismatches = {key: (export.get(key), config[key]) for key in policy_fields if export.get(key) != config[key]}
+    if mismatches:
+        raise ValueError(f"{version} export policies differ from training config: {mismatches}")
     step = int(step_dir.name)
     full_sha = export["exports"]["full_params"]["parameter_tree_sha256"]
     if export.get("step") != step or export.get("default_deployment") != "full_params":
@@ -106,7 +109,7 @@ def inspect_artifacts(args):
         "training_data_hash": config["artifact_identity"][f"{version}_training_data_hash"],
         "export_metadata": str(export_path), "data_profile": config["data_profile"],
         "experiment_version": version,
-        **({"reasoning_window_policy": config["reasoning_window_policy"]} if version == "book_v9_4_4" else {}),
+        **{key: config[key] for key in policy_fields},
     }
 
 

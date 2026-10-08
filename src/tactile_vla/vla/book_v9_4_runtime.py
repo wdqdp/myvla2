@@ -9,6 +9,10 @@ from typing import Any
 
 from tactile_vla.common.labels_v4 import LABEL_FIELDS, LABEL_MAPS, LABEL_SCHEMA_VERSION, labels_to_caption
 from tactile_vla.vla.book_v9_4_4_multitask_data import REASONING_WINDOW_POLICY
+from tactile_vla.vla.book_v9_4_5_action_replay import ACTION_SAMPLING_POLICY
+from tactile_vla.vla.book_v9_4_5_multitask_data import LABEL_POLICY as V945_LABEL_POLICY
+from tactile_vla.vla.book_v9_4_5_multitask_data import REASONING_WINDOW_POLICY as V945_REASONING_WINDOW_POLICY
+from tactile_vla.vla.book_v9_4_5_multitask_data import SAMPLING_POLICY as V945_SAMPLING_POLICY
 from tactile_vla.vla.book_v9_4_memory import MEMORY_POLICY as TRAINING_MEMORY_POLICY
 from tactile_vla.vla.book_v9_4_multitask_data import DATA_PROFILE
 from tactile_vla.vla.v7_7_phase_prompt import PROMPT_PROFILE, uniform_positions
@@ -33,6 +37,7 @@ DEPLOYMENT_VERSIONS = {
     DATA_PROFILE: "book_v9_4",
     "book_v9_4_3_five_task_h100": "book_v9_4_3",
     "book_v9_4_4_five_task_h100": "book_v9_4_4",
+    "book_v9_4_5_five_task_h100": "book_v9_4_5",
 }
 
 
@@ -41,6 +46,22 @@ def deployment_version(data_profile: str | None) -> str:
     if data_profile not in DEPLOYMENT_VERSIONS:
         raise ValueError(f"Unsupported Book deployment data_profile: {data_profile!r}")
     return DEPLOYMENT_VERSIONS[data_profile]
+
+
+def deployment_policy_fields(version: str) -> dict[str, Any]:
+    """Compact training contracts checked in config, export and client metadata."""
+    if version == "book_v9_4_4":
+        return {"reasoning_window_policy": REASONING_WINDOW_POLICY}
+    if version == "book_v9_4_5":
+        return {
+            "training_profile": "book_v9_4_5_phase_balanced_action_replay",
+            "data_experiment_version": version,
+            "need_label_policy": V945_LABEL_POLICY,
+            "need_sampling_policy": V945_SAMPLING_POLICY,
+            "reasoning_window_policy": V945_REASONING_WINDOW_POLICY,
+            "action_sampling_policy": ACTION_SAMPLING_POLICY,
+        }
+    return {}
 
 
 def validate_captioner_identity(identity: dict[str, Any]) -> None:
@@ -83,8 +104,7 @@ def validate_training_config(config: dict[str, Any], norm_sha: str) -> None:
     }
     if version != "book_v9_4":
         expected["experiment_version"] = version
-    if version == "book_v9_4_4":
-        expected["reasoning_window_policy"] = REASONING_WINDOW_POLICY
+    expected.update(deployment_policy_fields(version))
     mismatch = {key: (config.get(key), value) for key, value in expected.items() if config.get(key) != value}
     identity = config.get("artifact_identity", {})
     if identity.get("data_profile") != "book_stage_a_v1":
@@ -149,8 +169,7 @@ def validate_server_metadata(metadata: dict[str, Any]) -> None:
     }
     if version != "book_v9_4":
         expected["experiment_version"] = version
-    if version == "book_v9_4_4":
-        expected["reasoning_window_policy"] = REASONING_WINDOW_POLICY
+    expected.update(deployment_policy_fields(version))
     mismatch = {key: (metadata.get(key), value) for key, value in expected.items()
                 if metadata.get(key) != value}
     if mismatch:
