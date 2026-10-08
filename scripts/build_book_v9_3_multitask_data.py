@@ -88,7 +88,7 @@ def need_negative_source(frame, meta):
 
 def build(args, *, expected_counts=EXPECTED_COUNTS, data_profile=DATA_PROFILE,
           index_schema=INDEX_SCHEMA, manifest_schema=MANIFEST_SCHEMA,
-          validate_stage_a_model=True, need_builder=None):
+          validate_stage_a_model=True, need_builder=None, need_rows_complete=False):
     # Defaults preserve V9.3 exactly; incremental versions derive counts from their sources.
     def base_row(frame, split, source):
         return _base_row(frame, split, source, data_profile=data_profile, manifest_schema=manifest_schema)
@@ -213,7 +213,11 @@ def build(args, *, expected_counts=EXPECTED_COUNTS, data_profile=DATA_PROFILE,
         else:
             sampled, need_summary[split] = need_builder(
                 frames=frames, profile=profile, split=split, base_row=base_row, seed=args.seed,
+                **({"phase_fields": phase_fields} if need_rows_complete else {}),
             )
+        if need_rows_complete:
+            need_by_split[split] = sampled
+            continue
         rows = []
         for old in sampled:
             frame = frame_by_global[int(old["global_index"])]

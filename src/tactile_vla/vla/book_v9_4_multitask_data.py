@@ -150,7 +150,8 @@ def target_coverage(manifests: dict[str, list[dict]]) -> dict[str, list[str]]:
 
 
 def validate_manifest_rows(index: dict, manifests: dict[str, list[dict]], *,
-                           data_profile=DATA_PROFILE, manifest_schema=MANIFEST_SCHEMA) -> None:
+                           data_profile=DATA_PROFILE, manifest_schema=MANIFEST_SCHEMA,
+                           need_variant_key=None) -> None:
     failures = {(row["split"], row["global_index"]): row["target_failure_reason"] for row in manifests["failure"]}
     for task, rows in manifests.items():
         if sha256_json(rows) != index["manifest_content_hashes"][task]:
@@ -160,6 +161,8 @@ def validate_manifest_rows(index: dict, manifests: dict[str, list[dict]], *,
             if row["schema_version"] != manifest_schema or row["data_profile"] != data_profile:
                 raise ValueError("V9.4 manifest header mismatch")
             identity = (row["split"], row["global_index"])
+            if task == "need" and need_variant_key is not None:
+                identity += (row[need_variant_key],)
             if task == "plan":
                 identity += (row["memory_length"],)
                 validate_plan_row(row, failures[row["split"], row["global_index"]])
@@ -205,7 +208,7 @@ def validate_manifest_rows(index: dict, manifests: dict[str, list[dict]], *,
 
 def validate_index(index: dict, *, data_profile=DATA_PROFILE, index_schema=INDEX_SCHEMA,
                    manifest_schema=MANIFEST_SCHEMA, counts_fn=expected_counts,
-                   plan_source_validator=None) -> None:
+                   plan_source_validator=None, need_variant_key=None) -> None:
     expected = {
         "schema_version": index_schema,
         "data_profile": data_profile,
@@ -243,7 +246,8 @@ def validate_index(index: dict, *, data_profile=DATA_PROFILE, index_schema=INDEX
         if sha256_file(path) != index[f"{task}_manifest_sha256"]:
             raise ValueError(f"V9.4 {task} manifest file hash mismatch")
         manifests[task] = load_jsonl(path)
-    validate_manifest_rows(index, manifests, data_profile=data_profile, manifest_schema=manifest_schema)
+    validate_manifest_rows(index, manifests, data_profile=data_profile, manifest_schema=manifest_schema,
+                           need_variant_key=need_variant_key)
     if plan_source_validator is not None:
         plan_source_validator(index, manifests, profile)
     else:

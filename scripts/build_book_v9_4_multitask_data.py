@@ -52,14 +52,15 @@ def parse_args(argv=None, *, default_action_index=DEFAULT_ACTION_INDEX,
 
 def build(args, *, data_profile=DATA_PROFILE, index_schema=INDEX_SCHEMA,
           manifest_schema=MANIFEST_SCHEMA, counts_fn=expected_counts,
-          need_builder=None, validate_rows=validate_manifest_rows):
+          need_builder=None, validate_rows=validate_manifest_rows,
+          adjustment_experiment_version="book_v9_4", need_rows_complete=False):
     profile = json.loads((args.v4_dir / "profile.json").read_text())
     validate_upload_metadata(args.dataset_dir, profile)
     identity, provenance_hashes = load_captioner_provenance(args.incremental_state_dir, profile=profile)
     adjustment_index = json.loads((args.adjustment_dir / "adjustment_end_training_index.json").read_text())
     if (
         adjustment_index.get("captioner_identity") != identity
-        or adjustment_index.get("experiment_version") != "book_v9_4"
+        or adjustment_index.get("experiment_version") != adjustment_experiment_version
         or adjustment_index.get("model_dependency") != "none_data_only"
     ):
         raise ValueError("Rebuild the model-independent V9.4 adjustment subset with the current captioner")
@@ -71,6 +72,7 @@ def build(args, *, data_profile=DATA_PROFILE, index_schema=INDEX_SCHEMA,
         manifest_schema=manifest_schema,
         validate_stage_a_model=False,
         need_builder=need_builder,
+        need_rows_complete=need_rows_complete,
     )
     # Expand only the derived plan stream, never the V4 source used by Stage A.
     sources = {}
