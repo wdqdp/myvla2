@@ -69,7 +69,6 @@ from tactile_vla.vla.stage_b_v3_checkpoint import delta_params
 from tactile_vla.vla.stage_b_v3_checkpoint import merge_delta_params
 from tactile_vla.vla.stage_b_v3_checkpoint import resume_state
 from tactile_vla.vla.stage_b_v3_checkpoint import trainable_filter
-from tactile_vla.vla.index import FrameRecord
 from tactile_vla.vla.index import load_or_create_splits
 from tactile_vla.vla.index import scan_lerobot_frames
 from tactile_vla.vla.index import SplitConfig
@@ -221,6 +220,7 @@ V4_STAGE_B_FROZEN_COMPONENTS = ("action_expert", "paligemma_non_lora")
 # the checkpoint/optimizer machinery without changing the V3 protocol.
 TASK_CYCLE = ("action", "need", "failure", "plan")
 CHECKPOINT_EXPORT_HOOK = None
+ACTION_EVALUATION_HOOK = None
 EXTRA_CONFIG: dict[str, Any] = {}
 
 
@@ -1145,15 +1145,17 @@ def evaluate_action_loss(
     data_sharding: jax.sharding.Sharding,
     *,
     seed: int,
-    max_batches: int = 32,
+    max_batches: int | None = 32,
+    sample_weighted: bool = False,
 ) -> float:
     model = nnx.merge(state.model_def, state.params)
     model.eval()
     compute_loss = nnx_utils.module_jit(model.backbone.compute_loss)
     values: list[float] = []
+    counts: list[int] = []
     rng = jax.random.key(seed)
     for batch_index, batch in enumerate(loader):
-        if batch_index >= max_batches:
+        if max_batches is not None and batch_index >= max_batches:
             break
         batch, valid_count = pad_eval_batch(
             batch, multiple=len(data_sharding.device_set)
@@ -1162,9 +1164,49 @@ def evaluate_action_loss(
         rng, step_rng = jax.random.split(rng)
         loss = compute_loss(step_rng, observation, actions)[:valid_count].mean()
         values.append(float(jax.device_get(loss)))
+        counts.append(valid_count)
     if not values:
         raise ValueError("Action validation loader is empty")
-    return float(np.mean(values))
+    return float(np.average(values, weights=counts) if sample_weighted else np.mean(values))
+
+
+def evaluate_action_report(state, loaders, data_sharding, *, seed):
+    """Version-specific replay validation; old versions retain their original 32 batches."""
+    if ACTION_EVALUATION_HOOK is not None:
+        return ACTION_EVALUATION_HOOK(state, loaders, data_sharding, seed=seed)
+    return {"loss": evaluate_action_loss(state, loaders["action"], data_sharding, seed=seed)}
+
+
+def action_retention_metrics(report, baseline, *, limit):
+    """Preserve old overall gate; phase-aware versions must also retain every phase."""
+    if not np.isfinite(baseline["loss"]) or baseline["loss"] <= 0 or not np.isfinite(report["loss"]) or report["loss"] < 0:
+        raise ValueError("Action baseline must be positive and action losses must be finite")
+    degradation = report["loss"] / baseline["loss"] - 1.0
+    current_phases, baseline_phases = report.get("by_phase", {}), baseline.get("by_phase", {})
+    if set(current_phases) != set(baseline_phases):
+        raise ValueError("Action evaluation and Stage A baseline phase coverage differ")
+    if any(not np.isfinite(loss) or loss <= 0 for loss in baseline_phases.values()) or any(
+        not np.isfinite(loss) or loss < 0 for loss in current_phases.values()
+    ):
+        raise ValueError("Invalid phase action loss/baseline")
+    if current_phases and (report["support_by_phase"] != baseline["support_by_phase"] or any(
+        support <= 0 for support in report["support_by_phase"].values()
+    )):
+        raise ValueError("Action evaluation and baseline sample support differ")
+    phase_degradation = {phase: loss / baseline_phases[phase] - 1.0 for phase, loss in current_phases.items()}
+    result = {
+        "action_loss": report["loss"], "action_loss_baseline": baseline["loss"],
+        "action_loss_degradation": degradation,
+        "action_gate_passed": degradation <= limit and all(value <= limit for value in phase_degradation.values()),
+    }
+    if current_phases:
+        result.update({
+            "action_loss_by_phase": current_phases,
+            "action_loss_baseline_by_phase": baseline_phases,
+            "action_loss_degradation_by_phase": phase_degradation,
+            "action_eval_support_by_phase": report["support_by_phase"],
+        })
+    return result
 
 
 def evaluate_need(
@@ -1654,13 +1696,13 @@ def main() -> None:
     )
     rng = jax.random.key(args.seed + 1)
     jax.block_until_ready(state)
-    baseline_action_loss = evaluate_action_loss(
+    baseline_action_report = evaluate_action_report(
         state,
-        loaders["val"]["action"],
+        loaders["val"],
         data_sharding,
         seed=args.seed + 100,
     )
-    logging.info("Stage A validation action loss baseline=%.6f", baseline_action_loss)
+    logging.info("Stage A validation action baseline=%s", baseline_action_report)
     if resuming:
         state, rng = restore_state(manager, state, filter_, rng)
     jax.block_until_ready(state)
@@ -1772,9 +1814,9 @@ def main() -> None:
 
         should_evaluate = step % args.eval_interval == 0 or step == args.num_steps
         if should_evaluate:
-            action_loss = evaluate_action_loss(
+            action_report = evaluate_action_report(
                 state,
-                loaders["val"]["action"],
+                loaders["val"],
                 data_sharding,
                 seed=args.seed + 100,
             )
@@ -1826,7 +1868,9 @@ def main() -> None:
                 failure_metrics,
                 plan_metrics,
             )
-            degradation = action_loss / baseline_action_loss - 1.0
+            action_metrics = action_retention_metrics(
+                action_report, baseline_action_report, limit=args.action_loss_degradation_limit,
+            )
             score_terms = [
                 need_metrics["macro_f1"], failure_metrics["exact_match"], plan_metrics["exact_match"]
             ]
@@ -1836,10 +1880,7 @@ def main() -> None:
             metrics = {
                 "step": step,
                 "val_score": score,
-                "action_loss": action_loss,
-                "action_loss_baseline": baseline_action_loss,
-                "action_loss_degradation": degradation,
-                "action_gate_passed": degradation <= args.action_loss_degradation_limit,
+                **action_metrics,
                 "need_recovery": need_metrics,
                 **({"adjustment_end": adjustment_metrics} if adjustment_metrics is not None else {}),
                 "failure_reason": failure_metrics,

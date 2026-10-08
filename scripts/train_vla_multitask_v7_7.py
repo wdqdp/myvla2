@@ -192,6 +192,7 @@ def export_checkpoint(run_dir, state, step, filter_):
 def configure():
     base.TASK_CYCLE = TASK_CYCLE
     base.CHECKPOINT_EXPORT_HOOK = export_checkpoint
+    base.ACTION_EVALUATION_HOOK = None
     base.EXTRA_CONFIG = {
         "thresholds": {"adjustment_end": 0.5, "need_recovery": 0.5},
         "threshold_policy": "checkpoint_metadata_only",
