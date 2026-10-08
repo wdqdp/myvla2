@@ -88,7 +88,7 @@ def need_negative_source(frame, meta):
 
 def build(args, *, expected_counts=EXPECTED_COUNTS, data_profile=DATA_PROFILE,
           index_schema=INDEX_SCHEMA, manifest_schema=MANIFEST_SCHEMA,
-          validate_stage_a_model=True):
+          validate_stage_a_model=True, need_builder=None):
     # Defaults preserve V9.3 exactly; incremental versions derive counts from their sources.
     def base_row(frame, split, source):
         return _base_row(frame, split, source, data_profile=data_profile, manifest_schema=manifest_schema)
@@ -195,20 +195,25 @@ def build(args, *, expected_counts=EXPECTED_COUNTS, data_profile=DATA_PROFILE,
     }
     need_by_split, need_summary = {}, {}
     for split in ("train", "val", "test"):
-        positives = [
-            row for row in load_jsonl(args.v4_dir / f"need/{split}.jsonl")
-            if bool(row["need_recovery"])
-        ]
-        negative = {name: [] for name in NEGATIVE_SOURCES}
-        for frame in frames:
-            if split_by_episode[frame.episode_id] != split:
-                continue
-            meta = profile_attempts[frame.attempt_key]
-            source = need_negative_source(frame, meta)
-            if source is None:
-                continue
-            negative[source].append(base_row(frame, split, source) | {"need_recovery": False})
-        sampled, need_summary[split] = select_need_rows(positives, negative, seed=args.seed)
+        if need_builder is None:
+            positives = [
+                row for row in load_jsonl(args.v4_dir / f"need/{split}.jsonl")
+                if bool(row["need_recovery"])
+            ]
+            negative = {name: [] for name in NEGATIVE_SOURCES}
+            for frame in frames:
+                if split_by_episode[frame.episode_id] != split:
+                    continue
+                meta = profile_attempts[frame.attempt_key]
+                source = need_negative_source(frame, meta)
+                if source is None:
+                    continue
+                negative[source].append(base_row(frame, split, source) | {"need_recovery": False})
+            sampled, need_summary[split] = select_need_rows(positives, negative, seed=args.seed)
+        else:
+            sampled, need_summary[split] = need_builder(
+                frames=frames, profile=profile, split=split, base_row=base_row, seed=args.seed,
+            )
         rows = []
         for old in sampled:
             frame = frame_by_global[int(old["global_index"])]
@@ -216,7 +221,7 @@ def build(args, *, expected_counts=EXPECTED_COUNTS, data_profile=DATA_PROFILE,
                 raise ValueError("Book need row crosses split")
             rows.append(base_row(frame, split, old.get("source", "failure_active")) | {
                 "need_recovery": bool(old["need_recovery"]),
-            } | phase_fields(frame))
+            } | ({"need_boundary": old["need_boundary"]} if "need_boundary" in old else {}) | phase_fields(frame))
         need_by_split[split] = rows
     need = [row for split in ("train", "val", "test") for row in need_by_split[split]]
 
@@ -255,7 +260,12 @@ def build(args, *, expected_counts=EXPECTED_COUNTS, data_profile=DATA_PROFILE,
         for row in need if row["need_recovery"]
     }
     for row in failure:
-        if need_positive_prompts.get((row["split"], row["global_index"])) != row["prompt"]:
+        shared_prompt = need_positive_prompts.get((row["split"], row["global_index"]))
+        if shared_prompt is None and need_builder is not None:
+            # A newer need policy may ignore early failure frames. Keep the LM
+            # supervision and check its canonical prefix without inventing a need label.
+            shared_prompt = phase_fields(frame_by_global[row["global_index"]])["prompt"]
+        if shared_prompt != row["prompt"]:
             raise ValueError("Book need/failure shared phase prompt differs")
     manifests = {"adjustment": adjustment, "need": need, "failure": failure, "plan": plan}
     split_payload = {}

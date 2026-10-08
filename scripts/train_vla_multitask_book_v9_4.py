@@ -32,9 +32,9 @@ _BASE_CONFIGURE = trainer.configure
 _BASE_EVALUATE_TEXT = training_base.evaluate_text
 
 
-def ensure_index(args):
+def ensure_index(args, *, index_validator=None):
     index = json.loads(args.index_file.read_text())
-    validate_index(index)
+    (validate_index if index_validator is None else index_validator)(index)
     if Path(index["dataset_dir"]).resolve() != args.dataset_dir.resolve():
         raise ValueError("V9.4 multitask index was built for a different LeRobot dataset")
     norm_file = (args.norm_stats_dir / "norm_stats.json").resolve()

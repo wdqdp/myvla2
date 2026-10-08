@@ -149,14 +149,15 @@ def target_coverage(manifests: dict[str, list[dict]]) -> dict[str, list[str]]:
     }
 
 
-def validate_manifest_rows(index: dict, manifests: dict[str, list[dict]]) -> None:
+def validate_manifest_rows(index: dict, manifests: dict[str, list[dict]], *,
+                           data_profile=DATA_PROFILE, manifest_schema=MANIFEST_SCHEMA) -> None:
     failures = {(row["split"], row["global_index"]): row["target_failure_reason"] for row in manifests["failure"]}
     for task, rows in manifests.items():
         if sha256_json(rows) != index["manifest_content_hashes"][task]:
             raise ValueError(f"V9.4 {task} manifest content hash mismatch")
         seen = set()
         for row in rows:
-            if row["schema_version"] != MANIFEST_SCHEMA or row["data_profile"] != DATA_PROFILE:
+            if row["schema_version"] != manifest_schema or row["data_profile"] != data_profile:
                 raise ValueError("V9.4 manifest header mismatch")
             identity = (row["split"], row["global_index"])
             if task == "plan":
@@ -202,10 +203,11 @@ def validate_manifest_rows(index: dict, manifests: dict[str, list[dict]]) -> Non
     validate_balanced_variants(manifests["plan"])
 
 
-def validate_index(index: dict) -> None:
+def validate_index(index: dict, *, data_profile=DATA_PROFILE, index_schema=INDEX_SCHEMA,
+                   manifest_schema=MANIFEST_SCHEMA, counts_fn=expected_counts) -> None:
     expected = {
-        "schema_version": INDEX_SCHEMA,
-        "data_profile": DATA_PROFILE,
+        "schema_version": index_schema,
+        "data_profile": data_profile,
         "prompt_profile": PROMPT_PROFILE,
         "history_policy": helper_identity() | {"idle_perturbation": "none_raw_contiguous"},
         "adjustment_label_policy": ADJUSTMENT_LABEL_POLICY,
@@ -229,7 +231,7 @@ def validate_index(index: dict) -> None:
         index["source_hashes"].get(k) != v for k, v in provenance_hashes.items()
     ):
         raise ValueError("V9.4 captioner provenance mismatch")
-    counts = expected_counts(v4_dir)
+    counts = counts_fn(v4_dir)
     for split in SPLITS:
         for task, count in counts[split].items():
             if index["splits"][split][task]["sample_count"] != count:
@@ -240,7 +242,7 @@ def validate_index(index: dict) -> None:
         if sha256_file(path) != index[f"{task}_manifest_sha256"]:
             raise ValueError(f"V9.4 {task} manifest file hash mismatch")
         manifests[task] = load_jsonl(path)
-    validate_manifest_rows(index, manifests)
+    validate_manifest_rows(index, manifests, data_profile=data_profile, manifest_schema=manifest_schema)
     source_plans = {}
     for split in SPLITS:
         for row in load_jsonl(v4_dir / f"reasoning_manifests/reasoning/{split}.jsonl"):

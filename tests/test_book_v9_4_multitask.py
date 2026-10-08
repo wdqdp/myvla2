@@ -294,7 +294,8 @@ def test_real_training_cli_accepts_steps_without_reading_upload(monkeypatch, arg
     assert "v9_4" in str(args.stage_a_checkpoint)
     assert "v9_4" in str(args.index_file)
     assert "v9_4" in args.run_name
-    assert args.eval_interval == 500
+    # Match the already configured V9.4 defaults; V9.4.3 must not change them.
+    assert args.eval_interval == 2000
 
 
 def test_complete_index_validation_and_source_change_detection(tmp_path):

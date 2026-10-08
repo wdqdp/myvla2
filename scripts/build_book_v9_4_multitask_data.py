@@ -35,21 +35,24 @@ from tactile_vla.vla.book_v9_4_multitask_data import (
 )
 
 
-def parse_args(argv=None):
+def parse_args(argv=None, *, default_action_index=DEFAULT_ACTION_INDEX,
+               default_adjustment_dir=DEFAULT_ADJUSTMENT_DIR, default_output_dir=DEFAULT_MULTITASK_DIR):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dataset-dir", type=Path, default=ROOT / "lerobot_data/tactile_vla_rotation_v4")
     parser.add_argument("--v4-dir", type=Path, default=ROOT / "outputs/rotation_v4")
-    parser.add_argument("--action-index", type=Path, default=DEFAULT_ACTION_INDEX)
-    parser.add_argument("--adjustment-dir", type=Path, default=DEFAULT_ADJUSTMENT_DIR)
+    parser.add_argument("--action-index", type=Path, default=default_action_index)
+    parser.add_argument("--adjustment-dir", type=Path, default=default_adjustment_dir)
     parser.add_argument("--incremental-state-dir", type=Path, default=ROOT / "outputs/incremental_state")
-    parser.add_argument("--output-dir", type=Path, default=DEFAULT_MULTITASK_DIR)
+    parser.add_argument("--output-dir", type=Path, default=default_output_dir)
     parser.add_argument("--seed", type=int, choices=[42], default=42)
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--overwrite", action="store_true")
     return parser.parse_args(argv)
 
 
-def build(args):
+def build(args, *, data_profile=DATA_PROFILE, index_schema=INDEX_SCHEMA,
+          manifest_schema=MANIFEST_SCHEMA, counts_fn=expected_counts,
+          need_builder=None, validate_rows=validate_manifest_rows):
     profile = json.loads((args.v4_dir / "profile.json").read_text())
     validate_upload_metadata(args.dataset_dir, profile)
     identity, provenance_hashes = load_captioner_provenance(args.incremental_state_dir, profile=profile)
@@ -62,11 +65,12 @@ def build(args):
         raise ValueError("Rebuild the model-independent V9.4 adjustment subset with the current captioner")
     index, summary, manifests = base.build(
         args,
-        expected_counts=expected_counts(args.v4_dir, expand_plan=False),
-        data_profile=DATA_PROFILE,
-        index_schema=INDEX_SCHEMA,
-        manifest_schema=MANIFEST_SCHEMA,
+        expected_counts=counts_fn(args.v4_dir, expand_plan=False),
+        data_profile=data_profile,
+        index_schema=index_schema,
+        manifest_schema=manifest_schema,
         validate_stage_a_model=False,
+        need_builder=need_builder,
     )
     # Expand only the derived plan stream, never the V4 source used by Stage A.
     sources = {}
@@ -98,7 +102,7 @@ def build(args):
             "global_indices": [manifests["plan"][i]["global_index"] for i in chosen],
             "sample_count": len(chosen),
         }
-        if len(chosen) != expected_counts(args.v4_dir)[split]["plan"]:
+        if len(chosen) != counts_fn(args.v4_dir)[split]["plan"]:
             raise ValueError("V9.4 expanded plan stream count mismatch")
         summary["selected_counts"][split]["plan"] = len(chosen)
     index["manifest_content_hashes"]["plan"] = sha256_json(manifests["plan"])
@@ -119,11 +123,11 @@ def build(args):
         }
     )
     index["source_hashes"].update(provenance_hashes)
-    validate_manifest_rows(index, manifests)
+    validate_rows(index, manifests)
     summary.update(
         {
             "schema_version": "tactile_vla_book_v9_4_summary_v1",
-            "data_profile": DATA_PROFILE,
+            "data_profile": data_profile,
             "model_dependency": "none_data_only",
             "captioner_identity": identity,
             "training_target_coverage": index["training_target_coverage"],
