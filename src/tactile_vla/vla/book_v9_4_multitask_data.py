@@ -204,7 +204,8 @@ def validate_manifest_rows(index: dict, manifests: dict[str, list[dict]], *,
 
 
 def validate_index(index: dict, *, data_profile=DATA_PROFILE, index_schema=INDEX_SCHEMA,
-                   manifest_schema=MANIFEST_SCHEMA, counts_fn=expected_counts) -> None:
+                   manifest_schema=MANIFEST_SCHEMA, counts_fn=expected_counts,
+                   plan_source_validator=None) -> None:
     expected = {
         "schema_version": index_schema,
         "data_profile": data_profile,
@@ -243,6 +244,15 @@ def validate_index(index: dict, *, data_profile=DATA_PROFILE, index_schema=INDEX
             raise ValueError(f"V9.4 {task} manifest file hash mismatch")
         manifests[task] = load_jsonl(path)
     validate_manifest_rows(index, manifests, data_profile=data_profile, manifest_schema=manifest_schema)
+    if plan_source_validator is not None:
+        plan_source_validator(index, manifests, profile)
+    else:
+        _validate_original_plan_sources(index, manifests, v4_dir)
+    _validate_plan_token_summary(index, manifests)
+
+
+def _validate_original_plan_sources(index, manifests, v4_dir):
+    """Default V9.4/V9.4.3 provenance: observations remain in the original F window."""
     source_plans = {}
     for split in SPLITS:
         for row in load_jsonl(v4_dir / f"reasoning_manifests/reasoning/{split}.jsonl"):
@@ -266,6 +276,9 @@ def validate_index(index: dict, *, data_profile=DATA_PROFILE, index_schema=INDEX
             or target_source["plan_attempt_id"] != 2
         ):
             raise ValueError("V9.4 memory changed current observation or adjacent real target provenance")
+
+
+def _validate_plan_token_summary(index, manifests):
     token_summary = index["plan_token_validation"]
     if (
         token_summary.get("max_len") != PLAN_MAX_TOKEN_LEN

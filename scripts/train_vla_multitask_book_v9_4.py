@@ -68,7 +68,7 @@ def evaluate_text(state, loader, task, grammar, data_sharding, *, max_samples):
         group_loader = training_base._loader(
             Subset(loader.dataset, positions), batch_size=loader.batch_size, num_workers=0, shuffle=False
         )
-        # Evaluate all F+14 variants, not a prefix that could exclude long histories.
+        # Evaluate all selected terminal variants, not a prefix that could exclude long histories.
         metrics[key] = _BASE_EVALUATE_TEXT(state, group_loader, task, grammar, data_sharding, max_samples=None)
     return merge_plan_group_metrics(metrics)
 
