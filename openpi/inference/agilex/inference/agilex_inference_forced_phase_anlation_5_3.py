@@ -142,6 +142,49 @@ def _latest_tactile_timestamp(operator: Any) -> float | None:
     return float(timestamp) if timestamp is not None else None
 
 
+def _tactile_status(operator: Any) -> dict[str, Any]:
+    tactile = getattr(operator, "tactile", None)
+    if tactile is None:
+        return {"error": "tactile buffer is not configured"}
+    buffer = getattr(tactile, "buffer", tactile)
+    status = getattr(buffer, "status", None)
+    if not callable(status):
+        return {"ready": bool(tactile.ready)}
+    result = status()
+    topics = getattr(tactile, "topics", None)
+    if topics is not None:
+        for key in ("missing_topics", "waiting_topics"):
+            result[key] = [getattr(topics, name, name) for name in result[key]]
+    return result
+
+
+def _require_tactile_captioner(operator: Any, captioner: Any) -> None:
+    if captioner is None:
+        raise FailClosedError("Classification requires an enabled tactile captioner")
+    if getattr(operator, "tactile", None) is None:
+        raise FailClosedError("Classification requires a configured tactile buffer")
+
+
+def _wait_for_tactile_ready(args: argparse.Namespace, operator: Any, captioner: Any) -> None:
+    """Bound W30 startup warmup without accepting a neutral fallback caption."""
+    _require_tactile_captioner(operator, captioner)
+    rate = operator.rate(args.observation_poll_rate)
+    started = time.monotonic()
+    last_log = float("-inf")
+    while not operator.is_shutdown() and not runtime.shutdown_event.is_set():
+        now = time.monotonic()
+        if now - started > args.phase_change_timeout_seconds:
+            raise FailClosedError(f"Timed out waiting for W30 tactile warmup: {_tactile_status(operator)}")
+        if operator.tactile.ready:
+            print(f"[TACTILE] ready: {_tactile_status(operator)}", flush=True)
+            return
+        if now - last_log >= 1.0:
+            print(f"[TACTILE] warming up: {_tactile_status(operator)}", flush=True)
+            last_log = now
+        rate.sleep()
+    raise RuntimeError("Stopped while waiting for tactile warmup")
+
+
 def _capture_classification_observation(
     args: argparse.Namespace,
     operator: Any,
@@ -150,11 +193,15 @@ def _capture_classification_observation(
     after_timestamp: float,
 ) -> tuple[v52.FrozenObservation, dict[str, float]]:
     """Wait for front/left/qpos/tactile that are all newer than the H100 tail."""
+    _require_tactile_captioner(operator, captioner)
     rate = operator.rate(args.observation_poll_rate)
     started = time.monotonic()
     while not operator.is_shutdown() and not runtime.shutdown_event.is_set():
         if time.monotonic() - started > args.phase_change_timeout_seconds:
-            raise FailClosedError("Timed out waiting for fresh classification observation")
+            raise FailClosedError(
+                "Timed out waiting for fresh classification observation; "
+                f"after_timestamp={after_timestamp}; tactile={_tactile_status(operator)}"
+            )
         if isinstance(operator, runtime.ReplayOperator):
             front, left, joint = runtime.get_ros_observation(args, operator, after_timestamp=after_timestamp)
             timestamp = v52._joint_timestamp(joint)
@@ -180,8 +227,9 @@ def _capture_classification_observation(
         if tactile_timestamp is None or tactile_timestamp <= after_timestamp:
             rate.sleep()
             continue
-        if captioner is None or operator.tactile is None or not operator.tactile.ready:
-            raise RuntimeError("V5.3 classification requires a ready 30-frame tactile captioner")
+        if not operator.tactile.ready:
+            rate.sleep()
+            continue
         qpos = np.asarray(joint.position, dtype=np.float32)
         if getattr(args, "use_state_history", True):
             history, mask = operator.get_state_history(joint)

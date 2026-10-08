@@ -123,6 +123,17 @@ class TactileWindowBuffer:
     def ready(self) -> bool:
         return len(self) >= self.window_size
 
+    def status(self) -> dict[str, Any]:
+        """Describe window warmup and six-topic assembly under the buffer lock."""
+        with self._lock:
+            return {
+                "frames": len(self._frames),
+                "required_frames": self.window_size,
+                "missing_topics": sorted(_REQUIRED_KEYS.difference(self._latest)),
+                "waiting_topics": sorted(_REQUIRED_KEYS.difference(self._seen_since_frame)),
+                "latest_timestamp": self._frames[-1].timestamp if self._frames else None,
+            }
+
     def clear(self) -> None:
         with self._lock:
             self._frames.clear()

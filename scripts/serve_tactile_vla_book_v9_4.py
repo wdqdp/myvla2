@@ -25,7 +25,6 @@ from openpi_client import msgpack_numpy
 from scripts import serve_tactile_vla_v7_7 as base
 from tactile_vla.common.labels_v4 import neutral_caption
 from tactile_vla.vla.artifacts import sha256_file
-from tactile_vla.vla.book_v9_4_multitask_data import DATA_PROFILE
 from tactile_vla.vla.book_v9_4_runtime import (
     BOOK_INSTRUCTION,
     DEFAULT_CAPTIONER_SHA256,
@@ -34,6 +33,7 @@ from tactile_vla.vla.book_v9_4_runtime import (
     HISTORY_OFFSETS,
     MEMORY_POLICY,
     SERVER_NAME,
+    deployment_version,
     resolve_thresholds,
     validate_tactile_caption,
     validate_training_config,
@@ -83,10 +83,17 @@ def inspect_artifacts(args):
     config = base.v3._find_config(step_dir)
     norm_sha = sha256_file(args.norm_stats_dir / "norm_stats.json")
     validate_training_config(config, norm_sha)
+    version = deployment_version(config["data_profile"])
     if args.captioner_checkpoint_sha256 != config["captioner_identity"]["checkpoint_sha256"]:
         raise ValueError("Book V9.4 runtime captioner SHA256 differs from training")
-    export_path = step_dir / "book_v9_4_export.json"
+    export_path = step_dir / f"{version}_export.json"
     export = json.loads(export_path.read_text())
+    if version != "book_v9_4" and (
+        export.get("experiment_version") != version or export.get("data_profile") != config["data_profile"]
+    ):
+        raise ValueError(f"{version} export version/profile differs from training config")
+    if version == "book_v9_4_4" and export.get("reasoning_window_policy") != config["reasoning_window_policy"]:
+        raise ValueError("Book V9.4.4 export reasoning window differs from training config")
     step = int(step_dir.name)
     full_sha = export["exports"]["full_params"]["parameter_tree_sha256"]
     if export.get("step") != step or export.get("default_deployment") != "full_params":
@@ -96,8 +103,10 @@ def inspect_artifacts(args):
     args.checkpoint = full_params
     return config, {
         "checkpoint_step": step, "full_params_sha256": full_sha, "norm_stats_sha256": norm_sha,
-        "training_data_hash": config["artifact_identity"]["book_v9_4_training_data_hash"],
-        "export_metadata": str(export_path),
+        "training_data_hash": config["artifact_identity"][f"{version}_training_data_hash"],
+        "export_metadata": str(export_path), "data_profile": config["data_profile"],
+        "experiment_version": version,
+        **({"reasoning_window_policy": config["reasoning_window_policy"]} if version == "book_v9_4_4" else {}),
     }
 
 
@@ -108,6 +117,7 @@ def resolve_deployment(args, identity):
         full_params_sha=identity["full_params_sha256"], norm_sha=identity["norm_stats_sha256"],
         training_data_hash=identity["training_data_hash"], need_override=args.need_recovery_threshold,
         adjustment_override=args.adjustment_end_threshold,
+        data_profile=identity["data_profile"],
     )
     args.need_recovery_threshold = thresholds["need_recovery"]
     args.adjustment_end_threshold = thresholds["adjustment_end"]
@@ -125,7 +135,7 @@ def resolve_deployment(args, identity):
 class BookV94Policy(base.V77Policy):
     def __init__(self, *, args, config, model_config, norm_stats, identity, deployment):
         old_profile = base.DATA_PROFILE
-        base.DATA_PROFILE = DATA_PROFILE
+        base.DATA_PROFILE = config["data_profile"]
         try:
             super().__init__(args=args, config=config, model_config=model_config, norm_stats=norm_stats)
         finally:

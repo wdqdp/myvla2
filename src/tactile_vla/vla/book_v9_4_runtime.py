@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from tactile_vla.common.labels_v4 import LABEL_FIELDS, LABEL_MAPS, LABEL_SCHEMA_VERSION, labels_to_caption
+from tactile_vla.vla.book_v9_4_4_multitask_data import REASONING_WINDOW_POLICY
 from tactile_vla.vla.book_v9_4_memory import MEMORY_POLICY as TRAINING_MEMORY_POLICY
 from tactile_vla.vla.book_v9_4_multitask_data import DATA_PROFILE
 from tactile_vla.vla.v7_7_phase_prompt import PROMPT_PROFILE, uniform_positions
@@ -28,6 +29,18 @@ DEFAULT_CAPTIONER = Path(
 DEFAULT_CAPTIONER_SHA256 = "b13517e9ff35732ca9e178b740a42edece74afce4a8710f4d773d3559d6a5e53"
 HISTORY_OFFSETS = uniform_positions(100).tolist()
 MEMORY_POLICY = TRAINING_MEMORY_POLICY["runtime_retention"]
+DEPLOYMENT_VERSIONS = {
+    DATA_PROFILE: "book_v9_4",
+    "book_v9_4_3_five_task_h100": "book_v9_4_3",
+    "book_v9_4_4_five_task_h100": "book_v9_4_4",
+}
+
+
+def deployment_version(data_profile: str | None) -> str:
+    """Resolve an explicitly supported profile to its checkpoint artifact version."""
+    if data_profile not in DEPLOYMENT_VERSIONS:
+        raise ValueError(f"Unsupported Book deployment data_profile: {data_profile!r}")
+    return DEPLOYMENT_VERSIONS[data_profile]
 
 
 def validate_captioner_identity(identity: dict[str, Any]) -> None:
@@ -60,21 +73,27 @@ def validate_tactile_caption(caption: str) -> None:
 
 
 def validate_training_config(config: dict[str, Any], norm_sha: str) -> None:
+    version = deployment_version(config.get("data_profile"))
     expected = {
-        "data_profile": DATA_PROFILE, "prompt_profile": PROMPT_PROFILE,
+        "prompt_profile": PROMPT_PROFILE,
         "action_horizon": 30, "action_dim": 32, "max_token_len": 512,
         "reasoning_max_token_len": 320, "use_state_history": False, "state_history_len": 0,
         "grammar_profile": "v3_full_v1", "phase_prefill_protocol": "need_failure_shared_kv_v1",
         "plan_memory_policy": TRAINING_MEMORY_POLICY,
     }
+    if version != "book_v9_4":
+        expected["experiment_version"] = version
+    if version == "book_v9_4_4":
+        expected["reasoning_window_policy"] = REASONING_WINDOW_POLICY
     mismatch = {key: (config.get(key), value) for key, value in expected.items() if config.get(key) != value}
     identity = config.get("artifact_identity", {})
     if identity.get("data_profile") != "book_stage_a_v1":
         mismatch["artifact_identity.data_profile"] = (identity.get("data_profile"), "book_stage_a_v1")
     if identity.get("v4_norm_stats_sha256") != norm_sha:
         mismatch["norm_stats_sha256"] = (norm_sha, identity.get("v4_norm_stats_sha256"))
-    if not identity.get("book_v9_4_training_data_hash"):
-        mismatch["book_v9_4_training_data_hash"] = (None, "nonempty")
+    training_hash_key = f"{version}_training_data_hash"
+    if not identity.get(training_hash_key):
+        mismatch[training_hash_key] = (None, "nonempty")
     if mismatch:
         raise ValueError(f"Book V9.4 deployment config mismatch: {mismatch}")
     validate_captioner_identity(config.get("captioner_identity", {}))
@@ -84,10 +103,12 @@ def resolve_thresholds(
     *, calibration: dict[str, Any] | None, step: int, full_params_sha: str,
     norm_sha: str, training_data_hash: str, need_override: float | None,
     adjustment_override: float | None,
+    data_profile: str = DATA_PROFILE,
 ) -> tuple[dict[str, float], dict[str, bool]]:
+    version = deployment_version(data_profile)
     if calibration is not None:
         expected = {
-            "schema_version": THRESHOLD_SCHEMA, "data_profile": DATA_PROFILE,
+            "schema_version": f"{version}_val_thresholds_v1", "data_profile": data_profile,
             "prompt_profile": PROMPT_PROFILE, "checkpoint_step": step,
             "full_params_sha256": full_params_sha, "norm_stats_sha256": norm_sha,
             "training_data_hash": training_data_hash, "selection_split": "val",
@@ -113,8 +134,9 @@ def resolve_thresholds(
 
 
 def validate_server_metadata(metadata: dict[str, Any]) -> None:
+    version = deployment_version(metadata.get("data_profile"))
     expected = {
-        "name": SERVER_NAME, "data_profile": DATA_PROFILE, "phase_prompt_profile": PROMPT_PROFILE,
+        "name": SERVER_NAME, "phase_prompt_profile": PROMPT_PROFILE,
         "action_prompt_profile": "phase_v2", "supports_streamed_phase_events": True,
         "supports_action_noise": True, "requires_action_noise": True,
         "supports_failure_generation": True, "supports_recovery_generation": True,
@@ -125,6 +147,10 @@ def validate_server_metadata(metadata: dict[str, Any]) -> None:
         "classification_qpos_policy": "raw_no_gripper_remap",
         "episode_start_padding": "left_pad_episode_frame_0", "captioner_window_size": 30,
     }
+    if version != "book_v9_4":
+        expected["experiment_version"] = version
+    if version == "book_v9_4_4":
+        expected["reasoning_window_policy"] = REASONING_WINDOW_POLICY
     mismatch = {key: (metadata.get(key), value) for key, value in expected.items()
                 if metadata.get(key) != value}
     if mismatch:

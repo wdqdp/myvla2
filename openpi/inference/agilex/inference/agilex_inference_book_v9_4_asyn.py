@@ -45,7 +45,6 @@ from tactile_vla.common.labels_v4 import LABEL_SCHEMA_VERSION
 from tactile_vla.common.labels_v4 import neutral_caption
 from tactile_vla.vla.artifacts import sha256_file
 from tactile_vla.vla.book_v9_4_memory import append_runtime_memory
-from tactile_vla.vla.book_v9_4_multitask_data import DATA_PROFILE
 from tactile_vla.vla.book_v9_4_runtime import BOOK_INSTRUCTION
 from tactile_vla.vla.book_v9_4_runtime import DEFAULT_CAPTIONER
 from tactile_vla.vla.book_v9_4_runtime import DEFAULT_NORM_DIR
@@ -103,10 +102,7 @@ class StreamingPhaseClient:
         self._timeout = timeout
         self._packer = msgpack_numpy.Packer()
         self.metadata = msgpack_numpy.unpackb(self._ws.recv(timeout=timeout))
-        if self.metadata.get("data_profile") != DATA_PROFILE:
-            raise ValueError("phase server is not a Book V9.4 checkpoint")
-        if not self.metadata.get("supports_streamed_phase_events"):
-            raise ValueError("phase server does not support streamed phase events")
+        validate_book_server_metadata(self.metadata)
         self._lock = threading.Lock()
 
     def events(self, payload: dict[str, Any]) -> Iterator[dict[str, Any]]:
@@ -652,14 +648,32 @@ def run_book_v9_4_async(
                 raise error
 
     with inference_executor(gate=gate, action_policy=action_policy, phase_client=phase_client) as executor:
-        # This is the only H100 reset: phase and attempt transitions preserve it.
-        operator.reset_state_history()
         # Action prompts contain no touch text; reserve the captioner for the
         # asynchronous phase worker to avoid serializing action generation on it.
         initial = _wait_future_while_holding(
             executor.submit(_capture_action_observation, args, operator),
             gate=gate, operator=operator, publish_rate=args.publish_rate, poll_control=poll_control,
         )
+        # Topic traffic can be healthy before thirty complete six-topic frames
+        # have accumulated. Hold feedback qpos until phase assessment is usable.
+        hold_target[0] = initial.qpos.copy()
+
+        def poll_warmup() -> None:
+            poll_control()
+            hold()
+
+        _wait_future_while_holding(
+            executor.submit(v53._wait_for_tactile_ready, args, operator, captioner),
+            gate=gate, operator=operator, publish_rate=args.publish_rate, poll_control=poll_warmup,
+        )
+        # This is the only H100 reset: anchor it after warmup and preserve it
+        # across phase and attempt transitions.
+        operator.reset_state_history()
+        initial = _wait_future_while_holding(
+            executor.submit(_capture_action_observation, args, operator),
+            gate=gate, operator=operator, publish_rate=args.publish_rate, poll_control=poll_warmup,
+        )
+        reset_hold()
         if initial.timestamp is None:
             raise ValueError("initial ROS qpos does not have a timestamp")
         operator.state_history.push(float(initial.timestamp), initial.qpos)
