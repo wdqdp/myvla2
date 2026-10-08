@@ -168,12 +168,18 @@ def parse_args() -> argparse.Namespace:
         "--expected-data-profile",
         help="Refuse to load a checkpoint whose config declares a different profile.",
     )
+    parser.add_argument("--expected-run-name", help="Require this exact training run in the checkpoint config.")
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--num-inference-steps", type=int, default=10)
     parser.add_argument("--precision", choices=("auto", "bfloat16", "float32"))
-    parser.add_argument("--dry-run", action="store_true")
-    return parser.parse_args()
+    validation = parser.add_mutually_exclusive_group()
+    validation.add_argument("--dry-run", action="store_true", help="Load weights, warm up action inference, then exit.")
+    validation.add_argument("--validate-only", action="store_true", help="Validate config and norm identity without loading weights.")
+    args = parser.parse_args()
+    if args.num_inference_steps <= 0:
+        parser.error("--num-inference-steps must be positive")
+    return args
 
 
 def _find_config(path: Path) -> tuple[Path, dict[str, Any]]:
@@ -580,8 +586,23 @@ def main() -> None:
             "Action server checkpoint profile mismatch: "
             f"expected={args.expected_data_profile!r}, config={config.get('data_profile')!r}"
         )
+    if args.expected_run_name is not None and config.get("run_name") != args.expected_run_name:
+        raise ValueError(
+            "Action server checkpoint run mismatch: "
+            f"expected={args.expected_run_name!r}, config={config.get('run_name')!r}"
+        )
     validate_v4_norm_artifacts(args, config)
     model_config = _model_config(args, config)
+    if args.validate_only:
+        params_dir = _params_dir(args.checkpoint)
+        identity = checkpoint_artifact_identity(config)
+        print(json.dumps(metadata_config_summary(config) | {
+            "checkpoint_kind": args.checkpoint_kind,
+            "checkpoint": str(args.checkpoint.expanduser().resolve()),
+            "params_dir": str(params_dir), "config_path": str(config_path),
+            "norm_stats_sha256": identity.get("norm_stats_sha256") or identity.get("v4_norm_stats_sha256"),
+        }, indent=2, ensure_ascii=False))
+        return
     norm_stats = normalize.load(args.norm_stats_dir)
     policy = ActionOnlyAblationPolicy(
         args=args,

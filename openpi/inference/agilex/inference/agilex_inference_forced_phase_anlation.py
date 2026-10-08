@@ -30,14 +30,15 @@ import agilex_inference_tactile_vla_sync_single as runtime
 import cv2
 import numpy as np
 from openpi_client import websocket_client_policy
+from tactile_vla.vla.artifacts import sha256_file
+from tactile_vla.vla.book_stage_a_data import DATA_PROFILE as BOOK_STAGE_A_V1
+from tactile_vla.vla.book_stage_a_data import EXPERIMENT_KIND as BOOK_STAGE_A_EXPERIMENT_KIND
 from tactile_vla.vla.prompts import MINIMAL_PROMPT_PROFILE
 from tactile_vla.vla.prompts import PHASE_PROMPT_PROFILE
 from tactile_vla.vla.prompts import PHASE_PROMPT_PROFILE_V2
 from tactile_vla.vla.prompts import build_execution_prompt
 from tactile_vla.vla.prompts import build_phase_prompt
 from tactile_vla.vla.prompts import resolve_prompt_profile
-from tactile_vla.vla.book_stage_a_data import DATA_PROFILE as BOOK_STAGE_A_V1
-from tactile_vla.vla.book_stage_a_data import EXPERIMENT_KIND as BOOK_STAGE_A_EXPERIMENT_KIND
 from tactile_vla.vla.structured_text import failure_reason_text
 from tactile_vla.vla.structured_text import legal_failure_reasons
 from tactile_vla.vla.structured_text import legal_recovery_plans
@@ -267,6 +268,15 @@ def _poll_control_key(
 def validate_server_metadata(args: argparse.Namespace, metadata: dict[str, Any]) -> None:
     if not bool(metadata.get("action_only_ablation", False)):
         raise ValueError("Connected server is not the action-only forced-recovery ablation server")
+    expected_run_name = getattr(args, "expected_run_name", None)
+    if expected_run_name is not None and metadata.get("config", {}).get("run_name") != expected_run_name:
+        raise ValueError(
+            "Client/server training run mismatch: "
+            f"expected={expected_run_name!r}, server={metadata.get('config', {}).get('run_name')!r}"
+        )
+    norm_stats_file = getattr(args, "norm_stats_file", None)
+    if norm_stats_file is not None and metadata.get("norm_stats_sha256") != sha256_file(norm_stats_file):
+        raise ValueError("Client/server norm stats SHA256 differs; use the checkpoint's training snapshot")
     expected_data_profile = getattr(args, "expected_data_profile", None)
     server_data_profile = str(metadata.get("data_profile", "legacy"))
     if server_data_profile == BOOK_STAGE_A_V1 and expected_data_profile != BOOK_STAGE_A_V1:
@@ -1091,13 +1101,19 @@ def get_arguments() -> tuple[argparse.Namespace, argparse.ArgumentParser]:
         "--expected-data-profile",
         help="Refuse to run if server metadata does not advertise this exact data profile.",
     )
+    parser.add_argument("--expected-run-name", help="Require this exact training run in server metadata.")
+    parser.add_argument(
+        "--norm-stats-file", type=Path,
+        help="Optional training snapshot norm_stats.json; verify its SHA256 against the server before actions.",
+    )
     parser.add_argument("--instruction", default=DEFAULT_INSTRUCTION)
     parser.add_argument(
         "--rotation-direction",
         choices=ROTATION_DIRECTIONS,
         help=(
             "Force a horizontal recovery in this direction and automatically "
-            "set the matching V3 failure reason and recovery plan"
+            "set the matching V3 failure reason and recovery plan; "
+            "Book Stage A accepts left/right and defaults to right"
         ),
     )
     parser.add_argument(
@@ -1188,18 +1204,24 @@ def get_arguments() -> tuple[argparse.Namespace, argparse.ArgumentParser]:
 
 
 def validate_args(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
+    norm_stats_file = getattr(args, "norm_stats_file", None)
+    if norm_stats_file is not None and not norm_stats_file.is_file():
+        parser.error("--norm-stats-file must point to an existing norm_stats.json")
     if getattr(args, "expected_data_profile", None) == BOOK_STAGE_A_V1:
         if args.instruction not in {DEFAULT_INSTRUCTION, BOOK_INSTRUCTION}:
             parser.error(f"Book Stage A requires --instruction={BOOK_INSTRUCTION!r}")
-        if args.rotation_direction not in {None, "right"} or args.rotation_magnitude != "moderately":
-            parser.error("Book Stage A requires a right, moderately sized adjustment")
-        book_failure, book_plan = rotation_targets("right", "moderately")
+        book_direction = args.rotation_direction or "right"
+        if book_direction not in {"left", "right"}:
+            parser.error("Book Stage A requires --rotation-direction left or right")
+        if args.rotation_magnitude != "moderately":
+            parser.error("Book Stage A requires --rotation-magnitude moderately")
+        book_failure, book_plan = rotation_targets(book_direction, "moderately")
         if args.forced_failure_reason not in {None, book_failure}:
             parser.error(f"Book Stage A requires --forced-failure-reason={book_failure!r}")
         if args.forced_recovery_plan not in {None, book_plan}:
             parser.error(f"Book Stage A requires --forced-recovery-plan={book_plan!r}")
         args.instruction = BOOK_INSTRUCTION
-        args.rotation_direction = "right"
+        args.rotation_direction = book_direction
         args.forced_failure_reason = book_failure
         args.forced_recovery_plan = book_plan
         args.no_captioner = True
