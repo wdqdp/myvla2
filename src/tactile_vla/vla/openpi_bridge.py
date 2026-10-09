@@ -31,13 +31,14 @@ from tactile_vla.vla.v4_data import V4_NEED_SCHEMA
 from tactile_vla.vla.v4_data import V4_REASONING_SCHEMA
 from tactile_vla.vla.v4_data import memory_plan_matches_prefix
 from tactile_vla.vla.v4_data import validate_grasp_memory
+from tactile_vla.vla.v4_data import validate_real_fz_bias_memory
 
 
 StageName = Literal["execution", "status", "reasoning"]
 V3StageBTask = Literal["need_recovery", "failure_reason"]
 V4StageBTask = Literal["need", "failure", "plan"]
 _V4_FAILURE_RE = re.compile(
-    r"^failure_reason=rotate (none|right|left|front|back),grasp (appropriate|missing|too_high|too_low)\.$"
+    r"^failure_reason=rotate (none|right|left|front|back),grasp (appropriate|missing|too_high|too_low)(?:,fz_bias (left|right|none))?\.$"
 )
 _V4_PLAN_RE = re.compile(
     r"^recovery_plan=move horizontally (none|right|left|front|back) "
@@ -541,6 +542,8 @@ class V3StageBFrameDataset(torch.utils.data.Dataset):
             "frame_index": int(_scalar(item["frame_index"])),
         }
         if self.task == "need_recovery":
+            if "need_recovery_mask" in item and not bool(_scalar(item["need_recovery_mask"])):
+                raise ValueError("Need training received a masked transition frame")
             result.update(
                 {
                     "prompt": build_monitor_prompt(
@@ -736,7 +739,7 @@ class V4DirectManifestDataset(torch.utils.data.Dataset):
                     raise ValueError(f"V4 {task} row {row_index} has inconsistent window identity")
                 if task == "failure":
                     target = str(row.get("target_failure_reason", ""))
-                    if target not in legal_failure_reasons():
+                    if target not in legal_failure_reasons(include_fz_bias=True):
                         raise ValueError(f"V4 failure row {row_index} target is outside full V3 grammar")
                     if target != str(observation.get("failure_reason", "")):
                         raise ValueError(f"V4 failure row {row_index} target differs from real observation")
@@ -745,66 +748,69 @@ class V4DirectManifestDataset(torch.utils.data.Dataset):
                     if target not in legal_recovery_plans():
                         raise ValueError(f"V4 plan row {row_index} target is outside full V3 grammar")
                     target_match = _V4_PLAN_RE.fullmatch(target)
-                    grasp_recovery = validate_grasp_memory(row)
-                    if target_match is None:
-                        raise ValueError(f"V4 plan row {row_index} target is outside the rotation subset")
-                    memory = row.get("failure_recovery_memory")
-                    if not isinstance(memory, list) or len(memory) != int(row.get("memory_length", -1)):
-                        raise ValueError(f"V4 plan row {row_index} has invalid memory length")
-                    if not 1 <= len(memory) <= 5:
-                        raise ValueError(f"V4 plan row {row_index} memory length is outside [1,5]")
-                    if (
-                        not grasp_recovery
-                        and target_match.group(2) == "moderately"
-                        and len(memory) != 1
-                    ) or (
-                        not grasp_recovery
-                        and target_match.group(2) == "slightly"
-                        and len(memory) not in {2, 3, 4, 5}
-                    ) or (grasp_recovery and len(memory) not in {2, 3, 4, 5}):
-                        raise ValueError(f"V4 plan row {row_index} target/memory length mismatch")
-                    variant_id = str(row.get("variant_id", ""))
-                    rule_version = str(row.get("rule_version", ""))
-                    seed = int(row.get("seed", -1))
-                    if not variant_id or not rule_version or seed < 0:
-                        raise ValueError(f"V4 plan row {row_index} lacks synthetic provenance")
-                    failure_directions: list[str] = []
-                    for pair_index, pair in enumerate(memory):
-                        if not isinstance(pair, Mapping) or pair.get("source_type") != "synthetic":
-                            raise ValueError(f"V4 plan row {row_index} contains non-synthetic memory")
-                        if {"donor_episode_id", "donor_attempt_id"} & set(pair):
-                            raise ValueError(f"V4 plan row {row_index} contains fake donor provenance")
+                    if validate_real_fz_bias_memory(row):
+                        pass
+                    else:
+                        grasp_recovery = validate_grasp_memory(row)
+                        if target_match is None:
+                            raise ValueError(f"V4 plan row {row_index} target is outside the rotation subset")
+                        memory = row.get("failure_recovery_memory")
+                        if not isinstance(memory, list) or len(memory) != int(row.get("memory_length", -1)):
+                            raise ValueError(f"V4 plan row {row_index} has invalid memory length")
+                        if not 1 <= len(memory) <= 5:
+                            raise ValueError(f"V4 plan row {row_index} memory length is outside [1,5]")
                         if (
-                            pair.get("variant_id") != variant_id
-                            or pair.get("rule_version") != rule_version
-                            or int(pair.get("seed", -1)) != seed
-                            or int(pair.get("pair_index", -1)) != pair_index
-                        ):
-                            raise ValueError(f"V4 plan row {row_index} pair provenance mismatch")
-                        failure_match = _V4_FAILURE_RE.fullmatch(str(pair.get("failure_reason", "")))
-                        if failure_match is None:
-                            raise ValueError(f"V4 plan row {row_index} pair failure is outside V4 grammar")
-                        failure_directions.append(failure_match.group(1))
-                        plan_text = str(pair.get("recovery_plan", ""))
-                        if pair_index == 0:
-                            if plan_text != "initial plan":
-                                raise ValueError(f"V4 plan row {row_index} first pair is not initial plan")
-                        else:
-                            if not memory_plan_matches_prefix(memory, pair_index):
-                                raise ValueError(f"V4 plan row {row_index} memory chain is incompatible")
-                    real_failure = str(observation.get("failure_reason", ""))
-                    if str(memory[-1]["failure_reason"]) != real_failure:
-                        raise ValueError(f"V4 plan row {row_index} terminal failure differs from observation")
-                    if not grasp_recovery:
-                        rotation_count = sum(direction != "none" for direction in failure_directions)
-                        expected_magnitude = "moderately" if rotation_count == 1 else "slightly"
-                        if (
-                            target_match.group(1) != failure_directions[-1]
-                            or target_match.group(2) != expected_magnitude
-                        ):
-                            raise ValueError(
-                                f"V4 plan row {row_index} target differs from terminal rotation history"
-                            )
+                            not grasp_recovery
+                            and target_match.group(2) == "moderately"
+                            and len(memory) != 1
+                        ) or (
+                            not grasp_recovery
+                            and target_match.group(2) == "slightly"
+                            and len(memory) not in {2, 3, 4, 5}
+                        ) or (grasp_recovery and len(memory) not in {2, 3, 4, 5}):
+                            raise ValueError(f"V4 plan row {row_index} target/memory length mismatch")
+                        variant_id = str(row.get("variant_id", ""))
+                        rule_version = str(row.get("rule_version", ""))
+                        seed = int(row.get("seed", -1))
+                        if not variant_id or not rule_version or seed < 0:
+                            raise ValueError(f"V4 plan row {row_index} lacks synthetic provenance")
+                        failure_directions: list[str] = []
+                        for pair_index, pair in enumerate(memory):
+                            if not isinstance(pair, Mapping) or pair.get("source_type") != "synthetic":
+                                raise ValueError(f"V4 plan row {row_index} contains non-synthetic memory")
+                            if {"donor_episode_id", "donor_attempt_id"} & set(pair):
+                                raise ValueError(f"V4 plan row {row_index} contains fake donor provenance")
+                            if (
+                                pair.get("variant_id") != variant_id
+                                or pair.get("rule_version") != rule_version
+                                or int(pair.get("seed", -1)) != seed
+                                or int(pair.get("pair_index", -1)) != pair_index
+                            ):
+                                raise ValueError(f"V4 plan row {row_index} pair provenance mismatch")
+                            failure_match = _V4_FAILURE_RE.fullmatch(str(pair.get("failure_reason", "")))
+                            if failure_match is None:
+                                raise ValueError(f"V4 plan row {row_index} pair failure is outside V4 grammar")
+                            failure_directions.append(failure_match.group(1))
+                            plan_text = str(pair.get("recovery_plan", ""))
+                            if pair_index == 0:
+                                if plan_text != "initial plan":
+                                    raise ValueError(f"V4 plan row {row_index} first pair is not initial plan")
+                            else:
+                                if not memory_plan_matches_prefix(memory, pair_index):
+                                    raise ValueError(f"V4 plan row {row_index} memory chain is incompatible")
+                        real_failure = str(observation.get("failure_reason", ""))
+                        if str(memory[-1]["failure_reason"]) != real_failure:
+                            raise ValueError(f"V4 plan row {row_index} terminal failure differs from observation")
+                        if not grasp_recovery:
+                            rotation_count = sum(direction != "none" for direction in failure_directions)
+                            expected_magnitude = "moderately" if rotation_count == 1 else "slightly"
+                            if (
+                                target_match.group(1) != failure_directions[-1]
+                                or target_match.group(2) != expected_magnitude
+                            ):
+                                raise ValueError(
+                                    f"V4 plan row {row_index} target differs from terminal rotation history"
+                                )
                     target_source = row.get("target_source")
                     if not isinstance(target_source, Mapping) or target_source.get("source_type") != "real":
                         raise ValueError(f"V4 plan row {row_index} target is not real")
@@ -886,6 +892,8 @@ class V4DirectManifestDataset(torch.utils.data.Dataset):
             "frame_index": item_identity[3],
         }
         if self.task == "need":
+            if "need_recovery_mask" in item and not bool(_scalar(item["need_recovery_mask"])):
+                raise ValueError("V4 need manifest references a masked transition frame")
             target = bool(row["need_recovery"])
             stored = bool(_scalar(item["need_recovery"]))
             if target != stored:
@@ -907,6 +915,12 @@ class V4DirectManifestDataset(torch.utils.data.Dataset):
 
         if not bool(_scalar(item["need_recovery"])):
             raise ValueError(f"V4 {self.task} row {row_index} maps to a non-failure-active frame")
+        if ",fz_bias " in str(row["current_observation"].get("failure_reason", "")):
+            failure_match = _V4_FAILURE_RE.fullmatch(str(row["current_observation"]["failure_reason"]))
+            if (failure_match is None
+                    or _text(item.get("fz_bias_direction", "none")) != failure_match.group(3)
+                    or _text(item["failure_reason"]) != str(row["current_observation"]["failure_reason"])):
+                raise ValueError("Force bias manifest differs from the LeRobot failure label")
         if self.task == "failure":
             target = str(row["target_failure_reason"])
             stored_target = _text(item["failure_reason"])

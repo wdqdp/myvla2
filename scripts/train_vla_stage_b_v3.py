@@ -1282,6 +1282,9 @@ def evaluate_text(
     direction_magnitude_total: Counter[str] = Counter()
 
     def direction_for(text: str) -> str:
+        bias = re.search(r",fz_bias (left|right)\.", text)
+        if bias:
+            return f"fz_bias/{bias.group(1)}"
         pattern = (
             r"failure_reason=rotate (left|right|front|back|none),"
             if task == "failure"
@@ -1494,15 +1497,17 @@ def main() -> None:
         pytorch_compile_mode=None,
     )
     tokenizer = openpi_tokenizer.PaligemmaTokenizer(args.reasoning_max_token_len)
+    index, records = ensure_v3_index(args)
+    include_fz_bias = args.data_profile == ROTATION_V4 and bool(index.get("fz_bias_directions"))
     failure_codec = failure_grammar(
-        lambda text: tokenizer.encode_text(text, add_eos=True)
+        lambda text: tokenizer.encode_text(text, add_eos=True),
+        include_fz_bias=include_fz_bias,
     )
     plan_codec = recovery_grammar(
         lambda text: tokenizer.encode_text(text, add_eos=True)
     )
-    if failure_codec.texts != legal_failure_reasons() or plan_codec.texts != legal_recovery_plans():
+    if failure_codec.texts != legal_failure_reasons(include_fz_bias=include_fz_bias) or plan_codec.texts != legal_recovery_plans():
         raise AssertionError("V3 full grammar was unexpectedly narrowed")
-    index, records = ensure_v3_index(args)
     identity = artifact_identity(
         index,
         index_path=args.index_file,

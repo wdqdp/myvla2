@@ -15,8 +15,11 @@ MAGNITUDES = ("slightly", "moderately", "significantly")
 VERTICAL_DIRECTIONS = ("up", "down", "none")
 
 
-def failure_reason_text(rotation: str, grasp: str) -> str:
-    return f"failure_reason=rotate {rotation},grasp {grasp}."
+def failure_reason_text(rotation: str, grasp: str, fz_bias_direction: str = "none") -> str:
+    if fz_bias_direction not in {"none", "left", "right"}:
+        raise ValueError(f"Invalid fz_bias_direction: {fz_bias_direction}")
+    suffix = f",fz_bias {fz_bias_direction}" if fz_bias_direction != "none" else ""
+    return f"failure_reason=rotate {rotation},grasp {grasp}{suffix}."
 
 
 def recovery_plan_text(
@@ -32,12 +35,21 @@ def recovery_plan_text(
     )
 
 
-def legal_failure_reasons() -> tuple[str, ...]:
-    return tuple(
+def legal_failure_reasons(*, include_fz_bias: bool = False) -> tuple[str, ...]:
+    legacy = tuple(
         failure_reason_text(rotation, grasp)
         for rotation in ROTATION_DIRECTIONS
         for grasp in GRASP_POSITIONS
         if not (rotation == "none" and grasp == "appropriate")
+    )
+
+    if not include_fz_bias:
+        return legacy
+    return legacy + tuple(
+        failure_reason_text(rotation, grasp, bias)
+        for bias in ("left", "right")
+        for rotation in ROTATION_DIRECTIONS
+        for grasp in GRASP_POSITIONS
     )
 
 
@@ -162,8 +174,10 @@ class ConstrainedTokenGrammar:
         )
 
 
-def failure_grammar(encode: Callable[[str], Sequence[int]]) -> ConstrainedTokenGrammar:
-    return ConstrainedTokenGrammar(legal_failure_reasons(), encode=encode)
+def failure_grammar(
+    encode: Callable[[str], Sequence[int]], *, include_fz_bias: bool = False,
+) -> ConstrainedTokenGrammar:
+    return ConstrainedTokenGrammar(legal_failure_reasons(include_fz_bias=include_fz_bias), encode=encode)
 
 
 def recovery_grammar(encode: Callable[[str], Sequence[int]]) -> ConstrainedTokenGrammar:

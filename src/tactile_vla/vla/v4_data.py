@@ -94,6 +94,16 @@ class V4Frame:
     tactile_caption: str
     instruction: str
     input_recovery_plan: str
+    fz_bias_direction: str = "none"
+    need_recovery_mask: bool = True
+    need_recovery: bool | None = None
+    failure_boundary_status: str = "resolved"
+    failure_boundary_source: str = "none"
+    failure_boundary_frame_index: int = -1
+    captioner_left_start_frame: int = -1
+    failure_boundary_timestamp: float = -1.0
+    failure_boundary_rule_version: str = ""
+    failure_boundary_checkpoint_sha256: str = ""
 
     @property
     def key(self) -> tuple[int, int, int]:
@@ -142,9 +152,17 @@ def scan_v4_lerobot_frames(dataset_dir: Path) -> list[V4Frame]:
         missing = sorted(set(_LEROBOT_COLUMNS) - schema)
         if missing:
             raise ValueError(f"{path}: missing V4 identity columns {missing}")
-        data = pq.read_table(path, columns=list(_LEROBOT_COLUMNS)).to_pydict()
+        columns = list(_LEROBOT_COLUMNS)
+        if "fz_bias_direction" in schema:
+            columns.append("fz_bias_direction")
+        for optional in ("need_recovery_mask", "need_recovery", "failure_boundary_status",
+                         "failure_boundary_source", "failure_boundary_frame_index", "captioner_left_start_frame",
+                         "failure_boundary_timestamp", "failure_boundary_rule_version", "failure_boundary_checkpoint_sha256"):
+            if optional in schema:
+                columns.append(optional)
+        data = pq.read_table(path, columns=columns).to_pydict()
         for offset in range(len(data["index"])):
-            value = {name: _scalar(data[name][offset]) for name in _LEROBOT_COLUMNS}
+            value = {name: _scalar(data[name][offset]) for name in columns}
             frames.append(
                 V4Frame(
                     global_index=int(value["index"]),
@@ -157,6 +175,16 @@ def scan_v4_lerobot_frames(dataset_dir: Path) -> list[V4Frame]:
                     result=str(value["result"]),
                     rotation_direction=str(value["rotation_direction"]),
                     grasp_position=str(value["grasp_position"]),
+                    fz_bias_direction=str(value.get("fz_bias_direction", "none")),
+                    need_recovery_mask=bool(value.get("need_recovery_mask", True)),
+                    need_recovery=bool(value["need_recovery"]) if "need_recovery" in value else None,
+                    failure_boundary_status=str(value.get("failure_boundary_status", "resolved")),
+                    failure_boundary_source=str(value.get("failure_boundary_source", "none")),
+                    failure_boundary_frame_index=int(value.get("failure_boundary_frame_index", -1)),
+                    captioner_left_start_frame=int(value.get("captioner_left_start_frame", -1)),
+                    failure_boundary_timestamp=float(value.get("failure_boundary_timestamp", -1.0)),
+                    failure_boundary_rule_version=str(value.get("failure_boundary_rule_version", "")),
+                    failure_boundary_checkpoint_sha256=str(value.get("failure_boundary_checkpoint_sha256", "")),
                     horizontal_direction=str(value["horizontal_direction"]),
                     horizontal_magnitude=str(value["horizontal_magnitude"]),
                     valid=bool(value["valid"]),
@@ -222,6 +250,31 @@ def load_v4_sources(
     return selection, profile, splits
 
 
+def validate_need_boundary(frame: V4Frame, meta: Mapping[str, Any]) -> None:
+    if (meta.get("failure_boundary_status", "resolved") == "pending"
+            or (meta["result"] == "failure" and meta.get("failure_window_start") is None)):
+        raise ValueError("Failed attempt has an unresolved boundary; annotate with Captioner before training")
+    f = meta.get("need_transition_start_frame")
+    end = meta.get("need_transition_end_frame")
+    expected_mask = not (f is not None and int(f) <= frame.frame_index <= int(end))
+    if frame.need_recovery_mask != expected_mask:
+        raise ValueError(f"Frame {frame.key} need_recovery_mask differs from boundary transition")
+    c = meta.get("failure_window_start")
+    if frame.need_recovery is not None:
+        expected_need = meta["result"] == "failure" and c is not None and frame.frame_index >= int(c)
+        if frame.need_recovery != expected_need:
+            raise ValueError(f"Frame {frame.key} need_recovery differs from effective boundary")
+    if meta.get("failure_boundary_source") == "captioner_fz_bias":
+        for field in ("failure_boundary_source", "failure_boundary_status", "failure_boundary_frame_index",
+                      "captioner_left_start_frame", "failure_boundary_rule_version", "failure_boundary_checkpoint_sha256"):
+            if getattr(frame, field) != meta[field]:
+                raise ValueError(f"Frame {frame.key} {field} differs from profile")
+        if abs(frame.failure_boundary_timestamp - float(meta["failure_boundary_timestamp"])) > 1e-9:
+            raise ValueError(f"Frame {frame.key} boundary timestamp differs from profile")
+        if int(meta["captioner_left_start_frame"]) + 3 != int(c) or int(end) != int(c) - 1:
+            raise ValueError("Invalid Captioner transition: expected c=f+3")
+
+
 def validate_v4_lerobot_frames(
     frames: Sequence[V4Frame],
     profile: Mapping[str, Any],
@@ -276,10 +329,12 @@ def validate_v4_lerobot_frames(
             "result": str(profile_row["result"]),
             "rotation_direction": str(profile_row["rotation_direction"]),
             "grasp_position": str(profile_row["grasp_position"]),
+            "fz_bias_direction": str(profile_row.get("fz_bias_direction", "none")),
             "horizontal_direction": str(profile_row["horizontal_direction"]),
             "horizontal_magnitude": str(profile_row["horizontal_magnitude"]),
         }
         for row in attempt_frames:
+            validate_need_boundary(row, profile_row)
             for field, expected in constant_fields.items():
                 if getattr(row, field) != expected:
                     raise ValueError(f"Frame {row.key} {field} does not match profile")
@@ -381,11 +436,14 @@ def build_need_rows(
         failed = str(meta["result"]) == "failure"
         start_value = meta.get("failure_window_start")
         for frame in frames:
+            validate_need_boundary(frame, meta)
+            if not frame.need_recovery_mask:
+                continue
             source: str | None = None
             label: bool | None = None
             if failed:
                 if start_value is None:
-                    raise ValueError(f"Failed attempt {pair} lacks failure_window_start")
+                    raise ValueError(f"Failed attempt {pair} has an unresolved boundary; annotate it with Captioner before constructing the training index")
                 if frame.frame_index >= int(start_value):
                     source, label = "failure_active", True
                 else:
@@ -449,7 +507,40 @@ _PLAN_RE = re.compile(
     r"^recovery_plan=move horizontally (none|right|left|front|back) (slightly|moderately|significantly), "
     r"move vertically (none|up|down) moderately\.$"
 )
-_FAILURE_RE = re.compile(r"^failure_reason=rotate (none|right|left|front|back),grasp (appropriate|missing|too_high|too_low)\.$")
+_FAILURE_RE = re.compile(r"^failure_reason=rotate (none|right|left|front|back),grasp (appropriate|missing|too_high|too_low)(?:,fz_bias (left|right|none))?\.$")
+
+
+def validate_real_fz_bias_memory(row: Mapping[str, Any]) -> bool:
+    """Validate a single real force-bias failure and its configured recovery."""
+    observation = row["current_observation"]
+    reason = str(observation.get("failure_reason", ""))
+    failure = _FAILURE_RE.fullmatch(reason)
+    if failure is None:
+        raise ValueError("Invalid failure grammar")
+    bias = failure.group(3) or "none"
+    if bias == "none":
+        return False
+    if failure.group(1) != "none" or failure.group(2) != "appropriate":
+        raise ValueError("Combined force bias recovery has not been configured")
+    if bias != "left":
+        raise ValueError(f"Recovery for fz_bias_direction={bias} has not been configured")
+    if row.get("target_recovery_plan") != (
+        "recovery_plan=move horizontally none moderately, move vertically up moderately."
+    ):
+        raise ValueError("Force bias left recovery must move vertically up")
+    memory = row.get("failure_recovery_memory")
+    if not isinstance(memory, list) or len(memory) != 1 or row.get("memory_length") != 1:
+        raise ValueError("Force bias recovery requires one real memory pair")
+    if row.get("rule_version") != "real_fz_bias_recovery_v1":
+        raise ValueError("Force bias memory rule version mismatch")
+    pair = memory[0]
+    if (not isinstance(pair, Mapping) or pair.get("source_type") != "real"
+            or pair.get("recovery_plan") != "initial plan" or pair.get("failure_reason") != reason
+            or pair.get("pair_index") != 0 or not pair.get("meta_sha256")
+            or any(pair.get(field) != observation.get(field) for field in ("episode_id", "attempt_id"))
+            or {"donor_episode_id", "donor_attempt_id"} & set(pair)):
+        raise ValueError("Force bias memory differs from its real observation/provenance")
+    return True
 
 
 def validate_grasp_memory(row: Mapping[str, Any]) -> bool:
@@ -549,7 +640,7 @@ def validate_direct_manifest_rows(
         if str(observation.get("hdf5_path", "")) != str(meta["hdf5_path"]):
             raise ValueError(f"{task} row {row_number} HDF5 attempt identity differs from profile")
         real_failure = str(observation["failure_reason"])
-        if _FAILURE_RE.fullmatch(real_failure) is None or real_failure not in legal_failure_reasons():
+        if _FAILURE_RE.fullmatch(real_failure) is None or real_failure not in legal_failure_reasons(include_fz_bias=True):
             raise ValueError(f"{task} row {row_number} has failure outside full V3 grammar")
         if task == "failure":
             if str(row.get("target_failure_reason", "")) != real_failure:
@@ -563,52 +654,58 @@ def validate_direct_manifest_rows(
             length = int(row.get("memory_length", -1))
             if not isinstance(memory, list) or len(memory) != length or not 1 <= length <= 5:
                 raise ValueError(f"plan row {row_number} has invalid memory length")
-            magnitude = match.group(2)
-            grasp_recovery = validate_grasp_memory(row)
-            if (not grasp_recovery and magnitude == "moderately" and length != 1) or (
-                not grasp_recovery and magnitude == "slightly" and length not in {2, 3, 4, 5}
-            ) or (grasp_recovery and length not in {2, 3, 4, 5}):
-                raise ValueError(f"plan row {row_number} target/memory length mismatch")
-            variant_id = str(row.get("variant_id", ""))
-            rule_version = str(row.get("rule_version", ""))
-            seed = int(row.get("seed", -1))
-            if not variant_id or not rule_version or seed < 0:
-                raise ValueError(f"plan row {row_number} lacks synthetic provenance")
-            for pair_index, pair in enumerate(memory):
-                if not isinstance(pair, Mapping) or pair.get("source_type") != "synthetic":
-                    raise ValueError(f"plan row {row_number} contains non-synthetic memory")
-                if {"donor_episode_id", "donor_attempt_id"} & set(pair):
-                    raise ValueError(f"plan row {row_number} contains fake donor provenance")
-                if (
-                    pair.get("variant_id") != variant_id
-                    or pair.get("rule_version") != rule_version
-                    or int(pair.get("seed", -1)) != seed
-                    or int(pair.get("pair_index", -1)) != pair_index
-                ):
-                    raise ValueError(f"plan row {row_number} pair provenance mismatch")
-                if str(pair.get("failure_reason", "")) not in legal_failure_reasons():
-                    raise ValueError(f"plan row {row_number} pair failure outside full V3 grammar")
-                plan_text = str(pair.get("recovery_plan", ""))
-                if pair_index == 0:
-                    if plan_text != "initial plan":
-                        raise ValueError(f"plan row {row_number} first pair is not initial plan")
-                elif plan_text not in legal_recovery_plans():
-                    raise ValueError(f"plan row {row_number} pair plan outside full V3 grammar")
-            failure_directions = []
-            for pair in memory:
-                failure_match = _FAILURE_RE.fullmatch(str(pair["failure_reason"]))
-                assert failure_match is not None
-                failure_directions.append(failure_match.group(1))
-            for pair_index in range(1, length):
-                if not memory_plan_matches_prefix(memory, pair_index):
-                    raise ValueError(f"plan row {row_number} synthetic memory chain is incompatible")
-            if str(memory[-1]["failure_reason"]) != real_failure:
-                raise ValueError(f"plan row {row_number} terminal failure differs from observation")
-            if not grasp_recovery:
-                rotation_count = sum(direction != "none" for direction in failure_directions)
-                expected_magnitude = "moderately" if rotation_count == 1 else "slightly"
-                if match.group(1) != failure_directions[-1] or match.group(2) != expected_magnitude:
-                    raise ValueError(f"plan row {row_number} target differs from terminal rotation history")
+            if validate_real_fz_bias_memory(row):
+                if memory[0]["meta_sha256"] != meta.get("meta_sha256"):
+                    raise ValueError("Force bias memory metadata hash differs from profile")
+                if meta.get("fz_bias_direction", "none") != "left":
+                    raise ValueError("Force bias failure differs from profile")
+            else:
+                magnitude = match.group(2)
+                grasp_recovery = validate_grasp_memory(row)
+                if (not grasp_recovery and magnitude == "moderately" and length != 1) or (
+                    not grasp_recovery and magnitude == "slightly" and length not in {2, 3, 4, 5}
+                ) or (grasp_recovery and length not in {2, 3, 4, 5}):
+                    raise ValueError(f"plan row {row_number} target/memory length mismatch")
+                variant_id = str(row.get("variant_id", ""))
+                rule_version = str(row.get("rule_version", ""))
+                seed = int(row.get("seed", -1))
+                if not variant_id or not rule_version or seed < 0:
+                    raise ValueError(f"plan row {row_number} lacks synthetic provenance")
+                for pair_index, pair in enumerate(memory):
+                    if not isinstance(pair, Mapping) or pair.get("source_type") != "synthetic":
+                        raise ValueError(f"plan row {row_number} contains non-synthetic memory")
+                    if {"donor_episode_id", "donor_attempt_id"} & set(pair):
+                        raise ValueError(f"plan row {row_number} contains fake donor provenance")
+                    if (
+                        pair.get("variant_id") != variant_id
+                        or pair.get("rule_version") != rule_version
+                        or int(pair.get("seed", -1)) != seed
+                        or int(pair.get("pair_index", -1)) != pair_index
+                    ):
+                        raise ValueError(f"plan row {row_number} pair provenance mismatch")
+                    if str(pair.get("failure_reason", "")) not in legal_failure_reasons(include_fz_bias=True):
+                        raise ValueError(f"plan row {row_number} pair failure outside full V3 grammar")
+                    plan_text = str(pair.get("recovery_plan", ""))
+                    if pair_index == 0:
+                        if plan_text != "initial plan":
+                            raise ValueError(f"plan row {row_number} first pair is not initial plan")
+                    elif plan_text not in legal_recovery_plans():
+                        raise ValueError(f"plan row {row_number} pair plan outside full V3 grammar")
+                failure_directions = []
+                for pair in memory:
+                    failure_match = _FAILURE_RE.fullmatch(str(pair["failure_reason"]))
+                    assert failure_match is not None
+                    failure_directions.append(failure_match.group(1))
+                for pair_index in range(1, length):
+                    if not memory_plan_matches_prefix(memory, pair_index):
+                        raise ValueError(f"plan row {row_number} synthetic memory chain is incompatible")
+                if str(memory[-1]["failure_reason"]) != real_failure:
+                    raise ValueError(f"plan row {row_number} terminal failure differs from observation")
+                if not grasp_recovery:
+                    rotation_count = sum(direction != "none" for direction in failure_directions)
+                    expected_magnitude = "moderately" if rotation_count == 1 else "slightly"
+                    if match.group(1) != failure_directions[-1] or match.group(2) != expected_magnitude:
+                        raise ValueError(f"plan row {row_number} target differs from terminal rotation history")
             source = row.get("target_source")
             if not isinstance(source, Mapping) or source.get("source_type") != "real":
                 raise ValueError(f"plan row {row_number} target is not real")
@@ -616,6 +713,11 @@ def validate_direct_manifest_rows(
             if target_pair not in profile_attempts or target_pair[0] != key[0] or target_pair[1] != key[1] + 1:
                 raise ValueError(f"plan row {row_number} target is not the adjacent real attempt")
             target_meta = profile_attempts[target_pair]
+            if meta.get("fz_bias_direction", "none") != "none":
+                if (source.get("failed_attempt_id") != key[1]
+                        or source.get("plan_meta_sha256") != target_meta.get("meta_sha256")
+                        or source.get("hdf5_path") != target_meta.get("hdf5_path")):
+                    raise ValueError("Force bias target provenance differs from the adjacent profile attempt")
             expected_target = (
                 f"recovery_plan=move horizontally {target_meta['horizontal_direction']} "
                 f"{target_meta['horizontal_magnitude']}, move vertically "
@@ -680,6 +782,24 @@ def validate_v4_index_dataset(
     if stored_parquet_hashes != actual_parquet_hashes:
         raise ValueError("V4 LeRobot parquet file hashes differ from the unified index")
     frames = scan_v4_lerobot_frames(dataset_dir)
+    if any(frame.failure_boundary_status == "pending" for frame in frames):
+        raise ValueError("Failed attempt has an unresolved boundary")
+    if any(not frame.need_recovery_mask or frame.failure_boundary_source == "captioner_fz_bias" for frame in frames):
+        profile = _load_json(Path(str(source_files["profile"]["path"])))
+        profile_rows = {(int(row["episode_id"]), int(row["attempt_id"])): row for row in profile["attempts"]}
+        for frame in frames:
+            if frame.attempt_key not in profile_rows:
+                raise ValueError("LeRobot frame has no profile attempt")
+            validate_need_boundary(frame, profile_rows[frame.attempt_key])
+    lookup = {frame.global_index: frame for frame in frames}
+    for split in SPLITS:
+        for index in payload["splits"][split].get("status_indices", []):
+            if int(index) not in lookup or not lookup[int(index)].need_recovery_mask:
+                raise ValueError("Need training index contains a transition or unknown frame")
+    expected_bias = sorted({frame.fz_bias_direction for frame in frames
+                            if frame.fz_bias_direction != "none"})
+    if payload.get("fz_bias_directions", []) != expected_bias:
+        raise ValueError("V4 force bias grammar hint differs from the LeRobot data")
     global_lookup = {frame.global_index: frame for frame in frames}
     if set(global_lookup) != set(range(len(frames))):
         raise ValueError("V4 LeRobot global indices must be the exact contiguous range 0..N-1")

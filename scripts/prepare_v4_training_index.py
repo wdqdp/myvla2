@@ -226,6 +226,11 @@ def build_index(
         "need": need_summary,
         "splits": {split: split_entries[split]["summary"] for split in SPLITS},
     }
+    bias_directions = sorted({str(row.get("fz_bias_direction", "none"))
+                              for row in profile["attempts"]
+                              if row.get("fz_bias_direction", "none") != "none"})
+    if bias_directions:
+        payload["fz_bias_directions"] = bias_directions
     return payload, need_rows, summary
 
 
