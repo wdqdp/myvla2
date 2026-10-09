@@ -48,6 +48,9 @@ from tactile_vla.vla.artifacts import validate_merged_best_metrics
 from tactile_vla.vla.artifacts import validate_norm_stats_identity
 from tactile_vla.vla.book_stage_a_data import DATA_PROFILE as BOOK_STAGE_A_V1
 from tactile_vla.vla.book_stage_a_data import EXPERIMENT_KIND as BOOK_STAGE_A_EXPERIMENT_KIND
+from tactile_vla.vla.book_v9_5_stage_a_data import RUN_NAME as BOOK_V95_RUN_NAME
+from tactile_vla.vla.book_v9_5_stage_a_data import SCOPE_POLICY as BOOK_V95_SCOPE_POLICY
+from tactile_vla.vla.book_v9_5_stage_a_data import VERSION_TAG as BOOK_V95_VERSION
 from tactile_vla.vla.prompts import build_execution_prompt
 from tactile_vla.vla.prompts import MINIMAL_PROMPT_PROFILE
 from tactile_vla.vla.prompts import PHASE_PROMPT_PROFILE
@@ -116,6 +119,8 @@ VERSIONED_ACTION_PROFILES = {
 
 _METADATA_CONFIG_KEYS = (
     "run_name",
+    "experiment_version",
+    "source_scope",
     "stage_a_protocol",
     "data_profile",
     "prompt_profile",
@@ -169,6 +174,7 @@ def parse_args() -> argparse.Namespace:
         help="Refuse to load a checkpoint whose config declares a different profile.",
     )
     parser.add_argument("--expected-run-name", help="Require this exact training run in the checkpoint config.")
+    parser.add_argument("--expected-experiment-version", help="Require this exact experiment version in the checkpoint config.")
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--num-inference-steps", type=int, default=10)
@@ -197,6 +203,38 @@ def _params_dir(path: Path) -> Path:
     if not params_dir.is_dir():
         raise FileNotFoundError(f"Checkpoint params directory not found: {params_dir}")
     return params_dir
+
+
+def validate_book_v95_config(args: argparse.Namespace, config: dict[str, Any]) -> None:
+    """Check the V9.5 training identity without reading training datasets at serving time."""
+
+    if config.get("experiment_version") != BOOK_V95_VERSION and config.get("run_name") != BOOK_V95_RUN_NAME:
+        return
+    expected = {
+        "experiment_version": BOOK_V95_VERSION,
+        "data_profile": BOOK_STAGE_A_V1,
+        "prompt_profile": PHASE_PROMPT_PROFILE_V2,
+        "experiment_kind": BOOK_STAGE_A_EXPERIMENT_KIND,
+        "stage_a_protocol": BOOK_STAGE_A_PROTOCOL_NAME,
+        "use_state_history": False,
+        "state_history_len": 0,
+        "history_hidden_dim": 0,
+    }
+    mismatches = {key: (config.get(key), value) for key, value in expected.items() if config.get(key) != value}
+    if args.checkpoint_kind != "stage-a" or mismatches:
+        raise ValueError(f"Book V9.5 requires a Stage A no-history checkpoint: {mismatches}")
+    scope = config.get("source_scope")
+    if not isinstance(scope, dict) or scope.get("policy") != BOOK_V95_SCOPE_POLICY:
+        raise ValueError("Book V9.5 checkpoint is missing its current-data source_scope policy")
+    for key in ("book_root", "dataset_dir", "norm_stats_dir"):
+        if not config.get(key) or scope.get(key) != config[key]:
+            raise ValueError(f"Book V9.5 source_scope differs from its training config: {key}")
+    identity = checkpoint_artifact_identity(config)
+    if identity.get("data_profile") != BOOK_STAGE_A_V1 or identity.get("prompt_profile") != PHASE_PROMPT_PROFILE_V2:
+        raise ValueError("Book V9.5 artifact identity has a different action/prompt profile")
+    training_hash = identity.get("training_data_hash")
+    if not isinstance(training_hash, str) or len(training_hash) != 64:
+        raise ValueError("Book V9.5 checkpoint is missing its training_data_hash")
 
 
 def validate_v4_norm_artifacts(
@@ -433,6 +471,7 @@ class ActionOnlyAblationPolicy:
             "prompt_profile": resolve_prompt_profile(config.get("prompt_profile")),
             "data_profile": str(config.get("data_profile", "legacy")),
             "experiment_kind": config.get("experiment_kind"),
+            "experiment_version": config.get("experiment_version"),
             "norm_stats_sha256": (
                 checkpoint_artifact_identity(config).get("norm_stats_sha256")
                 or checkpoint_artifact_identity(config).get("v4_norm_stats_sha256")
@@ -591,6 +630,12 @@ def main() -> None:
             "Action server checkpoint run mismatch: "
             f"expected={args.expected_run_name!r}, config={config.get('run_name')!r}"
         )
+    if args.expected_experiment_version is not None and config.get("experiment_version") != args.expected_experiment_version:
+        raise ValueError(
+            "Action server checkpoint version mismatch: "
+            f"expected={args.expected_experiment_version!r}, config={config.get('experiment_version')!r}"
+        )
+    validate_book_v95_config(args, config)
     validate_v4_norm_artifacts(args, config)
     model_config = _model_config(args, config)
     if args.validate_only:
