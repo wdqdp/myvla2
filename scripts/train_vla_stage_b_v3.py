@@ -1498,7 +1498,11 @@ def main() -> None:
     )
     tokenizer = openpi_tokenizer.PaligemmaTokenizer(args.reasoning_max_token_len)
     index, records = ensure_v3_index(args)
-    include_fz_bias = args.data_profile == ROTATION_V4 and bool(index.get("fz_bias_directions"))
+    # Independent multitask profiles can explicitly opt into the extended
+    # grammar. Legacy profiles retain their original behavior by default.
+    include_fz_bias = (
+        args.data_profile == ROTATION_V4 and bool(index.get("fz_bias_directions"))
+    ) or bool(EXTRA_CONFIG.get("include_fz_bias_failure_grammar", False))
     failure_codec = failure_grammar(
         lambda text: tokenizer.encode_text(text, add_eos=True),
         include_fz_bias=include_fz_bias,

@@ -1,3 +1,5 @@
 {
-    "ROS2.distro": "noetic"
+    "ROS2.distro": "noetic",
+    "python.terminal.activateEnvironment": false,
+    "python-envs.terminal.autoActivationType": "off"
 }
