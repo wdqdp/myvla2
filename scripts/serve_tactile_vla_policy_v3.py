@@ -218,10 +218,11 @@ class TactileVLAPolicyV3:
             return self._tokenizer.encode_text(text, add_eos=True)
         configured_failure = config.get("failure_grammar")
         configured_plan = config.get("recovery_grammar")
+        include_fz_bias = bool(config.get("include_fz_bias_failure_grammar", False))
         self._failure_grammar = (
             ConstrainedTokenGrammar(configured_failure, encode=encode)
             if configured_failure is not None
-            else failure_grammar(encode)
+            else failure_grammar(encode, include_fz_bias=include_fz_bias)
         )
         self._plan_grammar = (
             ConstrainedTokenGrammar(configured_plan, encode=encode)
@@ -232,7 +233,7 @@ class TactileVLAPolicyV3:
         if grammar_profile != "v3_full_v1":
             raise ValueError(f"Unsupported checkpoint grammar_profile={grammar_profile!r}")
         if (
-            self._failure_grammar.texts != legal_failure_reasons()
+            self._failure_grammar.texts != legal_failure_reasons(include_fz_bias=include_fz_bias)
             or self._plan_grammar.texts != legal_recovery_plans()
         ):
             raise ValueError("Checkpoint does not retain the complete V3 grammar")
