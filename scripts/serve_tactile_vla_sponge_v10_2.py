@@ -40,6 +40,7 @@ from tactile_vla.vla.sponge_v10_2_runtime import (
     deployment_policy_fields,
     deployment_version,
     resolve_thresholds,
+    validate_server_metadata,
     validate_training_config,
 )
 from tactile_vla.vla.prompts import build_phase_prompt as action_prompt
@@ -129,7 +130,9 @@ def inspect_artifacts(args):
         raise ValueError("Sponge V10.2 full_params export digest is missing")
     args.checkpoint = full_params
     return config, {
+        "checkpoint": str(full_params),
         "checkpoint_step": step,
+        "norm_stats_dir": str(args.norm_stats_dir.expanduser().resolve()),
         "full_params_sha256": full_sha,
         "norm_stats_sha256": norm_sha,
         "training_data_hash": config["artifact_identity"][f"{version}_training_data_hash"],
@@ -201,6 +204,9 @@ class SpongeV102Policy(base.V77Policy):
                 "worker_policy": "single_model_worker_stream_events_before_continuation",
             }
         )
+        # Check the same contract used by both robot connections before warm-up
+        # or accepting requests, including the no-touch input policy.
+        validate_server_metadata(self._metadata)
 
     def infer_events(self, request):
         prompt = str(request.get("prompt", ""))
@@ -362,6 +368,12 @@ def main():
     args = parse_args()
     config, identity = inspect_artifacts(args)
     deployment = resolve_deployment(args, identity)
+    logging.info(
+        "Sponge V10.2 checkpoint=%s step=%s norm_stats_dir=%s; captioner/tactile inputs disabled",
+        identity["checkpoint"],
+        identity["checkpoint_step"],
+        identity["norm_stats_dir"],
+    )
     logging.info(
         "Sponge V10.2 runtime thresholds: need_recovery=%s adjustment_end=%s source=%s",
         args.need_recovery_threshold,
