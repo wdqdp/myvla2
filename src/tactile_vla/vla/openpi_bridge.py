@@ -32,13 +32,14 @@ from tactile_vla.vla.v4_data import V4_REASONING_SCHEMA
 from tactile_vla.vla.v4_data import memory_plan_matches_prefix
 from tactile_vla.vla.v4_data import validate_grasp_memory
 from tactile_vla.vla.v4_data import validate_real_fz_bias_memory
+from tactile_vla.vla.v4_data import validate_real_fy_change_memory
 
 
 StageName = Literal["execution", "status", "reasoning"]
 V3StageBTask = Literal["need_recovery", "failure_reason"]
 V4StageBTask = Literal["need", "failure", "plan"]
 _V4_FAILURE_RE = re.compile(
-    r"^failure_reason=rotate (none|right|left|front|back),grasp (appropriate|missing|too_high|too_low)(?:,fz_bias (left|right|none))?\.$"
+    r"^failure_reason=rotate (none|right|left|front|back),grasp (appropriate|missing|too_high|too_low)(?:,fz_bias (left|right|none)(?:,fy_change (raise|drop|none))?)?\.$"
 )
 _V4_PLAN_RE = re.compile(
     r"^recovery_plan=move horizontally (none|right|left|front|back) "
@@ -739,16 +740,16 @@ class V4DirectManifestDataset(torch.utils.data.Dataset):
                     raise ValueError(f"V4 {task} row {row_index} has inconsistent window identity")
                 if task == "failure":
                     target = str(row.get("target_failure_reason", ""))
-                    if target not in legal_failure_reasons(include_fz_bias=True):
+                    if target not in legal_failure_reasons(include_fz_bias=True, include_fy_change=",fy_change " in target):
                         raise ValueError(f"V4 failure row {row_index} target is outside full V3 grammar")
                     if target != str(observation.get("failure_reason", "")):
                         raise ValueError(f"V4 failure row {row_index} target differs from real observation")
                 else:
                     target = str(row.get("target_recovery_plan", ""))
-                    if target not in legal_recovery_plans():
+                    if target not in legal_recovery_plans(include_rotate=", rotate " in target):
                         raise ValueError(f"V4 plan row {row_index} target is outside full V3 grammar")
-                    target_match = _V4_PLAN_RE.fullmatch(target)
-                    if validate_real_fz_bias_memory(row):
+                    target_match = _V4_PLAN_RE.fullmatch(target.split(", rotate ")[0].rstrip(".") + ".")
+                    if validate_real_fy_change_memory(row) or validate_real_fz_bias_memory(row):
                         pass
                     else:
                         grasp_recovery = validate_grasp_memory(row)
@@ -921,6 +922,8 @@ class V4DirectManifestDataset(torch.utils.data.Dataset):
                     or _text(item.get("fz_bias_direction", "none")) != failure_match.group(3)
                     or _text(item["failure_reason"]) != str(row["current_observation"]["failure_reason"])):
                 raise ValueError("Force bias manifest differs from the LeRobot failure label")
+            if failure_match.group(4) is not None and _text(item.get("fy_change", "none")) != failure_match.group(4):
+                raise ValueError("Fy manifest differs from the LeRobot failure label")
         if self.task == "failure":
             target = str(row["target_failure_reason"])
             stored_target = _text(item["failure_reason"])

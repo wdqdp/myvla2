@@ -15,10 +15,14 @@ MAGNITUDES = ("slightly", "moderately", "significantly")
 VERTICAL_DIRECTIONS = ("up", "down", "none")
 
 
-def failure_reason_text(rotation: str, grasp: str, fz_bias_direction: str = "none") -> str:
+def failure_reason_text(rotation: str, grasp: str, fz_bias_direction: str = "none", fy_change: str | None = None) -> str:
     if fz_bias_direction not in {"none", "left", "right"}:
         raise ValueError(f"Invalid fz_bias_direction: {fz_bias_direction}")
     suffix = f",fz_bias {fz_bias_direction}" if fz_bias_direction != "none" else ""
+    if fy_change is not None:
+        if fy_change not in {"none", "raise", "drop"}:
+            raise ValueError(f"Invalid fy_change: {fy_change}")
+        suffix = f",fz_bias {fz_bias_direction},fy_change {fy_change}"
     return f"failure_reason=rotate {rotation},grasp {grasp}{suffix}."
 
 
@@ -27,15 +31,18 @@ def recovery_plan_text(
     horizontal_magnitude: str,
     vertical_direction: str,
     vertical_magnitude: str,
+    rotate_direction: str | None = None,
+    rotate_magnitude: str = "moderately",
 ) -> str:
+    suffix = "" if rotate_direction is None else f", rotate {rotate_direction} {rotate_magnitude}"
     return (
         "recovery_plan=move horizontally "
         f"{horizontal_direction} {horizontal_magnitude}, move vertically "
-        f"{vertical_direction} {vertical_magnitude}."
+        f"{vertical_direction} {vertical_magnitude}{suffix}."
     )
 
 
-def legal_failure_reasons(*, include_fz_bias: bool = False) -> tuple[str, ...]:
+def legal_failure_reasons(*, include_fz_bias: bool = False, include_fy_change: bool = False) -> tuple[str, ...]:
     legacy = tuple(
         failure_reason_text(rotation, grasp)
         for rotation in ROTATION_DIRECTIONS
@@ -43,17 +50,22 @@ def legal_failure_reasons(*, include_fz_bias: bool = False) -> tuple[str, ...]:
         if not (rotation == "none" and grasp == "appropriate")
     )
 
-    if not include_fz_bias:
-        return legacy
-    return legacy + tuple(
+    bias_values = tuple(
         failure_reason_text(rotation, grasp, bias)
         for bias in ("left", "right")
         for rotation in ROTATION_DIRECTIONS
         for grasp in GRASP_POSITIONS
     )
+    values = legacy + (bias_values if include_fz_bias else ())
+    if include_fy_change:
+        values += tuple(failure_reason_text(rotation, grasp, bias, fy)
+            for rotation in ROTATION_DIRECTIONS for grasp in GRASP_POSITIONS
+            for bias in ("none", "left", "right") for fy in ("none", "raise", "drop")
+            if (rotation, grasp, bias, fy) != ("none", "appropriate", "none", "none"))
+    return values
 
 
-def legal_recovery_plans() -> tuple[str, ...]:
+def legal_recovery_plans(*, include_rotate: bool = False) -> tuple[str, ...]:
     values: list[str] = []
     for horizontal_direction in HORIZONTAL_DIRECTIONS:
         horizontal_magnitudes = (
@@ -73,6 +85,10 @@ def legal_recovery_plans() -> tuple[str, ...]:
                             vertical_magnitude,
                         )
                     )
+    if include_rotate:
+        values += [text[:-1] + f", rotate {direction} {magnitude}."
+            for text in tuple(values) for direction in ("none", "clockwise", "counterclockwise")
+            for magnitude in (("moderately",) if direction == "none" else MAGNITUDES)]
     return tuple(values)
 
 
@@ -175,10 +191,10 @@ class ConstrainedTokenGrammar:
 
 
 def failure_grammar(
-    encode: Callable[[str], Sequence[int]], *, include_fz_bias: bool = False,
+    encode: Callable[[str], Sequence[int]], *, include_fz_bias: bool = False, include_fy_change: bool = False,
 ) -> ConstrainedTokenGrammar:
-    return ConstrainedTokenGrammar(legal_failure_reasons(include_fz_bias=include_fz_bias), encode=encode)
+    return ConstrainedTokenGrammar(legal_failure_reasons(include_fz_bias=include_fz_bias, include_fy_change=include_fy_change), encode=encode)
 
 
-def recovery_grammar(encode: Callable[[str], Sequence[int]]) -> ConstrainedTokenGrammar:
-    return ConstrainedTokenGrammar(legal_recovery_plans(), encode=encode)
+def recovery_grammar(encode: Callable[[str], Sequence[int]], *, include_rotate: bool = False) -> ConstrainedTokenGrammar:
+    return ConstrainedTokenGrammar(legal_recovery_plans(include_rotate=include_rotate), encode=encode)

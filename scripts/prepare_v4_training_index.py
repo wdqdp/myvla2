@@ -231,6 +231,16 @@ def build_index(
                               if row.get("fz_bias_direction", "none") != "none"})
     if bias_directions:
         payload["fz_bias_directions"] = bias_directions
+    fy_changes = sorted({str(row.get("fy_change", "none")) for row in profile["attempts"]
+                         if row.get("fy_change", "none") != "none"})
+    if fy_changes:
+        payload["fy_changes"] = fy_changes
+        payload["include_fy_change_failure_grammar"] = True
+    rotate_directions = sorted({str(row.get("rotate_direction", "none")) for row in profile["attempts"]
+                               if row.get("rotate_direction", "none") != "none"})
+    if rotate_directions:
+        payload["rotate_directions"] = rotate_directions
+        payload["include_rotate_recovery_grammar"] = True
     return payload, need_rows, summary
 
 

@@ -1503,14 +1503,17 @@ def main() -> None:
     include_fz_bias = (
         args.data_profile == ROTATION_V4 and bool(index.get("fz_bias_directions"))
     ) or bool(EXTRA_CONFIG.get("include_fz_bias_failure_grammar", False))
+    include_fy_change = bool(index.get("include_fy_change_failure_grammar", False)) or bool(EXTRA_CONFIG.get("include_fy_change_failure_grammar", False))
+    include_rotate = bool(index.get("include_rotate_recovery_grammar", False)) or bool(EXTRA_CONFIG.get("include_rotate_recovery_grammar", False))
     failure_codec = failure_grammar(
         lambda text: tokenizer.encode_text(text, add_eos=True),
         include_fz_bias=include_fz_bias,
+        include_fy_change=include_fy_change,
     )
     plan_codec = recovery_grammar(
-        lambda text: tokenizer.encode_text(text, add_eos=True)
+        lambda text: tokenizer.encode_text(text, add_eos=True), include_rotate=include_rotate,
     )
-    if failure_codec.texts != legal_failure_reasons(include_fz_bias=include_fz_bias) or plan_codec.texts != legal_recovery_plans():
+    if failure_codec.texts != legal_failure_reasons(include_fz_bias=include_fz_bias, include_fy_change=include_fy_change) or plan_codec.texts != legal_recovery_plans(include_rotate=include_rotate):
         raise AssertionError("V3 full grammar was unexpectedly narrowed")
     identity = artifact_identity(
         index,
