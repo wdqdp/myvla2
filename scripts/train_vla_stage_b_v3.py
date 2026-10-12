@@ -222,6 +222,7 @@ TASK_CYCLE = ("action", "need", "failure", "plan")
 CHECKPOINT_EXPORT_HOOK = None
 ACTION_EVALUATION_HOOK = None
 EXTRA_CONFIG: dict[str, Any] = {}
+TEXT_GRAMMAR_FACTORY = None  # Optional version-specific complete text schema.
 
 
 def validate_v4_training_protocol(args: argparse.Namespace) -> None:
@@ -1505,16 +1506,19 @@ def main() -> None:
     ) or bool(EXTRA_CONFIG.get("include_fz_bias_failure_grammar", False))
     include_fy_change = bool(index.get("include_fy_change_failure_grammar", False)) or bool(EXTRA_CONFIG.get("include_fy_change_failure_grammar", False))
     include_rotate = bool(index.get("include_rotate_recovery_grammar", False)) or bool(EXTRA_CONFIG.get("include_rotate_recovery_grammar", False))
-    failure_codec = failure_grammar(
-        lambda text: tokenizer.encode_text(text, add_eos=True),
-        include_fz_bias=include_fz_bias,
-        include_fy_change=include_fy_change,
-    )
-    plan_codec = recovery_grammar(
-        lambda text: tokenizer.encode_text(text, add_eos=True), include_rotate=include_rotate,
-    )
-    if failure_codec.texts != legal_failure_reasons(include_fz_bias=include_fz_bias, include_fy_change=include_fy_change) or plan_codec.texts != legal_recovery_plans(include_rotate=include_rotate):
-        raise AssertionError("V3 full grammar was unexpectedly narrowed")
+    if TEXT_GRAMMAR_FACTORY is not None:
+        failure_codec, plan_codec = TEXT_GRAMMAR_FACTORY(tokenizer, args=args, index=index)
+    else:
+        failure_codec = failure_grammar(
+            lambda text: tokenizer.encode_text(text, add_eos=True),
+            include_fz_bias=include_fz_bias,
+            include_fy_change=include_fy_change,
+        )
+        plan_codec = recovery_grammar(
+            lambda text: tokenizer.encode_text(text, add_eos=True), include_rotate=include_rotate,
+        )
+        if failure_codec.texts != legal_failure_reasons(include_fz_bias=include_fz_bias, include_fy_change=include_fy_change) or plan_codec.texts != legal_recovery_plans(include_rotate=include_rotate):
+            raise AssertionError("V3 full grammar was unexpectedly narrowed")
     identity = artifact_identity(
         index,
         index_path=args.index_file,

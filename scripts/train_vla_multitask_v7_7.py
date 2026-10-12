@@ -190,6 +190,7 @@ def export_checkpoint(run_dir, state, step, filter_):
 
 
 def configure():
+    base.TEXT_GRAMMAR_FACTORY = None
     base.TASK_CYCLE = TASK_CYCLE
     base.CHECKPOINT_EXPORT_HOOK = export_checkpoint
     base.ACTION_EVALUATION_HOOK = None
