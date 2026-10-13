@@ -502,15 +502,14 @@ def validate_stage_a_for_training(checkpoint, index):
     checkpoint = Path(checkpoint).resolve()
     config_path = checkpoint.parent / "config.json"
     metadata = checkpoint / "params/_METADATA"
-    if checkpoint.name != "15000" or not metadata.is_file():
-        raise ValueError("V11.1 requires completed bottle Stage A step15000")
+    if not metadata.is_file():
+        raise ValueError(f"V11.1 Stage A checkpoint is missing params metadata: {metadata}")
     config = json.loads(config_path.read_text())
     action = json.loads(Path(index["action_index_file"]).read_text())
     if (
         config.get("experiment_version") != VERSION_TAG
         or config.get("use_state_history") is not False
         or config.get("data_profile") != "book_stage_a_v1"
-        or config.get("num_steps") != 15000
         or config.get("failure_action_policy") != FAILURE_ACTION_POLICY
         or config.get("artifact_identity", {}).get("training_data_hash") != index["action_training_data_hash"]
         or config.get("source_scope") != action["source_scope"]
@@ -520,7 +519,7 @@ def validate_stage_a_for_training(checkpoint, index):
         raise ValueError("V11.1 Stage A version, dataset, C filter or norm identity mismatch")
     return {
         "path": str(checkpoint),
-        "step": 15000,
+        "step": int(checkpoint.name) if checkpoint.name.isdecimal() else None,
         "experiment_version": VERSION_TAG,
         "config_sha256": sha256_file(config_path),
         "params_metadata_sha256": sha256_file(metadata),

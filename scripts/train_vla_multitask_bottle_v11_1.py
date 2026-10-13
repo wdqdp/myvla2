@@ -88,7 +88,7 @@ def parse_args(argv=None):
         "--keep-period": 1000,
         "--eval-max-need-samples": 2147483647,
         "--eval-max-text-samples": 2147483647,
-        "--fsdp-devices": 2,
+        "--fsdp-devices": 1,
     }
     for flag, value in defaults.items():
         if flag not in normalized:

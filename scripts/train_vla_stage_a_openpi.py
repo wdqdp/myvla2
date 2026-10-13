@@ -310,7 +310,7 @@ BOOK_STAGE_A_PROTOCOL = {
     **V7_4_STAGE_A_PROTOCOL,
     "batch_size": 8,
     "num_steps": 15_000,
-    "fsdp_devices": 2,
+    # "fsdp_devices": 2,
 }
 
 
