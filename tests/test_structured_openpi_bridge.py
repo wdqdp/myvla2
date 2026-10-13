@@ -77,6 +77,7 @@ def test_execution_dataset_does_not_parse_v3_structured_failure_reason() -> None
     dataset.reasoning_source_indices = None
     dataset.stage = "execution"
     dataset.state_history_len = 0
+    dataset.action_horizon = 30
     dataset._dataset = [
         {
             "observation.images.front": np.zeros((3, 8, 8), dtype=np.float32),
@@ -111,6 +112,7 @@ def test_execution_dataset_returns_masked_state_history_for_action_training() ->
     dataset.reasoning_source_indices = None
     dataset.stage = "execution"
     dataset.state_history_len = 3
+    dataset.action_horizon = 30
     history = np.arange(21, dtype=np.float32).reshape(3, 7)
     dataset._dataset = [
         {

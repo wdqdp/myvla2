@@ -232,9 +232,27 @@ class TactileVLAPolicyV3:
         grammar_profile = str(config.get("grammar_profile", "v3_full_v1"))
         if grammar_profile != "v3_full_v1":
             raise ValueError(f"Unsupported checkpoint grammar_profile={grammar_profile!r}")
+        expected_failure = legal_failure_reasons(include_fz_bias=include_fz_bias)
+        expected_plan = legal_recovery_plans()
+        if config.get("experiment_version") == "bottle_v11_1":
+            from tactile_vla.vla.bottle_v11_1_grammar import (
+                TEXT_SCHEMA_POLICY,
+                bottle_failure_reasons,
+                bottle_recovery_plans,
+            )
+
+            if (
+                config.get("data_profile") != "bottle_v11_1_five_task_h100"
+                or config.get("text_schema_policy") != TEXT_SCHEMA_POLICY
+                or config.get("include_fy_change_failure_grammar") is not True
+                or config.get("include_rotate_recovery_grammar") is not True
+            ):
+                raise ValueError("Bottle V11.1 requires its versioned four-field/three-axis text schema")
+            expected_failure = bottle_failure_reasons()
+            expected_plan = bottle_recovery_plans()
         if (
-            self._failure_grammar.texts != legal_failure_reasons(include_fz_bias=include_fz_bias)
-            or self._plan_grammar.texts != legal_recovery_plans()
+            self._failure_grammar.texts != expected_failure
+            or self._plan_grammar.texts != expected_plan
         ):
             raise ValueError("Checkpoint does not retain the complete V3 grammar")
         self._prompt_profile = load_checkpoint_prompt_profile(config)

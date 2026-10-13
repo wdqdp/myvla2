@@ -169,8 +169,17 @@ def make_memory(length, *, split, global_index, failure_reason=FAILURE_TARGET, r
     ]
 
 
-def build_artifacts(*, dataset_dir, v4_dir, action_index_file, incremental_state_dir):
+def build_artifacts(
+    *, dataset_dir, v4_dir, action_index_file, incremental_state_dir,
+    action_validator=validate_action_index, version_tag=VERSION_TAG,
+    data_profile=DATA_PROFILE, index_schema=INDEX_SCHEMA, manifest_schema=MANIFEST_SCHEMA,
+    history_policy=HISTORY_POLICY, adjustment_history_sampler=None,
+):
     """Data-only construction; no Stage A checkpoint or GPU/model required."""
+    # Explicit extension points keep V11.1 defaults unchanged for newer versions.
+    VERSION_TAG, DATA_PROFILE = version_tag, data_profile
+    INDEX_SCHEMA, MANIFEST_SCHEMA = index_schema, manifest_schema
+    HISTORY_POLICY = history_policy
     from scripts.build_v7_7_multitask_data import _phase_fields, _timeline
 
     dataset_dir, v4_dir, action_index_file, incremental_state_dir = map(
@@ -185,7 +194,7 @@ def build_artifacts(*, dataset_dir, v4_dir, action_index_file, incremental_state
     if captioner["checkpoint_sha256"] != CAPTIONER_SHA256:
         raise ValueError("V11.1 data was not processed with the pinned mixed_2 captioner")
     action = json.loads(action_index_file.read_text())
-    validate_action_index(action, index_path=action_index_file, dataset_dir=dataset_dir)
+    action_validator(action, index_path=action_index_file, dataset_dir=dataset_dir)
     if action["v4_training_data_hash"] != v4["training_data_hash"]:
         raise ValueError("V11.1 action and multitask data refer to different V4 snapshots")
     norm_path = v4_dir / "norm_stats/norm_stats.json"
@@ -214,9 +223,10 @@ def build_artifacts(*, dataset_dir, v4_dir, action_index_file, incremental_state
             "source": source,
         }
 
-    def phase_fields(f):
+    def phase_fields(f, *, adjustment_history=False):
         timeline, p = positions[f.global_index]
-        points, length = sample_episode_history(timeline, p)
+        sampler = adjustment_history_sampler if adjustment_history else None
+        points, length = (sampler or sample_episode_history)(timeline, p)
         return _phase_fields(f, qpos_points=points, effective_length=length, stats=stats)
 
     adjustment, need, failure, plan = [], [], [], []
@@ -243,7 +253,7 @@ def build_artifacts(*, dataset_dir, v4_dir, action_index_file, incremental_state
                             "adjustment_end": f.frame_index >= r - 10,
                             "selected": split != "train" or f.frame_index in selected,
                         }
-                        | phase_fields(f)
+                        | phase_fields(f, adjustment_history=True)
                     )
             label, source = need_role(f, m)
             if label is None:
