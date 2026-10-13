@@ -33,6 +33,11 @@ from openpi_client import websocket_client_policy
 from tactile_vla.vla.artifacts import sha256_file
 from tactile_vla.vla.book_stage_a_data import DATA_PROFILE as BOOK_STAGE_A_V1
 from tactile_vla.vla.book_stage_a_data import EXPERIMENT_KIND as BOOK_STAGE_A_EXPERIMENT_KIND
+from tactile_vla.vla.bottle_v11_1_grammar import bottle_failure_reasons
+from tactile_vla.vla.bottle_v11_1_grammar import bottle_recovery_plans
+from tactile_vla.vla.bottle_v11_1_stage_a_data import INSTRUCTION as BOTTLE_INSTRUCTION
+from tactile_vla.vla.bottle_v11_1_stage_a_data import RUN_NAME as BOTTLE_STAGE_A_RUN_NAME
+from tactile_vla.vla.bottle_v11_1_stage_a_data import VERSION_TAG as BOTTLE_VERSION
 from tactile_vla.vla.prompts import MINIMAL_PROMPT_PROFILE
 from tactile_vla.vla.prompts import PHASE_PROMPT_PROFILE
 from tactile_vla.vla.prompts import PHASE_PROMPT_PROFILE_V2
@@ -274,6 +279,17 @@ def validate_server_metadata(args: argparse.Namespace, metadata: dict[str, Any])
             "Client/server training run mismatch: "
             f"expected={expected_run_name!r}, server={metadata.get('config', {}).get('run_name')!r}"
         )
+    expected_version = getattr(args, "expected_experiment_version", None)
+    if expected_version is not None and metadata.get("experiment_version") != expected_version:
+        raise ValueError(f"Client/server experiment version mismatch: expected={expected_version!r}")
+    expected_step = getattr(args, "expected_checkpoint_step", None)
+    if expected_step is not None and metadata.get("checkpoint_step") != expected_step:
+        raise ValueError(f"Client/server checkpoint step mismatch: expected={expected_step}")
+    if metadata.get("experiment_version") == BOTTLE_VERSION:
+        if expected_version != BOTTLE_VERSION:
+            raise ValueError("Bottle Stage A requires --expected-experiment-version bottle_v11_1")
+        if metadata.get("instruction") != args.instruction or args.instruction != BOTTLE_INSTRUCTION:
+            raise ValueError("Bottle Stage A client/server instruction must be 'Open the bottle'")
     norm_stats_file = getattr(args, "norm_stats_file", None)
     if norm_stats_file is not None and metadata.get("norm_stats_sha256") != sha256_file(norm_stats_file):
         raise ValueError("Client/server norm stats SHA256 differs; use the checkpoint's training snapshot")
@@ -1102,6 +1118,8 @@ def get_arguments() -> tuple[argparse.Namespace, argparse.ArgumentParser]:
         help="Refuse to run if server metadata does not advertise this exact data profile.",
     )
     parser.add_argument("--expected-run-name", help="Require this exact training run in server metadata.")
+    parser.add_argument("--expected-experiment-version", help="Require this exact experiment version; bottle_v11_1 selects bottle prompts.")
+    parser.add_argument("--expected-checkpoint-step", type=int, help="Require this exact numeric checkpoint step in server metadata.")
     parser.add_argument(
         "--norm-stats-file", type=Path,
         help="Optional training snapshot norm_stats.json; verify its SHA256 against the server before actions.",
@@ -1207,7 +1225,31 @@ def validate_args(args: argparse.Namespace, parser: argparse.ArgumentParser) -> 
     norm_stats_file = getattr(args, "norm_stats_file", None)
     if norm_stats_file is not None and not norm_stats_file.is_file():
         parser.error("--norm-stats-file must point to an existing norm_stats.json")
-    if getattr(args, "expected_data_profile", None) == BOOK_STAGE_A_V1:
+    bottle = (
+        getattr(args, "expected_experiment_version", None) == BOTTLE_VERSION
+        or getattr(args, "expected_run_name", None) == BOTTLE_STAGE_A_RUN_NAME
+    )
+    if bottle:
+        if args.expected_experiment_version not in {None, BOTTLE_VERSION}:
+            parser.error("Bottle Stage A requires experiment version bottle_v11_1")
+        if args.expected_data_profile not in {None, BOOK_STAGE_A_V1}:
+            parser.error("Bottle Stage A uses the shared book_stage_a_v1 action profile")
+        if args.expected_run_name not in {None, BOTTLE_STAGE_A_RUN_NAME}:
+            parser.error("Bottle Stage A requires its bottle training run")
+        if args.instruction not in {DEFAULT_INSTRUCTION, BOTTLE_INSTRUCTION}:
+            parser.error("Bottle Stage A requires --instruction 'Open the bottle'")
+        if args.rotation_direction is not None:
+            parser.error("Bottle rotation recovery uses --forced-recovery-plan with the rotate field")
+        args.expected_experiment_version = BOTTLE_VERSION
+        args.expected_data_profile = BOOK_STAGE_A_V1
+        args.expected_run_name = BOTTLE_STAGE_A_RUN_NAME
+        args.instruction = BOTTLE_INSTRUCTION
+        args.forced_failure_reason = args.forced_failure_reason or failure_reason_text("none", "appropriate", "none", "raise")
+        args.forced_recovery_plan = args.forced_recovery_plan or recovery_plan_text(
+            "none", "moderately", "none", "moderately", "clockwise", "moderately"
+        )
+        args.no_captioner = True
+    elif getattr(args, "expected_data_profile", None) == BOOK_STAGE_A_V1:
         if args.instruction not in {DEFAULT_INSTRUCTION, BOOK_INSTRUCTION}:
             parser.error(f"Book Stage A requires --instruction={BOOK_INSTRUCTION!r}")
         book_direction = args.rotation_direction or "right"
@@ -1247,14 +1289,19 @@ def validate_args(args: argparse.Namespace, parser: argparse.ArgumentParser) -> 
             "and --forced-recovery-plan"
         )
 
-    if args.forced_failure_reason not in legal_failure_reasons():
-        parser.error("--forced-failure-reason is outside the fixed V3 failure grammar")
-    if args.forced_recovery_plan not in legal_recovery_plans():
-        parser.error("--forced-recovery-plan is outside the fixed V3 recovery grammar")
+    failure_grammar = bottle_failure_reasons() if bottle else legal_failure_reasons()
+    plan_grammar = bottle_recovery_plans() if bottle else legal_recovery_plans()
+    grammar_name = "bottle V11.1" if bottle else "fixed V3"
+    if args.forced_failure_reason not in failure_grammar:
+        parser.error(f"--forced-failure-reason is outside the {grammar_name} failure grammar")
+    if args.forced_recovery_plan not in plan_grammar:
+        parser.error(f"--forced-recovery-plan is outside the {grammar_name} recovery grammar")
     if args.max_publish_step <= 0:
         parser.error("--max_publish_step must be positive")
     if args.noise_seed < 0:
         parser.error("--noise-seed must be non-negative")
+    if args.expected_checkpoint_step is not None and args.expected_checkpoint_step <= 0:
+        parser.error("--expected-checkpoint-step must be positive")
     if not np.isfinite(args.gripper_offset) or args.gripper_offset < 0:
         parser.error("--gripper_offset must be finite and non-negative")
     if not np.isfinite(args.gripper_min) or not 0.0 <= args.gripper_min <= 0.08:

@@ -51,7 +51,13 @@ from tactile_vla.vla.book_stage_a_data import EXPERIMENT_KIND as BOOK_STAGE_A_EX
 from tactile_vla.vla.book_v9_5_stage_a_data import RUN_NAME as BOOK_V95_RUN_NAME
 from tactile_vla.vla.book_v9_5_stage_a_data import SCOPE_POLICY as BOOK_V95_SCOPE_POLICY
 from tactile_vla.vla.book_v9_5_stage_a_data import VERSION_TAG as BOOK_V95_VERSION
+from tactile_vla.vla.bottle_v11_1_stage_a_data import FAILURE_ACTION_POLICY as BOTTLE_FAILURE_ACTION_POLICY
+from tactile_vla.vla.bottle_v11_1_stage_a_data import INSTRUCTION as BOTTLE_INSTRUCTION
+from tactile_vla.vla.bottle_v11_1_stage_a_data import RUN_NAME as BOTTLE_STAGE_A_RUN_NAME
+from tactile_vla.vla.bottle_v11_1_stage_a_data import VERSION_TAG as BOTTLE_VERSION
+from tactile_vla.vla.structured_text import recovery_plan_text
 from tactile_vla.vla.prompts import build_execution_prompt
+from tactile_vla.vla.prompts import build_phase_prompt
 from tactile_vla.vla.prompts import MINIMAL_PROMPT_PROFILE
 from tactile_vla.vla.prompts import PHASE_PROMPT_PROFILE
 from tactile_vla.vla.prompts import PHASE_PROMPT_PROFILE_V2
@@ -121,6 +127,7 @@ _METADATA_CONFIG_KEYS = (
     "run_name",
     "experiment_version",
     "source_scope",
+    "failure_action_policy",
     "stage_a_protocol",
     "data_profile",
     "prompt_profile",
@@ -175,6 +182,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--expected-run-name", help="Require this exact training run in the checkpoint config.")
     parser.add_argument("--expected-experiment-version", help="Require this exact experiment version in the checkpoint config.")
+    parser.add_argument("--expected-checkpoint-step", type=int, help="Require this exact numeric Stage A checkpoint step.")
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--num-inference-steps", type=int, default=10)
@@ -185,6 +193,8 @@ def parse_args() -> argparse.Namespace:
     args = parser.parse_args()
     if args.num_inference_steps <= 0:
         parser.error("--num-inference-steps must be positive")
+    if args.expected_checkpoint_step is not None and args.expected_checkpoint_step <= 0:
+        parser.error("--expected-checkpoint-step must be positive")
     return args
 
 
@@ -235,6 +245,53 @@ def validate_book_v95_config(args: argparse.Namespace, config: dict[str, Any]) -
     training_hash = identity.get("training_data_hash")
     if not isinstance(training_hash, str) or len(training_hash) != 64:
         raise ValueError("Book V9.5 checkpoint is missing its training_data_hash")
+
+
+def validate_bottle_v111_config(args: argparse.Namespace, config: dict[str, Any]) -> None:
+    """Validate bottle Stage A independently of the reused book action profile."""
+    if config.get("experiment_version") != BOTTLE_VERSION and config.get("run_name") != BOTTLE_STAGE_A_RUN_NAME:
+        return
+    expected = {
+        "experiment_version": BOTTLE_VERSION,
+        "run_name": BOTTLE_STAGE_A_RUN_NAME,
+        "data_profile": BOOK_STAGE_A_V1,
+        "prompt_profile": PHASE_PROMPT_PROFILE_V2,
+        "experiment_kind": BOOK_STAGE_A_EXPERIMENT_KIND,
+        "stage_a_protocol": BOOK_STAGE_A_PROTOCOL_NAME,
+        "use_state_history": False,
+        "state_history_len": 0,
+        "history_hidden_dim": 0,
+        "action_horizon": 30,
+        "action_dim": 32,
+        "failure_action_policy": BOTTLE_FAILURE_ACTION_POLICY,
+    }
+    mismatches = {key: (config.get(key), value) for key, value in expected.items() if config.get(key) != value}
+    if args.checkpoint_kind != "stage-a" or mismatches:
+        raise ValueError(f"Bottle V11.1 requires its Stage A phase_v2 no-history checkpoint: {mismatches}")
+    scope = config.get("source_scope", {})
+    if (
+        not isinstance(scope, dict)
+        or scope.get("schema_version") != "bottle_v11_1_source_scope_v1"
+        or scope.get("selection") != "explicit_selected_dataset_and_hashed_V4_sources_no_recursive_archive_scan"
+        or scope.get("dataset_dir") != config.get("dataset_dir")
+        or not scope.get("v4_index_file")
+    ):
+        raise ValueError("Bottle V11.1 checkpoint has inconsistent source_scope")
+    identity = checkpoint_artifact_identity(config)
+    if identity.get("data_profile") != BOOK_STAGE_A_V1 or identity.get("prompt_profile") != PHASE_PROMPT_PROFILE_V2:
+        raise ValueError("Bottle V11.1 artifact identity has a different action/prompt profile")
+    if identity.get("target_policy", {}).get("failure_action_filter") != BOTTLE_FAILURE_ACTION_POLICY:
+        raise ValueError("Bottle V11.1 artifact identity differs from its C-before action policy")
+    digest = identity.get("training_data_hash", "")
+    if not isinstance(digest, str) or len(digest) != 64 or any(char not in "0123456789abcdef" for char in digest):
+        raise ValueError("Bottle V11.1 checkpoint is missing its action training_data_hash")
+
+
+def action_checkpoint_step(path: Path) -> int | None:
+    root = path.expanduser().resolve()
+    if root.name == "params":
+        root = root.parent
+    return int(root.name) if root.name.isdigit() else None
 
 
 def validate_v4_norm_artifacts(
@@ -467,6 +524,7 @@ class ActionOnlyAblationPolicy:
             "action_only_ablation": True,
             "checkpoint_kind": args.checkpoint_kind,
             "checkpoint": str(args.checkpoint.resolve()),
+            "checkpoint_step": action_checkpoint_step(args.checkpoint) if args.checkpoint_kind == "stage-a" else None,
             "stage_a_protocol": config.get("stage_a_protocol"),
             "prompt_profile": resolve_prompt_profile(config.get("prompt_profile")),
             "data_profile": str(config.get("data_profile", "legacy")),
@@ -494,6 +552,8 @@ class ActionOnlyAblationPolicy:
             # into every trial log, while none of those rows are inference inputs.
             "config": metadata_config_summary(config),
         }
+        if config.get("experiment_version") == BOTTLE_VERSION:
+            self._metadata["instruction"] = BOTTLE_INSTRUCTION
 
     @property
     def metadata(self) -> dict[str, Any]:
@@ -506,6 +566,8 @@ class ActionOnlyAblationPolicy:
         return Observation.from_dict(batched)
 
     def _prepare(self, request: dict[str, Any]) -> tuple[dict[str, Any], Observation, np.ndarray]:
+        if self._metadata.get("experiment_version") == BOTTLE_VERSION and BOTTLE_INSTRUCTION not in str(request.get("prompt", "")):
+            raise ValueError("Bottle Stage A action prompt requires 'Open the bottle'")
         inputs = dict(request)
         inputs.pop("mode", None)
         noise = validate_action_noise(
@@ -590,7 +652,7 @@ def warm_up(policy: ActionOnlyAblationPolicy) -> dict[str, Any]:
             "observation/state": state,
             **history_inputs,
             "prompt": build_execution_prompt(
-                instruction="dry run",
+                instruction=policy.metadata.get("instruction", "dry run"),
                 tactile_caption=(
                     "Touch[area=none; Fx=near_zero; Fy=near_zero; "
                     "Fz=near_zero; rotation=none]"
@@ -600,7 +662,7 @@ def warm_up(policy: ActionOnlyAblationPolicy) -> dict[str, Any]:
             "action_noise": np.zeros((ACTION_HORIZON, ACTION_DIM), dtype=np.float32),
         }
     )
-    return {
+    summary = {
         "checkpoint_kind": policy.metadata["checkpoint_kind"],
         "raw_model_actions_shape": list(np.asarray(response["raw_model_actions"]).shape),
         "actions_shape": list(np.asarray(response["actions"]).shape),
@@ -614,6 +676,22 @@ def warm_up(policy: ActionOnlyAblationPolicy) -> dict[str, Any]:
             else None
         ),
     }
+    if policy.metadata.get("experiment_version") == BOTTLE_VERSION:
+        plan = recovery_plan_text("none", "moderately", "none", "moderately", "clockwise", "moderately")
+        adjustment = policy.infer({
+            "mode": "execution",
+            "observation/image": image,
+            "observation/wrist_image": image,
+            "observation/state": state,
+            "prompt": build_phase_prompt(
+                phase="adjustment", instruction=BOTTLE_INSTRUCTION,
+                recovery_plan=plan, prompt_profile=PHASE_PROMPT_PROFILE_V2,
+            ),
+            "action_noise": np.zeros((ACTION_HORIZON, ACTION_DIM), dtype=np.float32),
+        })
+        summary["adjustment_actions_shape"] = list(np.asarray(adjustment["actions"]).shape)
+        summary["adjustment_recovery_plan"] = plan
+    return summary
 
 
 def main() -> None:
@@ -636,6 +714,11 @@ def main() -> None:
             f"expected={args.expected_experiment_version!r}, config={config.get('experiment_version')!r}"
         )
     validate_book_v95_config(args, config)
+    validate_bottle_v111_config(args, config)
+    if args.expected_checkpoint_step is not None and (
+        args.checkpoint_kind != "stage-a" or action_checkpoint_step(args.checkpoint) != args.expected_checkpoint_step
+    ):
+        raise ValueError("Action server checkpoint step differs from --expected-checkpoint-step")
     validate_v4_norm_artifacts(args, config)
     model_config = _model_config(args, config)
     if args.validate_only:
@@ -644,6 +727,7 @@ def main() -> None:
         print(json.dumps(metadata_config_summary(config) | {
             "checkpoint_kind": args.checkpoint_kind,
             "checkpoint": str(args.checkpoint.expanduser().resolve()),
+            "checkpoint_step": action_checkpoint_step(args.checkpoint) if args.checkpoint_kind == "stage-a" else None,
             "params_dir": str(params_dir), "config_path": str(config_path),
             "norm_stats_sha256": identity.get("norm_stats_sha256") or identity.get("v4_norm_stats_sha256"),
         }, indent=2, ensure_ascii=False))
