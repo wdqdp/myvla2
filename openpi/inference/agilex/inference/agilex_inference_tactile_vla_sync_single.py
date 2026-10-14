@@ -128,7 +128,7 @@ def apply_yaml_defaults(args: argparse.Namespace, parser: argparse.ArgumentParse
         "tactile_right_mesh_3d_flow_topic": flow_topics.get("right"),
     }
     for name, value in yaml_defaults.items():
-        if value and getattr(args, name) == parser.get_default(name):
+        if value and hasattr(args, name) and getattr(args, name) == parser.get_default(name):
             setattr(args, name, value)
 
 
@@ -244,7 +244,8 @@ class RosOperator:
             self.JointState,
             queue_size=10,
         )
-        self.tactile = RosTactileBuffer(make_tactile_topics(self.args), window_size=self.args.tactile_window_size)
+        if getattr(self.args, "tactile_topics_enabled", True):
+            self.tactile = RosTactileBuffer(make_tactile_topics(self.args), window_size=self.args.tactile_window_size)
 
     def rate(self, hz: int):
         return self.rospy.Rate(hz)

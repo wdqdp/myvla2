@@ -38,8 +38,11 @@ from tactile_vla.vla.bottle_v11_1_runtime import (
     MEMORY_POLICY,
     FAILURE_TARGET,
     PLAN_TARGET,
-    SERVER_NAME,
+    V112_VERSION,
+    V113_VERSION,
     deployment_policy_fields,
+    deployment_phase_profile,
+    deployment_runtime_history_policy,
     deployment_version,
     resolve_thresholds,
     validate_tactile_caption,
@@ -51,11 +54,13 @@ from tactile_vla.vla.prompts import build_phase_prompt as action_prompt
 from tactile_vla.vla.bottle_v11_1_grammar import bottle_failure_reasons, bottle_recovery_plans
 from tactile_vla.vla.v5_3_adjustment_end_checkpoint import parameter_tree_sha256
 from tactile_vla.vla.v7_7_phase_prompt import build_phase_prompt
+from tactile_vla.vla import bottle_v11_3_prompts as visual_prompts
 
 
-def parse_args(argv=None):
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    parser.add_argument("--checkpoint", type=Path, default=DEFAULT_CHECKPOINT)
+def parse_args(argv=None, *, default_checkpoint=DEFAULT_CHECKPOINT, description=__doc__, captioner_enabled=True):
+    parser = argparse.ArgumentParser(description=description, formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+    parser.add_argument("--checkpoint", type=Path, default=default_checkpoint)
+    parser.add_argument("--config", type=Path, help="Explicit training config.json if stored separately from weights")
     parser.add_argument("--norm-stats-dir", type=Path, default=DEFAULT_NORM_DIR)
     parser.add_argument("--thresholds-file", type=Path, help="Optional calibrated thresholds; omitted by default")
     parser.add_argument(
@@ -68,11 +73,14 @@ def parse_args(argv=None):
         type=float,
         help="Override adjustment_end threshold; defaults to 0.5 without a thresholds file",
     )
-    parser.add_argument(
-        "--captioner-checkpoint-sha256",
-        default=DEFAULT_CAPTIONER_SHA256,
-        help="Robot captioner SHA256; must match the training captioner identity",
-    )
+    if captioner_enabled:
+        parser.add_argument(
+            "--captioner-checkpoint-sha256",
+            default=DEFAULT_CAPTIONER_SHA256,
+            help="Robot captioner SHA256; must match the training captioner identity",
+        )
+    else:
+        parser.set_defaults(captioner_checkpoint_sha256=None)
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8001)
     parser.add_argument("--num-inference-steps", type=int, default=10)
@@ -89,7 +97,7 @@ def parse_args(argv=None):
     if args.num_inference_steps <= 0:
         parser.error("--num-inference-steps must be positive")
     sha = args.captioner_checkpoint_sha256
-    if len(sha) != 64 or any(char not in "0123456789abcdef" for char in sha):
+    if captioner_enabled and (len(sha) != 64 or any(char not in "0123456789abcdef" for char in sha)):
         parser.error("--captioner-checkpoint-sha256 must be a lowercase 64-character SHA256")
     return args
 
@@ -100,12 +108,14 @@ def inspect_artifacts(args):
     full_params = step_dir / "full_params"
     if not full_params.is_dir():
         raise FileNotFoundError(full_params)
-    config = base.v3._find_config(step_dir)
+    config = json.loads(args.config.expanduser().read_text()) if args.config else base.v3._find_config(step_dir)
     args.norm_stats_dir = args.norm_stats_dir.expanduser().resolve()
     norm_sha = sha256_file(args.norm_stats_dir / "norm_stats.json")
     validate_training_config(config, norm_sha)
     version = deployment_version(config["data_profile"])
-    if args.captioner_checkpoint_sha256 != config["captioner_identity"]["checkpoint_sha256"]:
+    if version == V113_VERSION and args.captioner_checkpoint_sha256 is not None:
+        raise ValueError("Bottle V11.3 has no runtime captioner; use the V11.3 server entry")
+    if version != V113_VERSION and args.captioner_checkpoint_sha256 != config["captioner_identity"]["checkpoint_sha256"]:
         raise ValueError("Bottle V11.1 runtime captioner SHA256 differs from training")
     export_path = step_dir / f"{version}_export.json"
     export = json.loads(export_path.read_text())
@@ -119,6 +129,10 @@ def inspect_artifacts(args):
         "training_data_hash",
         "training_target_coverage",
     )
+    if version in {V112_VERSION, V113_VERSION}:
+        identity_fields += ("action_target_policy", "idle_gap_audit_sha256")
+    if version == V113_VERSION:
+        identity_fields += ("source_multitask_training_data_hash", "source_multitask_index_sha256")
     checked_fields = (*policy_fields, *identity_fields)
     mismatches = {key: (export.get(key), config[key]) for key in checked_fields if export.get(key) != config[key]}
     for key in (
@@ -149,6 +163,7 @@ def inspect_artifacts(args):
         "export_metadata": str(export_path),
         "data_profile": config["data_profile"],
         "experiment_version": version,
+        **({"adjustment_history_runtime_policy": deployment_runtime_history_policy(version)} if version in {V112_VERSION, V113_VERSION} else {}),
         **{key: config[key] for key in policy_fields},
         **{key: config[key] for key in identity_fields},
     }
@@ -187,7 +202,10 @@ class BottleV111Policy(base.V77Policy):
         old_profile = base.DATA_PROFILE
         base.DATA_PROFILE = config["data_profile"]
         try:
-            super().__init__(args=args, config=config, model_config=model_config, norm_stats=norm_stats)
+            super().__init__(
+                args=args, config=config, model_config=model_config, norm_stats=norm_stats,
+                prompt_profile=deployment_phase_profile(identity["experiment_version"]),
+            )
         finally:
             base.DATA_PROFILE = old_profile
         actual_sha = parameter_tree_sha256(base.v3.nnx.state(self._model))
@@ -197,7 +215,7 @@ class BottleV111Policy(base.V77Policy):
             identity
             | deployment
             | {
-                "name": SERVER_NAME,
+                "name": f"tactile_vla_{identity['experiment_version']}",
                 "instruction": BOTTLE_INSTRUCTION,
                 "action_prompt_profile": "phase_v2",
                 "qpos_h100_sample_offsets": HISTORY_OFFSETS,
@@ -209,12 +227,16 @@ class BottleV111Policy(base.V77Policy):
                 "captioner_window_size": 30,
                 "captioner_checkpoint_sha256": args.captioner_checkpoint_sha256,
                 "captioner_identity": config["captioner_identity"],
-                "captioner_identity_scope": "training_and_runtime_client_server",
+                "captioner_identity_scope": config.get("captioner_identity_scope", "training_and_runtime_client_server"),
                 "requires_captioner": True,
                 "requires_tactile_topics": True,
                 "worker_policy": "single_model_worker_stream_events_before_continuation",
             }
         )
+        if identity["experiment_version"] in {V112_VERSION, V113_VERSION}:
+            self._metadata["adjustment_history_runtime_policy"] = deployment_runtime_history_policy(identity["experiment_version"])
+        if identity["experiment_version"] == V113_VERSION:
+            self._metadata.update(captioner_window_size=0, requires_captioner=False, requires_tactile_topics=False)
         validate_server_metadata(self._metadata)
 
     def infer_events(self, request):
@@ -224,13 +246,20 @@ class BottleV111Policy(base.V77Policy):
         if any(key in request for key in ("observation/state_history", "observation/state_history_mask")):
             raise ValueError("Bottle V11.1 must not receive continuous state_history arrays")
         mode = request.get("mode", "execution")
+        visual_only = self._metadata["experiment_version"] == V113_VERSION
+        if visual_only:
+            visual_prompts.validate_no_touch(prompt)
         if mode == "phase":
+            if self._metadata["experiment_version"] in {V112_VERSION, V113_VERSION}:
+                if request.get("phase") not in {"execution", "adjustment"} or request.get("history_clock") != "raw_30Hz_frames":
+                    raise ValueError("Bottle V11.2 phase request has the wrong history clock")
             if not prompt.startswith("Mode: phase\n") or "State history H100 sampled to 11 points: " not in prompt:
                 raise ValueError("Bottle V11.1 requires the V7.7 H100 phase prompt")
-            touch_lines = [line[7:] for line in prompt.splitlines() if line.startswith("Touch: ")]
-            if len(touch_lines) != 1:
-                raise ValueError("Bottle V11.1 phase prompt requires exactly one Touch line")
-            validate_tactile_caption(touch_lines[0])
+            if not visual_only:
+                touch_lines = [line[7:] for line in prompt.splitlines() if line.startswith("Touch: ")]
+                if len(touch_lines) != 1:
+                    raise ValueError("Bottle phase prompt requires exactly one Touch line")
+                validate_tactile_caption(touch_lines[0])
         elif mode == "reasoning":
             if not prompt.startswith("Mode: reasoning.") or "Failure-recovery memory: " not in prompt:
                 raise ValueError("Bottle V11.1 requires the minimal_v1 plan prompt")
@@ -246,13 +275,16 @@ class BottleV111Policy(base.V77Policy):
                     index > 0 and plan not in bottle_recovery_plans()
                 ):
                     raise ValueError("Bottle V11.1 plan memory must preserve the initial pair and executed plans")
-            captions = re.findall(r"Touch\[[^\]]*\]", prompt.split("Failure-recovery memory: ", 1)[0])
-            if len(captions) != 1:
-                raise ValueError("Bottle V11.1 plan requires exactly one current Touch caption")
-            validate_tactile_caption(captions[0])
+            if not visual_only:
+                captions = re.findall(r"Touch\[[^\]]*\]", prompt.split("Failure-recovery memory: ", 1)[0])
+                if len(captions) != 1:
+                    raise ValueError("Bottle plan requires exactly one current Touch caption")
+                validate_tactile_caption(captions[0])
         elif mode not in {"action", "execution"}:
             raise ValueError(f"Unsupported Bottle V11.1 inference mode: {mode}")
-        yield from super().infer_events(request)
+        inputs = dict(request)
+        inputs.pop("history_clock", None)
+        yield from super().infer_events(inputs)
 
 
 def load_policy(args, config, identity, deployment):
@@ -274,23 +306,28 @@ def warm_up(policy):
         "observation/wrist_image": image,
         "observation/state": np.zeros(7, dtype=np.float32),
     }
-    caption = neutral_caption()
-    phase_prompt = build_phase_prompt(
-        instruction=BOTTLE_INSTRUCTION,
-        tactile_caption=caption,
-        recovery_plan="",
-        qpos_h100_11_discrete=np.zeros((11, 7), dtype=np.int32),
+    visual_only = policy.metadata["experiment_version"] == V113_VERSION
+    caption = "" if visual_only else neutral_caption()
+    phase_args = {
+        "instruction": BOTTLE_INSTRUCTION, "recovery_plan": "",
+        "qpos_h100_11_discrete": np.zeros((11, 7), dtype=np.int32),
+    }
+    phase_prompt = (
+        visual_prompts.build_phase_prompt(**phase_args)
+        if visual_only else build_phase_prompt(**phase_args, tactile_caption=caption)
     )
     execution_prompt = action_prompt(
         phase="execution", instruction=BOTTLE_INSTRUCTION, recovery_plan="", prompt_profile="phase_v2"
     )
     # Force the conditional failure branch for warm-up only, without changing runtime metadata.
     threshold = policy._need_threshold
+    clocks = policy.metadata["experiment_version"] in {V112_VERSION, V113_VERSION}
     try:
         policy._need_threshold = 0.0
         execution = list(
             policy.infer_events(
                 common | {"mode": "phase", "phase": "execution", "request_id": "warmup-need", "prompt": phase_prompt}
+                | ({"history_clock": "raw_30Hz_frames"} if clocks else {})
             )
         )
     finally:
@@ -298,16 +335,18 @@ def warm_up(policy):
     adjustment = list(
         policy.infer_events(
             common | {"mode": "phase", "phase": "adjustment", "request_id": "warmup-adjustment", "prompt": phase_prompt}
+            | ({"history_clock": "raw_30Hz_frames"} if clocks else {})
         )
     )
     plan = []
     memory = [{"recovery_plan": "initial plan", "failure_reason": FAILURE_TARGET}]
     for length in range(1, 5):
-        plan_prompt = build_recovery_prompt(
-            instruction=BOTTLE_INSTRUCTION,
-            failed_tactile_caption=caption,
-            failure_recovery_memory=memory,
-            prompt_profile=MINIMAL_PROMPT_PROFILE,
+        plan_prompt = (
+            visual_prompts.build_recovery_prompt(instruction=BOTTLE_INSTRUCTION, failure_recovery_memory=memory)
+            if visual_only else build_recovery_prompt(
+                instruction=BOTTLE_INSTRUCTION, failed_tactile_caption=caption,
+                failure_recovery_memory=memory, prompt_profile=MINIMAL_PROMPT_PROFILE,
+            )
         )
         plan.append(
             {
@@ -383,13 +422,17 @@ class WorkerStreamingPolicyServer(base.StreamingPolicyServer):
             self._executor.shutdown(wait=True, cancel_futures=True)
 
 
-def main():
+def main(*, argv=None, expected_version=None, argument_parser=parse_args):
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s", force=True)
-    args = parse_args()
+    args = argument_parser(argv)
     config, identity = inspect_artifacts(args)
+    if expected_version is not None and identity["experiment_version"] != expected_version:
+        raise ValueError(f"Deployment entry requires experiment_version={expected_version}")
     deployment = resolve_deployment(args, identity)
+    label = identity["experiment_version"]
     logging.info(
-        "Bottle V11.1 checkpoint=%s step=%s norm_stats_dir=%s Stage_A_step=%s captioner_sha=%s",
+        "%s checkpoint=%s step=%s norm_stats_dir=%s Stage_A_step=%s captioner_sha=%s",
+        label,
         identity["checkpoint"],
         identity["checkpoint_step"],
         identity["norm_stats_dir"],
@@ -397,7 +440,8 @@ def main():
         args.captioner_checkpoint_sha256,
     )
     logging.info(
-        "Bottle V11.1 runtime thresholds: need_recovery=%s adjustment_end=%s source=%s",
+        "%s runtime thresholds: need_recovery=%s adjustment_end=%s source=%s",
+        label,
         args.need_recovery_threshold,
         args.adjustment_end_threshold,
         deployment["thresholds_status"],
@@ -406,12 +450,12 @@ def main():
         print(json.dumps(identity | deployment, indent=2, ensure_ascii=False))
         return
     policy = load_policy(args, config, identity, deployment)
-    logging.info("Starting Bottle V11.1 five-task warm-up")
-    logging.info("Bottle V11.1 five-task warm-up: %s", json.dumps(warm_up(policy), default=str, ensure_ascii=False))
+    logging.info("Starting %s five-task warm-up", label)
+    logging.info("%s five-task warm-up: %s", label, json.dumps(warm_up(policy), default=str, ensure_ascii=False))
     if args.dry_run:
         print(json.dumps(policy.metadata, indent=2, default=str, ensure_ascii=False))
         return
-    logging.info("Serving Bottle V11.1 at %s:%d", args.host, args.port)
+    logging.info("Serving %s at %s:%d", label, args.host, args.port)
     WorkerStreamingPolicyServer(policy, args.host, args.port).serve_forever()
 
 

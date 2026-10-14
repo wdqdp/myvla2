@@ -47,6 +47,7 @@ from openpi_client import msgpack_numpy
 from tactile_vla.common.labels_v4 import LABEL_FIELDS
 from tactile_vla.common.labels_v4 import LABEL_SCHEMA_VERSION
 from tactile_vla.common.labels_v4 import neutral_caption
+from tactile_vla.vla import bottle_v11_3_prompts as visual_prompts
 from tactile_vla.vla.artifacts import sha256_file
 from tactile_vla.vla.bottle_v11_1_grammar import bottle_failure_reasons
 from tactile_vla.vla.bottle_v11_1_grammar import bottle_recovery_plans
@@ -343,6 +344,7 @@ def plan_payload_after_failure(
     image,
     wrist_image,
     qpos,
+    visual_only: bool = False,
 ) -> tuple[dict[str, Any], list[dict[str, str]]]:
     """Append the current real failure, retaining initial plus latest three pairs."""
     if failure_reason not in bottle_failure_reasons():
@@ -354,11 +356,12 @@ def plan_payload_after_failure(
             "failure_reason": failure_reason,
         },
     )
-    prompt = build_recovery_prompt(
-        instruction=instruction,
-        failed_tactile_caption=tactile_caption,
-        failure_recovery_memory=updated,
-        prompt_profile=MINIMAL_PROMPT_PROFILE,
+    prompt = (
+        visual_prompts.build_recovery_prompt(instruction=instruction, failure_recovery_memory=updated)
+        if visual_only else build_recovery_prompt(
+            instruction=instruction, failed_tactile_caption=tactile_caption,
+            failure_recovery_memory=updated, prompt_profile=MINIMAL_PROMPT_PROFILE,
+        )
     )
     return (
         {
@@ -387,6 +390,7 @@ class PhaseAssessmentResult(NamedTuple):
     finished_monotonic: float
     qpos_h100_raw: list[list[float]] | None = None
     decision_received_monotonic: float | None = None
+    history_diagnostics: dict[str, Any] | None = None
 
     @property
     def decision(self) -> dict[str, Any]:
@@ -418,8 +422,11 @@ def _assess_phase(
     after_timestamp: float,
     recovery_plan: str,
     submitted_monotonic: float,
+    history_clock=None,
+    visual_only: bool = False,
 ) -> PhaseAssessmentResult:
-    observation, timestamps = v53._capture_classification_observation(
+    capture = _capture_visual_classification_observation if visual_only else v53._capture_classification_observation
+    observation, timestamps = capture(
         args,
         operator,
         captioner,
@@ -432,7 +439,7 @@ def _assess_phase(
     )
     if dense_h100.shape != (100, 7):
         raise ValueError(f"runtime H100 must be [100,7], got {dense_h100.shape}")
-    targets = float(observation.timestamp) + (np.arange(100) - 99) / args.state_history_fps
+    targets = np.asarray(diagnostics["target_timestamps"], dtype=np.float64)
     valid_mask = np.asarray(valid_mask, dtype=np.bool_)
     if valid_mask.shape != (100,) or not np.isfinite(dense_h100).all():
         raise ValueError("Invalid runtime H100 mask or qpos")
@@ -455,13 +462,16 @@ def _assess_phase(
         print(f"[H100] {message}", flush=True)
         raise ValueError(message)
     dense_h100[targets < args.episode_start_timestamp - 1e-6] = args.episode_start_qpos
-    validate_tactile_caption(observation.tactile_caption)
+    if not visual_only:
+        validate_tactile_caption(observation.tactile_caption)
     discrete = discretize_state_qpos(dense_h100[sampled_offsets], stats)
-    prompt = build_phase_prompt(
-        instruction=args.instruction,
-        tactile_caption=observation.tactile_caption,
-        recovery_plan=recovery_plan,
-        qpos_h100_11_discrete=discrete,
+    phase_prompt_args = {
+        "instruction": args.instruction, "recovery_plan": recovery_plan,
+        "qpos_h100_11_discrete": discrete,
+    }
+    prompt = (
+        visual_prompts.build_phase_prompt(**phase_prompt_args)
+        if visual_only else build_phase_prompt(**phase_prompt_args, tactile_caption=observation.tactile_caption)
     )
     payload = runtime.build_payload(
         mode="phase",
@@ -481,6 +491,21 @@ def _assess_phase(
             "action_step": captured_step,
         }
     )
+    if history_clock is not None:
+        payload["history_clock"] = history_clock
+    history_diagnostics = None
+    if history_clock is not None and phase == "adjustment":
+        history_diagnostics = {
+            "clock": history_clock,
+            "status": "raw_no_compression",
+            "removed_frames": 0,
+            "left_padding_frames": int(np.count_nonzero(targets < args.episode_start_timestamp - 1e-6)),
+        }
+        print(
+            "[ADJUSTMENT_HISTORY] status=raw_no_compression removed_frames=0 "
+            f"left_padding={history_diagnostics['left_padding_frames']}",
+            flush=True,
+        )
     events = []
     decision_received = None
     for event in client.events(payload):
@@ -488,9 +513,10 @@ def _assess_phase(
             decision_received = time.monotonic()
         gate.handle_phase_event(event)
         if phase == "execution" and event.get("event") == "phase_decision":
+            caption_text = "" if visual_only else f"caption={observation.tactile_caption} "
             print(
                 f"[NEED_RECOVERY] request_id={request_id} "
-                f"caption={observation.tactile_caption} "
+                f"{caption_text}"
                 f"result={bool(event.get('need_recovery'))} "
                 f"probs(false,true)={event.get('need_recovery_probs')}",
                 flush=True,
@@ -513,6 +539,7 @@ def _assess_phase(
         finished_monotonic=time.monotonic(),
         qpos_h100_raw=dense_h100.tolist(),
         decision_received_monotonic=decision_received,
+        history_diagnostics=history_diagnostics,
     )
 
 
@@ -523,6 +550,46 @@ def _run_phase_assessment(**kwargs) -> PhaseAssessmentResult:
         # A failed assessment must stop commands even if action inference is still running.
         kwargs["gate"].stop()
         raise
+
+
+def _capture_visual_classification_observation(args, operator, captioner, *, after_timestamp):
+    """Acquire fresh cameras/qpos without tactile windows or placeholder text."""
+    if captioner is not None or getattr(operator, "tactile", None) is not None:
+        raise ValueError("Bottle V11.3 requires no runtime captioner or tactile subscriptions")
+    started = time.monotonic()
+    rate = operator.rate(args.observation_poll_rate)
+    while not operator.is_shutdown() and not runtime.shutdown_event.is_set():
+        if time.monotonic() - started > args.phase_change_timeout_seconds:
+            raise TimeoutError("Timed out waiting for fresh visual phase cameras/qpos")
+        try:
+            front_msg = operator.img_front_deque[-1]
+            wrist_msg = operator.img_left_deque[-1]
+            joint = operator.puppet_arm_deque[-1]
+        except IndexError:
+            rate.sleep()
+            continue
+        stamps = {
+            "front": float(front_msg.header.stamp.to_sec()),
+            "left": float(wrist_msg.header.stamp.to_sec()),
+            "qpos": float(joint.header.stamp.to_sec()),
+        }
+        if not all(np.isfinite(stamp) for stamp in stamps.values()):
+            raise ValueError("Visual phase observation requires finite ROS timestamps")
+        if min(stamps.values()) <= after_timestamp:
+            rate.sleep()
+            continue
+        qpos = np.asarray(joint.position, dtype=np.float32)
+        if qpos.shape != (7,) or not np.isfinite(qpos).all():
+            raise ValueError("Visual phase observation requires finite [7] qpos")
+        return v52.FrozenObservation(
+            img_front=np.asarray(operator.bridge.imgmsg_to_cv2(front_msg, "passthrough")).copy(),
+            img_left=np.asarray(operator.bridge.imgmsg_to_cv2(wrist_msg, "passthrough")).copy(),
+            qpos=qpos.copy(), timestamp=stamps["qpos"],
+            state_history=np.empty((0, 7), dtype=np.float32),
+            state_history_mask=np.empty((0,), dtype=np.bool_),
+            tactile_caption="",
+        ), stamps
+    raise RuntimeError("Stopped while waiting for visual phase observation")
 
 
 def _capture_action_observation(args, operator) -> v52.FrozenObservation:
@@ -546,7 +613,7 @@ def _capture_action_observation(args, operator) -> v52.FrozenObservation:
                 timestamp=float(timestamp),
                 state_history=np.empty((0, 7), dtype=np.float32),
                 state_history_mask=np.empty((0,), dtype=np.bool_),
-                tactile_caption=neutral_caption(),
+                tactile_caption="" if getattr(args, "visual_only", False) else neutral_caption(),
             )
         rate.sleep()
     raise RuntimeError("Stopped while waiting for action observation")
@@ -673,6 +740,7 @@ def _phase_result_log(result: PhaseAssessmentResult, *, handled_step: int) -> di
         "prompt": result.prompt,
         "qpos_h100_11_discrete": result.qpos_h100_11_discrete,
         "qpos_h100_raw": result.qpos_h100_raw,
+        "history_diagnostics": result.history_diagnostics,
         "observation_qpos": result.observation.qpos,
         "observation_timestamp": result.observation.timestamp,
         "tactile_caption": result.observation.tactile_caption,
@@ -698,16 +766,25 @@ def run_bottle_v11_1_async(
     captioner: Any,
     keyboard: Any,
     logger: v52.TrialLogger,
+    *,
+    expected_version="bottle_v11_1",
+    deployment_label="Bottle V11.1",
 ) -> None:
     action_metadata = action_policy.get_server_metadata()
     validate_server_metadata(action_metadata)
+    if action_metadata.get("experiment_version") != expected_version:
+        raise ValueError(f"This client requires experiment_version={expected_version}")
     if action_metadata.get("instruction") != args.instruction:
         raise ValueError("Bottle instruction differs between client and server")
     if action_metadata.get("norm_stats_sha256") != sha256_file(args.norm_stats_file):
         raise ValueError("Bottle client/server norm stats differ")
-    if action_metadata.get("captioner_checkpoint_sha256") != sha256_file(args.captioner_checkpoint):
+    visual_only = expected_version == "bottle_v11_3"
+    if visual_only:
+        if captioner is not None or getattr(operator, "tactile", None) is not None or not args.visual_only:
+            raise ValueError("Bottle V11.3 runtime must have no captioner or tactile subscriptions")
+    elif action_metadata.get("captioner_checkpoint_sha256") != sha256_file(args.captioner_checkpoint):
         raise ValueError("Bottle client/server captioner identities differ")
-    if (
+    if not visual_only and (
         getattr(captioner, "schema_version", None) != LABEL_SCHEMA_VERSION
         or list(getattr(captioner, "label_fields", ())) != list(LABEL_FIELDS)
         or captioner.window_size != 30
@@ -748,7 +825,7 @@ def run_bottle_v11_1_async(
         {"event": "run_start", "server_metadata": action_metadata, "args": vars(args), "continuous_h100": True}
     )
     print(
-        "Bottle V11.1 async started: need and adjustment checks run independently of action chunks; "
+        f"{deployment_label} async started: need and adjustment checks run independently of action chunks; "
         f"need={args.need_recovery_rate_hz:g}Hz adjustment={args.adjustment_end_rate_hz:g}Hz. "
         f"{args.success_key}=success, {args.quit_key}=quit."
     )
@@ -789,13 +866,14 @@ def run_bottle_v11_1_async(
             poll_control()
             hold()
 
-        _wait_future_while_holding(
-            executor.submit(v53._wait_for_tactile_ready, args, operator, captioner),
-            gate=gate,
-            operator=operator,
-            publish_rate=args.publish_rate,
-            poll_control=poll_warmup,
-        )
+        if not visual_only:
+            _wait_future_while_holding(
+                executor.submit(v53._wait_for_tactile_ready, args, operator, captioner),
+                gate=gate,
+                operator=operator,
+                publish_rate=args.publish_rate,
+                poll_control=poll_warmup,
+            )
         # This is the only H100 reset: anchor it after warmup and preserve it
         # across phase and attempt transitions.
         operator.reset_state_history()
@@ -845,6 +923,8 @@ def run_bottle_v11_1_async(
                 after_timestamp=float(last_feedback_timestamp),
                 recovery_plan=recovery_plan,
                 submitted_monotonic=now,
+                history_clock="raw_30Hz_frames" if expected_version in {"bottle_v11_2", "bottle_v11_3"} else None,
+                visual_only=visual_only,
             )
             logger.record(
                 {
@@ -933,6 +1013,7 @@ def run_bottle_v11_1_async(
                 image=runtime.prepare_rgb(result.observation.img_front),
                 wrist_image=runtime.prepare_rgb(result.observation.img_left),
                 qpos=result.observation.qpos,
+                visual_only=visual_only,
             )
             plan_future = executor.submit(
                 action_policy.infer_with_timeout,
@@ -1133,9 +1214,9 @@ def run_bottle_v11_1_async(
         logger.record({"event": "max_publish_step_reached", "published_steps": published_steps})
 
 
-def build_argument_parser(*, direction_keys: bool = False) -> argparse.ArgumentParser:
+def build_argument_parser(*, direction_keys: bool = False, visual_only: bool = False) -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.set_defaults(direction_keys=direction_keys)
+    parser.set_defaults(direction_keys=direction_keys, visual_only=visual_only, tactile_topics_enabled=not visual_only)
     parser.add_argument("--config_path", type=Path)
     parser.add_argument("--host", default="localhost")
     parser.add_argument("--port", type=int, default=8001)
@@ -1163,16 +1244,20 @@ def build_argument_parser(*, direction_keys: bool = False) -> argparse.ArgumentP
     parser.add_argument("--img_left_topic", default="/camera_l/color/image_raw")
     parser.add_argument("--puppet_arm_cmd_topic", default="/master/joint_right")
     parser.add_argument("--puppet_arm_topic", default="/puppet/joint_right")
-    parser.add_argument("--tactile_left_force_topic", default="/xense/OG001251/force")
-    parser.add_argument("--tactile_right_force_topic", default="/xense/OG000991/force")
-    parser.add_argument("--tactile_left_mesh_3d_topic", default="/xense/OG001251/mesh_3d")
-    parser.add_argument("--tactile_right_mesh_3d_topic", default="/xense/OG000991/mesh_3d")
-    parser.add_argument("--tactile_left_mesh_3d_flow_topic", default="/xense/OG001251/mesh_3d_flow")
-    parser.add_argument("--tactile_right_mesh_3d_flow_topic", default="/xense/OG000991/mesh_3d_flow")
-    parser.add_argument("--tactile_window_size", type=int, default=30)
-    parser.add_argument("--captioner_checkpoint", type=Path, default=DEFAULT_CAPTIONER)
-    parser.add_argument("--captioner_device", default="auto")
-    parser.add_argument("--no-captioner", action="store_true")
+    if visual_only:
+        parser.set_defaults(captioner_checkpoint=None, tactile_window_size=0, captioner_device="auto")
+        parser.add_argument("--no-captioner", action="store_true", default=True, help="Always disabled for V11.3")
+    else:
+        parser.add_argument("--tactile_left_force_topic", default="/xense/OG001251/force")
+        parser.add_argument("--tactile_right_force_topic", default="/xense/OG000991/force")
+        parser.add_argument("--tactile_left_mesh_3d_topic", default="/xense/OG001251/mesh_3d")
+        parser.add_argument("--tactile_right_mesh_3d_topic", default="/xense/OG000991/mesh_3d")
+        parser.add_argument("--tactile_left_mesh_3d_flow_topic", default="/xense/OG001251/mesh_3d_flow")
+        parser.add_argument("--tactile_right_mesh_3d_flow_topic", default="/xense/OG000991/mesh_3d_flow")
+        parser.add_argument("--tactile_window_size", type=int, default=30)
+        parser.add_argument("--captioner_checkpoint", type=Path, default=DEFAULT_CAPTIONER)
+        parser.add_argument("--captioner_device", default="auto")
+        parser.add_argument("--no-captioner", action="store_true")
     parser.add_argument("--start-immediately", action="store_true")
     if not direction_keys:
         parser.add_argument("--success-key", default="s")
@@ -1212,15 +1297,18 @@ def validate_args(args: argparse.Namespace, parser: argparse.ArgumentParser) -> 
             parser.error(f"{name} must be finite")
     if args.noise_seed < 0:
         parser.error("--noise-seed must be non-negative")
-    if args.no_captioner:
+    visual_only = getattr(args, "visual_only", False)
+    if visual_only and (not args.no_captioner or args.captioner_checkpoint is not None or args.tactile_topics_enabled):
+        parser.error("Bottle V11.3 must disable captioner and tactile topics")
+    if not visual_only and args.no_captioner:
         parser.error("Bottle V11.1 phase inference requires the tactile captioner")
     if not args.norm_stats_file.is_file():
         parser.error(f"--norm-stats-file does not exist: {args.norm_stats_file}")
     if args.instruction != BOTTLE_INSTRUCTION:
         parser.error("Bottle V11.1 requires the original bottle instruction")
-    if not args.captioner_checkpoint.is_file():
+    if not visual_only and not args.captioner_checkpoint.is_file():
         parser.error("--captioner_checkpoint does not exist")
-    if args.tactile_window_size != 30:
+    if not visual_only and args.tactile_window_size != 30:
         parser.error("Bottle V11.1 requires captioner window=30")
     if args.state_history_fps != 30.0:
         parser.error("Bottle V11.1 H100 requires the training 30 Hz time grid")
@@ -1254,6 +1342,7 @@ def main(
     argument_validator=validate_args,
     run=run_bottle_v11_1_async,
     deployment_label: str = "Bottle V11.1",
+    operator_factory=runtime.RosOperator,
 ) -> None:
     args, parser = argument_parser()
     runtime.apply_yaml_defaults(args, parser)
@@ -1262,10 +1351,14 @@ def main(
         parser.error("Bottle V11.1 real-robot inference requires an interactive TTY")
     runtime.shutdown_event.clear()
     signal.signal(signal.SIGINT, runtime._on_sigint)
-    captioner = runtime.load_captioner(args)
+    if getattr(args, "visual_only", False):
+        captioner = None
+        print("Bottle V11.3 visual/state inference: captioner and tactile subscriptions disabled.")
+    else:
+        captioner = runtime.load_captioner(args)
     action_policy = DirectActionClient(args.host, args.port, timeout=args.request_timeout_seconds)
     phase_client = StreamingPhaseClient(args.host, args.port, timeout=args.request_timeout_seconds)
-    operator = runtime.RosOperator(args)
+    operator = operator_factory(args)
     v53._install_tactile_arrival_timestamps(operator)
     trial_id = args.trial_id
     if trial_id and (args.log_dir.resolve() / trial_id).exists():

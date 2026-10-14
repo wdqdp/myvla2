@@ -234,7 +234,7 @@ class TactileVLAPolicyV3:
             raise ValueError(f"Unsupported checkpoint grammar_profile={grammar_profile!r}")
         expected_failure = legal_failure_reasons(include_fz_bias=include_fz_bias)
         expected_plan = legal_recovery_plans()
-        if config.get("experiment_version") == "bottle_v11_1":
+        if config.get("experiment_version") in {"bottle_v11_1", "bottle_v11_2", "bottle_v11_3"}:
             from tactile_vla.vla.bottle_v11_1_grammar import (
                 TEXT_SCHEMA_POLICY,
                 bottle_failure_reasons,
@@ -242,12 +242,16 @@ class TactileVLAPolicyV3:
             )
 
             if (
-                config.get("data_profile") != "bottle_v11_1_five_task_h100"
+                config.get("data_profile") != (
+                    "bottle_v11_3_five_task_h100_visual"
+                    if config["experiment_version"] == "bottle_v11_3"
+                    else f"{config['experiment_version']}_five_task_h100"
+                )
                 or config.get("text_schema_policy") != TEXT_SCHEMA_POLICY
                 or config.get("include_fy_change_failure_grammar") is not True
                 or config.get("include_rotate_recovery_grammar") is not True
             ):
-                raise ValueError("Bottle V11.1 requires its versioned four-field/three-axis text schema")
+                raise ValueError("Bottle requires its versioned four-field/three-axis text schema")
             expected_failure = bottle_failure_reasons()
             expected_plan = bottle_recovery_plans()
         if (

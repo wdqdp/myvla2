@@ -7,7 +7,6 @@ import json
 from pathlib import Path
 
 import numpy as np
-import pyarrow.parquet as pq
 
 from tactile_vla.vla import bottle_v11_1_stage_a_data as previous
 from tactile_vla.vla.artifacts import action_indices_identity, sha256_file, sha256_json
@@ -144,6 +143,8 @@ def compressed_h30_offsets(start_frame, gap, *, action_horizon=30):
 
 
 def build_artifacts(*, dataset_dir, v4_index_file, norm_stats_dir, settle_frames=DEFAULT_SETTLE_FRAMES):
+    import pyarrow.parquet as pq
+
     policy = target_policy(settle_frames)
     rows, index, _ = previous.build_artifacts(
         dataset_dir=Path(dataset_dir), v4_index_file=Path(v4_index_file), norm_stats_dir=Path(norm_stats_dir)

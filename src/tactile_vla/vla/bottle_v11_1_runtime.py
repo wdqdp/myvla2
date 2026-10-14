@@ -27,6 +27,12 @@ from tactile_vla.vla.bottle_v11_1_stage_a_data import (
 )
 from tactile_vla.vla.bottle_v11_1_grammar import TEXT_SCHEMA_POLICY, bottle_failure_reasons, bottle_recovery_plans
 from tactile_vla.vla.v7_7_phase_prompt import PROMPT_PROFILE, uniform_positions
+from tactile_vla.vla.bottle_v11_2_multitask_data import HISTORY_POLICY as V112_HISTORY_POLICY
+from tactile_vla.vla.bottle_v11_2_stage_a_data import target_policy as v112_action_target_policy
+from tactile_vla.vla.bottle_v11_3_prompts import INPUT_POLICY as V113_INPUT_POLICY
+from tactile_vla.vla.bottle_v11_3_prompts import PROMPT_PROFILE as V113_PROMPT_PROFILE
+from tactile_vla.vla.bottle_v11_3_multitask_data import HISTORY_POLICY as V113_HISTORY_POLICY
+from tactile_vla.vla.bottle_v11_3_multitask_data import NEED_POLICY as V113_NEED_POLICY
 
 BOTTLE_ROOT = Path("/data1/qxh/tac_vla_new/tac_data/demon_data/bottle")
 BOTTLE_INSTRUCTION = INSTRUCTION
@@ -42,41 +48,82 @@ DEFAULT_CAPTIONER_SHA256 = CAPTIONER_SHA256
 HISTORY_OFFSETS = uniform_positions(100).tolist()
 MEMORY_POLICY = TRAINING_MEMORY_POLICY
 VERSION_TAG = "bottle_v11_1"
+V112_VERSION = "bottle_v11_2"
+V113_VERSION = "bottle_v11_3"
+V112_RUNTIME_HISTORY_POLICY = {
+    "schema_version": "bottle_v11_2_raw_history_v1",
+    "scope": "need_failure_adjustment_end",
+    "clock": "raw_30Hz_H100_uniform_11",
+    "frame_filter": "none",
+    "current_frame": "always_keep_original_observation",
+    "future_access": "none",
+}
+V113_RUNTIME_HISTORY_POLICY = V112_RUNTIME_HISTORY_POLICY | {"schema_version": "bottle_v11_3_raw_history_v1"}
 
 
 def deployment_version(data_profile: str | None) -> str:
-    if data_profile != DATA_PROFILE:
-        raise ValueError(f"Unsupported Bottle V11.1 deployment data_profile: {data_profile!r}")
-    return VERSION_TAG
+    versions = {
+        DATA_PROFILE: VERSION_TAG,
+        "bottle_v11_2_five_task_h100": V112_VERSION,
+        "bottle_v11_3_five_task_h100_visual": V113_VERSION,
+    }
+    if data_profile not in versions:
+        raise ValueError(f"Unsupported Bottle deployment data_profile: {data_profile!r}")
+    return versions[data_profile]
+
+
+def deployment_phase_profile(version: str) -> str:
+    if version not in {VERSION_TAG, V112_VERSION, V113_VERSION}:
+        raise ValueError(f"Unsupported Bottle deployment version: {version!r}")
+    return V113_PROMPT_PROFILE if version == V113_VERSION else PROMPT_PROFILE
+
+
+def deployment_runtime_history_policy(version: str) -> dict[str, Any]:
+    if version == V113_VERSION:
+        return V113_RUNTIME_HISTORY_POLICY
+    if version == V112_VERSION:
+        return V112_RUNTIME_HISTORY_POLICY
+    raise ValueError(f"Unsupported explicit runtime history version: {version!r}")
 
 
 def deployment_policy_fields(version: str) -> dict[str, Any]:
     """Compact training contracts checked in config, export and client metadata."""
-    if version != VERSION_TAG:
-        raise ValueError(f"Unsupported Bottle V11.1 deployment version: {version!r}")
-    return {
+    if version not in {VERSION_TAG, V112_VERSION, V113_VERSION}:
+        raise ValueError(f"Unsupported Bottle deployment version: {version!r}")
+    fields = {
         "include_fz_bias_failure_grammar": True,
         "include_fy_change_failure_grammar": True,
         "include_rotate_recovery_grammar": True,
         "text_schema_policy": TEXT_SCHEMA_POLICY,
         "failure_action_policy": FAILURE_ACTION_POLICY,
-        "need_policy": NEED_POLICY,
+        "need_policy": V113_NEED_POLICY if version == V113_VERSION else NEED_POLICY,
         "adjustment_policy": ADJUSTMENT_POLICY,
         "reasoning_policy": REASONING_POLICY,
-        "history_policy": HISTORY_POLICY,
+        "history_policy": {
+            VERSION_TAG: HISTORY_POLICY,
+            V112_VERSION: V112_HISTORY_POLICY,
+            V113_VERSION: V113_HISTORY_POLICY,
+        }[version],
         "memory_policy": TRAINING_MEMORY_POLICY,
         "action_sampling_policy": ACTION_SAMPLING_POLICY
         | {
-            "action_candidates": "V11.1_Stage_A_phase_pure_and_failure_safe_H30",
+            "action_candidates": (
+                "V11.2_compressed_phase_pure_failure_safe_H30"
+                if version in {V112_VERSION, V113_VERSION} else "V11.1_Stage_A_phase_pure_and_failure_safe_H30"
+            ),
         },
     }
+    if version == V113_VERSION:
+        fields.update(input_policy=V113_INPUT_POLICY, captioner_identity_scope="offline_label_provenance_only")
+    return fields
 
 
-def validate_source_identity(payload: dict[str, Any], training_data_hash: str) -> None:
+def validate_source_identity(payload: dict[str, Any], training_data_hash: str, *, version: str = VERSION_TAG) -> None:
+    source_version = V112_VERSION if version == V113_VERSION else version
     scope = payload.get("source_scope")
     if (
         not isinstance(scope, dict)
-        or scope.get("schema_version") != "bottle_v11_1_source_scope_v1"
+        or scope.get("schema_version") != f"{source_version}_source_scope_v1"
         or scope.get("selection") != "explicit_selected_dataset_and_hashed_V4_sources_no_recursive_archive_scan"
         or not scope.get("dataset_dir")
         or not scope.get("v4_index_file")
@@ -92,7 +139,7 @@ def validate_source_identity(payload: dict[str, Any], training_data_hash: str) -
         not isinstance(stage_a, dict)
         or type(stage_a.get("step")) is not int
         or stage_a["step"] <= 0
-        or stage_a.get("experiment_version") != VERSION_TAG
+        or stage_a.get("experiment_version") != source_version
         or Path(str(stage_a.get("path", ""))).name != str(stage_a["step"])
     ):
         raise ValueError("Bottle V11.1 requires a consistent versioned Stage A initialization identity")
@@ -101,6 +148,17 @@ def validate_source_identity(payload: dict[str, Any], training_data_hash: str) -
             raise ValueError(f"Bottle V11.1 Stage A initialization identity is missing {key}")
     if not re.fullmatch(r"[0-9a-f]{64}", str(payload.get("boundary_audit_sha256", ""))):
         raise ValueError("Bottle V11.1 identity is missing boundary_audit_sha256")
+    if version in {V112_VERSION, V113_VERSION}:
+        policy = payload.get("action_target_policy", {})
+        settle = policy.get("idle_compression", {}).get("settle_frames") if isinstance(policy, dict) else None
+        if type(settle) is not int or settle < 0 or policy != v112_action_target_policy(settle):
+            raise ValueError("Bottle V11.2 action target compression policy mismatch")
+        if not re.fullmatch(r"[0-9a-f]{64}", str(payload.get("idle_gap_audit_sha256", ""))):
+            raise ValueError("Bottle V11.2 identity is missing idle_gap_audit_sha256")
+    if version == V113_VERSION:
+        for key in ("source_multitask_training_data_hash", "source_multitask_index_sha256"):
+            if not re.fullmatch(r"[0-9a-f]{64}", str(payload.get(key, ""))):
+                raise ValueError(f"Bottle V11.3 is missing its V11.2 source identity: {key}")
 
 
 def append_runtime_memory(memory: list[dict], entry: dict) -> list[dict]:
@@ -162,7 +220,7 @@ def validate_target_coverage(payload: dict[str, Any]) -> None:
 def validate_training_config(config: dict[str, Any], norm_sha: str) -> None:
     version = deployment_version(config.get("data_profile"))
     expected = {
-        "prompt_profile": PROMPT_PROFILE,
+        "prompt_profile": deployment_phase_profile(version),
         "action_horizon": 30,
         "action_dim": 32,
         "max_token_len": 512,
@@ -195,7 +253,9 @@ def validate_training_config(config: dict[str, Any], norm_sha: str) -> None:
     if config.get("dataset_dir") != config.get("source_scope", {}).get("dataset_dir"):
         raise ValueError("Bottle V11.1 source_scope differs from the training dataset")
     validate_captioner_identity(config.get("captioner_identity", {}))
-    validate_source_identity(config, identity[training_hash_key])
+    validate_source_identity(config, identity[training_hash_key], version=version)
+    if version in {V112_VERSION, V113_VERSION} and identity.get("target_policy") != config["action_target_policy"]:
+        raise ValueError("Bottle V11.2 action artifact identity differs from its compression policy")
     validate_target_coverage(config)
     stage_a = config["stage_a_initialization_identity"]
     if config.get("stage_a_checkpoint_step") != stage_a["step"] or config.get("stage_a_checkpoint") != stage_a["path"]:
@@ -220,7 +280,7 @@ def resolve_thresholds(
         expected = {
             "schema_version": f"{version}_val_thresholds_v1",
             "data_profile": data_profile,
-            "prompt_profile": PROMPT_PROFILE,
+            "prompt_profile": deployment_phase_profile(version),
             "checkpoint_step": step,
             "full_params_sha256": full_params_sha,
             "norm_stats_sha256": norm_sha,
@@ -252,9 +312,10 @@ def resolve_thresholds(
 
 def validate_server_metadata(metadata: dict[str, Any]) -> None:
     version = deployment_version(metadata.get("data_profile"))
+    visual_only = version == V113_VERSION
     expected = {
-        "name": SERVER_NAME,
-        "phase_prompt_profile": PROMPT_PROFILE,
+        "name": f"tactile_vla_{version}",
+        "phase_prompt_profile": deployment_phase_profile(version),
         "instruction": BOTTLE_INSTRUCTION,
         "action_prompt_profile": "phase_v2",
         "supports_streamed_phase_events": True,
@@ -274,19 +335,23 @@ def validate_server_metadata(metadata: dict[str, Any]) -> None:
         "max_supported_attempts": None,
         "classification_qpos_policy": "raw_no_gripper_remap",
         "episode_start_padding": "left_pad_episode_frame_0",
-        "captioner_window_size": 30,
-        "requires_captioner": True,
-        "requires_tactile_topics": True,
+        "captioner_window_size": 0 if visual_only else 30,
+        "requires_captioner": not visual_only,
+        "requires_tactile_topics": not visual_only,
     }
     expected["experiment_version"] = version
     expected.update(deployment_policy_fields(version))
+    if version in {V112_VERSION, V113_VERSION}:
+        expected["adjustment_history_runtime_policy"] = deployment_runtime_history_policy(version)
+    if visual_only:
+        expected["captioner_checkpoint_sha256"] = None
     mismatch = {key: (metadata.get(key), value) for key, value in expected.items() if metadata.get(key) != value}
     if mismatch:
         raise ValueError(f"Bottle V11.1 client/server metadata mismatch: {mismatch}")
     validate_captioner_identity(metadata.get("captioner_identity", {}))
-    validate_source_identity(metadata, metadata.get("training_data_hash", ""))
+    validate_source_identity(metadata, metadata.get("training_data_hash", ""), version=version)
     validate_target_coverage(metadata)
-    if metadata.get("captioner_checkpoint_sha256") != metadata["captioner_identity"]["checkpoint_sha256"]:
+    if not visual_only and metadata.get("captioner_checkpoint_sha256") != metadata["captioner_identity"]["checkpoint_sha256"]:
         raise ValueError("Bottle V11.1 runtime captioner differs from training provenance")
     for task in ("need_recovery", "adjustment_end"):
         value = float(metadata.get(f"{task}_threshold", -1))

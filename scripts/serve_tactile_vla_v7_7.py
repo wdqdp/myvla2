@@ -88,11 +88,11 @@ def parse_args():
 
 
 class V77Policy(v3.TactileVLAPolicyV3):
-    def __init__(self, *, args, config, model_config, norm_stats):
+    def __init__(self, *, args, config, model_config, norm_stats, prompt_profile=PROMPT_PROFILE):
         if config.get("data_profile") != DATA_PROFILE:
             raise ValueError(f"checkpoint data_profile must be {DATA_PROFILE!r}")
-        if config.get("prompt_profile") != PROMPT_PROFILE:
-            raise ValueError(f"checkpoint prompt_profile must be {PROMPT_PROFILE!r}")
+        if config.get("prompt_profile") != prompt_profile:
+            raise ValueError(f"checkpoint prompt_profile must be {prompt_profile!r}")
         if bool(config.get("use_state_history")) or int(config.get("state_history_len", -1)) != 0:
             raise ValueError("V7.7 deployment requires the no-history Action Expert")
         old = v3.StageBV3Model
@@ -102,7 +102,7 @@ class V77Policy(v3.TactileVLAPolicyV3):
         if args.need_recovery_threshold is None:
             args.need_recovery_threshold = float(config.get("thresholds", {}).get("need_recovery", 0.5))
         v3.StageBV3Model = V77MultitaskModel
-        v3.load_checkpoint_prompt_profile = lambda _config: PROMPT_PROFILE
+        v3.load_checkpoint_prompt_profile = lambda _config: prompt_profile
         v3.openpi_model.restore_params = _restore_exported_full_params
         try:
             super().__init__(args=args, config=config, model_config=model_config, norm_stats=norm_stats)
@@ -125,7 +125,7 @@ class V77Policy(v3.TactileVLAPolicyV3):
             "supports_action_noise": True, "requires_action_noise": True,
             "need_recovery_threshold": self._need_threshold,
             "adjustment_end_threshold": self._adjustment_threshold,
-            "phase_prompt_profile": PROMPT_PROFILE,
+            "phase_prompt_profile": prompt_profile,
         })
 
     def _actions_with_noise(self, transformed, observation, noise):
