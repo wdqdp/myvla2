@@ -193,6 +193,41 @@ def _model_config(args: argparse.Namespace, config: dict[str, Any]) -> Pi0Config
     )
 
 
+def _restore_typed_rng_keys(reference, restored):
+    """Recover Orbax raw PRNG data using each reference NNX key's implementation.
+
+    Check the full structure first. Only leaves whose reference dtype is a
+    typed PRNG key are converted; model parameter arrays keep their original
+    values, shapes and dtypes for the subsequent strict checks.
+    """
+    at.check_pytree_equality(expected=reference, got=restored)
+    converted = 0
+
+    def restore_key(path, expected, value):
+        nonlocal converted
+        expected_dtype = getattr(expected, "dtype", None)
+        if expected_dtype is None or not jax.dtypes.issubdtype(expected_dtype, jax.dtypes.prng_key):
+            return value
+        value_dtype = getattr(value, "dtype", None)
+        if value_dtype is None or not jax.dtypes.issubdtype(value_dtype, jax.dtypes.prng_key):
+            raw = jnp.asarray(value)
+            if raw.dtype != jnp.uint32:
+                raise ValueError(f"Invalid checkpoint RNG data at {jax.tree_util.keystr(path)}: {raw.dtype}")
+            value = jax.random.wrap_key_data(raw, impl=jax.random.key_impl(expected))
+            converted += 1
+        if value.shape != expected.shape or value.dtype != expected.dtype:
+            raise ValueError(
+                f"Checkpoint RNG mismatch at {jax.tree_util.keystr(path)}: "
+                f"expected {expected.shape}/{expected.dtype}, got {value.shape}/{value.dtype}"
+            )
+        return value
+
+    result = jax.tree_util.tree_map_with_path(restore_key, reference, restored)
+    if converted:
+        logging.info("Restored %d checkpoint RNG keys to the model's typed PRNG format", converted)
+    return result
+
+
 class TactileVLAPolicyV3:
     def __init__(
         self,
@@ -273,8 +308,10 @@ class TactileVLAPolicyV3:
         graphdef, state = nnx.split(model)
         dtype = jnp.bfloat16 if model_config.dtype == "bfloat16" else jnp.float32
         params = openpi_model.restore_params(_params_dir(args.checkpoint), dtype=dtype)
+        reference = state.to_pure_dict()
+        params = _restore_typed_rng_keys(reference, params)
         at.check_pytree_equality(
-            expected=state.to_pure_dict(),
+            expected=reference,
             got=params,
             check_shapes=True,
             check_dtypes=False,

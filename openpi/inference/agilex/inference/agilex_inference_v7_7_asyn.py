@@ -35,6 +35,8 @@ import agilex_inference_forced_phase_anlation as v52
 import agilex_inference_forced_phase_anlation_5_3 as v53
 import agilex_inference_tactile_vla_sync_single as runtime
 from openpi_client import msgpack_numpy
+from tactile_vla.vla import v7_8_phase_prompt as visual_prompts
+from tactile_vla.vla.artifacts import sha256_file
 from tactile_vla.vla.prompts import MINIMAL_PROMPT_PROFILE
 from tactile_vla.vla.prompts import build_recovery_prompt
 from tactile_vla.vla.prompts import update_failure_recovery_memory
@@ -47,6 +49,7 @@ from tactile_vla.vla.v7_7_async_state import AsyncPhaseState
 from tactile_vla.vla.v7_7_multitask_data import DATA_PROFILE
 from tactile_vla.vla.v7_7_phase_prompt import PROMPT_PROFILE
 from tactile_vla.vla.v7_7_phase_prompt import build_phase_prompt
+from tactile_vla.vla.v7_8_runtime import validate_server_metadata as validate_visual_metadata
 
 DEFAULT_LOG_ROOT = PROJECT_ROOT / "outputs/runtime/v7_7_async"
 DEFAULT_NORM_STATS = Path(
@@ -123,6 +126,12 @@ class V77AsyncControlGate:
         self.state = AsyncPhaseState()
         self._hold = hold
         self._lock = threading.Lock()
+
+    def stop(self) -> None:
+        with self._lock:
+            self.state.stop_latched = True
+            self.state.action_generation += 1
+            self._hold()
 
     def handle_phase_event(self, event: dict[str, Any]) -> bool:
         with self._lock:
@@ -261,7 +270,8 @@ def phase_payload(*, phase: str, request_id: str, attempt_id: int, generation: i
 
 def plan_payload_after_failure(*, instruction: str, tactile_caption: str,
                                executed_recovery_plan: str, failure_reason: str,
-                               memory: list[dict[str, str]], image, wrist_image, qpos
+                               memory: list[dict[str, str]], image, wrist_image, qpos,
+                               visual_only: bool = False,
                                ) -> tuple[dict[str, Any], list[dict[str, str]]]:
     """Update failure-recovery memory, then create the mandatory new plan prefill."""
     entry = {
@@ -271,9 +281,12 @@ def plan_payload_after_failure(*, instruction: str, tactile_caption: str,
     updated = update_failure_recovery_memory(
         memory, entry, prompt_profile=MINIMAL_PROMPT_PROFILE
     )
-    prompt = build_recovery_prompt(
-        instruction=instruction, failed_tactile_caption=tactile_caption,
-        failure_recovery_memory=updated, prompt_profile=MINIMAL_PROMPT_PROFILE,
+    prompt = (
+        visual_prompts.build_recovery_prompt(instruction=instruction, failure_recovery_memory=updated)
+        if visual_only else build_recovery_prompt(
+            instruction=instruction, failed_tactile_caption=tactile_caption,
+            failure_recovery_memory=updated, prompt_profile=MINIMAL_PROMPT_PROFILE,
+        )
     )
     return ({
         "mode": "reasoning", "prompt": prompt,
@@ -295,6 +308,7 @@ class PhaseAssessmentResult(NamedTuple):
     events: list[dict[str, Any]]
     submitted_monotonic: float
     finished_monotonic: float
+    qpos_h100_raw: list[list[float]] | None = None
 
     @property
     def decision(self) -> dict[str, Any]:
@@ -307,6 +321,9 @@ class PhaseAssessmentResult(NamedTuple):
 
 
 def validate_server_metadata(metadata: dict[str, Any]) -> None:
+    if DATA_PROFILE == "rotation_phase_v7_8_five_task_h100_visual":
+        validate_visual_metadata(metadata)
+        return
     expected = {
         "name": "tactile_vla_v7_7",
         "data_profile": DATA_PROFILE,
@@ -332,21 +349,31 @@ def validate_server_metadata(metadata: dict[str, Any]) -> None:
             raise ValueError(f"invalid server {key}={value}")
 
 
-def _run_phase_assessment(
+def _assess_phase(
     *, args: argparse.Namespace, client: StreamingPhaseClient, operator: Any,
     captioner: Any, stats: StateQuantileStats, gate: V77AsyncControlGate,
     phase: str, generation: int, attempt_id: int, request_id: str,
     captured_step: int, after_timestamp: float,
     recovery_plan: str, submitted_monotonic: float,
 ) -> PhaseAssessmentResult:
-    observation, timestamps = v53._capture_classification_observation(
+    visual_only = getattr(args, "visual_only", False)
+    capture = _capture_visual_observation if visual_only else v53._capture_classification_observation
+    observation, timestamps = capture(
         args, operator, captioner, after_timestamp=after_timestamp,
     )
-    dense_h100, _ = operator.state_history.snapshot(
+    dense_h100, valid_mask = operator.state_history.snapshot(
         current_timestamp=float(observation.timestamp), current_state=observation.qpos,
     )
     if dense_h100.shape != (100, 7):
         raise ValueError(f"runtime H100 must be [100,7], got {dense_h100.shape}")
+    if visual_only:
+        targets = float(observation.timestamp) + (np.arange(100) - 99) / args.state_history_fps
+        before_start = targets < args.episode_start_timestamp - 1e-6
+        sampled = np.linspace(0, 99, 11, dtype=np.int64)
+        missing = ~np.asarray(valid_mask, dtype=np.bool_)[sampled] & ~before_start[sampled]
+        if missing.any():
+            raise ValueError(f"Runtime H100 has missing ROS samples at offsets {sampled[missing].tolist()}; max_gap={args.state_history_max_gap_seconds}s")
+        dense_h100[before_start] = args.episode_start_qpos
     open_threshold = args.classification_gripper_open_threshold
     open_value = args.classification_gripper_open_value
     mapped_h100, _ = _remap_classification_qpos(
@@ -356,11 +383,10 @@ def _run_phase_assessment(
         observation.qpos, open_threshold=open_threshold, open_value=open_value,
     )
     discrete = discretize_state_qpos(mapped_h100[np.linspace(0, 99, 11, dtype=np.int64)], stats)
-    prompt = build_phase_prompt(
-        instruction=args.instruction,
-        tactile_caption=observation.tactile_caption,
-        recovery_plan=recovery_plan,
-        qpos_h100_11_discrete=discrete,
+    phase_args = {"instruction": args.instruction, "recovery_plan": recovery_plan, "qpos_h100_11_discrete": discrete}
+    prompt = (
+        visual_prompts.build_phase_prompt(**phase_args)
+        if visual_only else build_phase_prompt(**phase_args, tactile_caption=observation.tactile_caption)
     )
     payload = runtime.build_payload(
         mode="phase", img_front_bgr=observation.img_front,
@@ -374,6 +400,8 @@ def _run_phase_assessment(
     events = []
     for event in client.events(payload):
         gate.handle_phase_event(event)
+        if visual_only and phase == "execution" and event.get("event") == "phase_decision":
+            print(f"[NEED_RECOVERY] request_id={request_id} result={event['need_recovery']} probs(false,true)={event['need_recovery_probs']}", flush=True)
         events.append(event)
     if not events:
         raise ValueError("V7.7 phase request returned no events")
@@ -384,7 +412,55 @@ def _run_phase_assessment(
         prompt=prompt, qpos_h100_11_discrete=discrete.tolist(), events=events,
         submitted_monotonic=submitted_monotonic,
         finished_monotonic=time.monotonic(),
+        qpos_h100_raw=dense_h100.tolist() if visual_only else None,
     )
+
+
+def _run_phase_assessment(**kwargs):
+    try:
+        return _assess_phase(**kwargs)
+    except Exception:
+        if getattr(kwargs["args"], "visual_only", False):
+            kwargs["gate"].stop()
+        raise
+
+
+def _capture_visual_observation(args, operator, captioner, *, after_timestamp):
+    """Wait only for fresh cameras and qpos; no tactile window or neutral text."""
+    if captioner is not None or getattr(operator, "tactile", None) is not None:
+        raise ValueError("V7.8 requires no runtime captioner or tactile subscriptions")
+    started = time.monotonic()
+    rate = operator.rate(args.observation_poll_rate)
+    while not operator.is_shutdown() and not runtime.shutdown_event.is_set():
+        if time.monotonic() - started > args.phase_change_timeout_seconds:
+            raise TimeoutError("Timed out waiting for V7.8 fresh cameras/qpos")
+        try:
+            front, wrist, joint = operator.img_front_deque[-1], operator.img_left_deque[-1], operator.puppet_arm_deque[-1]
+        except IndexError:
+            rate.sleep()
+            continue
+        stamps = {"front": float(front.header.stamp.to_sec()), "left": float(wrist.header.stamp.to_sec()), "qpos": float(joint.header.stamp.to_sec())}
+        if not all(np.isfinite(t) for t in stamps.values()):
+            raise ValueError("V7.8 observation has nonfinite ROS timestamps")
+        if min(stamps.values()) <= after_timestamp:
+            rate.sleep()
+            continue
+        qpos = np.asarray(joint.position, dtype=np.float32)
+        if qpos.shape != (7,) or not np.isfinite(qpos).all():
+            raise ValueError("V7.8 observation requires finite [7] qpos")
+        return v52.FrozenObservation(
+            img_front=np.asarray(operator.bridge.imgmsg_to_cv2(front, "passthrough")).copy(),
+            img_left=np.asarray(operator.bridge.imgmsg_to_cv2(wrist, "passthrough")).copy(),
+            qpos=qpos.copy(), timestamp=stamps["qpos"],
+            state_history=np.empty((0, 7), dtype=np.float32), state_history_mask=np.empty(0, dtype=np.bool_), tactile_caption="",
+        ), stamps
+    raise RuntimeError("Stopped while waiting for V7.8 observation")
+
+
+def _capture_action_observation(args, operator):
+    if not getattr(args, "visual_only", False):
+        return v52._capture_observation(args, operator, None, reset_history=False)
+    return _capture_visual_observation(args, operator, None, after_timestamp=float("-inf"))[0]
 
 
 def _request_action_chunk(
@@ -451,6 +527,7 @@ def _phase_result_log(result: PhaseAssessmentResult, *, handled_step: int) -> di
         "lag_steps": max(0, handled_step - result.captured_step),
         "prompt": result.prompt,
         "qpos_h100_11_discrete": result.qpos_h100_11_discrete,
+        "qpos_h100_raw": result.qpos_h100_raw,
         "tactile_caption": result.observation.tactile_caption,
         "synchronized_timestamps": result.synchronized_timestamps,
         "need_recovery": decision.get("need_recovery"),
@@ -468,6 +545,12 @@ def run_v7_7_async(
 ) -> None:
     action_metadata = action_policy.get_server_metadata()
     validate_server_metadata(action_metadata)
+    visual_only = getattr(args, "visual_only", False)
+    if visual_only:
+        if action_metadata.get("checkpoint_step") != args.expected_checkpoint_step:
+            raise ValueError(f"V7.8 client requires checkpoint step {args.expected_checkpoint_step}")
+        if action_metadata.get("norm_stats_sha256") != sha256_file(args.norm_stats_file):
+            raise ValueError("V7.8 client/server norm_stats SHA256 differs")
     if action_metadata != phase_client.metadata:
         raise ValueError("V7.7 action and phase connections expose different metadata")
     args.use_state_history = False
@@ -497,7 +580,7 @@ def run_v7_7_async(
     logger.record({"event": "run_start", "server_metadata": action_metadata,
                    "args": vars(args), "continuous_h100": True})
     print(
-        "V7.7 async started: need and adjustment checks run independently of action chunks; "
+        f"{'V7.8' if visual_only else 'V7.7'} async started: need and adjustment checks run independently of action chunks; "
         f"need={args.need_recovery_rate_hz:g}Hz adjustment={args.adjustment_end_rate_hz:g}Hz. "
         f"{args.success_key}=success, {args.quit_key}=quit."
     )
@@ -506,10 +589,13 @@ def run_v7_7_async(
     operator.reset_state_history()
     # Action prompts contain no touch text; reserve the captioner for the
     # asynchronous phase worker to avoid serializing action generation on it.
-    initial = v52._capture_observation(args, operator, None, reset_history=False)
+    initial = _capture_action_observation(args, operator)
     if initial.timestamp is None:
         raise ValueError("initial ROS qpos does not have a timestamp")
     operator.state_history.push(float(initial.timestamp), initial.qpos)
+    if visual_only:
+        args.episode_start_timestamp = float(initial.timestamp)
+        args.episode_start_qpos = initial.qpos.copy()
     hold_target[0] = initial.qpos.copy()
     last_feedback_timestamp = initial.timestamp
     pending_observation: v52.FrozenObservation | None = initial
@@ -603,6 +689,7 @@ def run_v7_7_async(
                 image=runtime.prepare_rgb(result.observation.img_front),
                 wrist_image=runtime.prepare_rgb(result.observation.img_left),
                 qpos=result.observation.qpos,
+                visual_only=visual_only,
             )
             plan_future = executor.submit(
                 action_policy.infer_with_timeout, plan_payload,
@@ -645,9 +732,7 @@ def run_v7_7_async(
                 continue
 
             phase, attempt_id, _, _, _ = gate.snapshot()
-            observation = pending_observation or v52._capture_observation(
-                args, operator, None, reset_history=False,
-            )
+            observation = pending_observation or _capture_action_observation(args, operator)
             pending_observation = None
             hold_target[0] = observation.qpos.copy()
             phase_index = phase_indices[phase]
@@ -745,11 +830,14 @@ def run_v7_7_async(
         logger.record({"event": "max_publish_step_reached", "published_steps": published_steps})
 
 
-def get_arguments(argv: list[str] | None = None) -> tuple[argparse.Namespace, argparse.ArgumentParser]:
-    parser = argparse.ArgumentParser(description=__doc__)
+def get_arguments(argv: list[str] | None = None, *, visual_only: bool = False) -> tuple[argparse.Namespace, argparse.ArgumentParser]:
+    parser = argparse.ArgumentParser(description="V7.8 visual/state asynchronous deployment (default step 2000)" if visual_only else __doc__)
+    parser.set_defaults(visual_only=visual_only, tactile_topics_enabled=not visual_only)
     parser.add_argument("--config_path", type=Path)
     parser.add_argument("--host", default="localhost")
-    parser.add_argument("--port", type=int, default=8000)
+    parser.add_argument("--port", type=int, default=8001 if visual_only else 8000)
+    if visual_only:
+        parser.add_argument("--expected-checkpoint-step", type=int, default=2000)
     parser.add_argument("--instruction", default=v52.DEFAULT_INSTRUCTION)
     parser.add_argument("--noise-seed", type=int, required=True)
     parser.add_argument("--trial-id")
@@ -774,16 +862,19 @@ def get_arguments(argv: list[str] | None = None) -> tuple[argparse.Namespace, ar
     parser.add_argument("--img_left_topic", default="/camera_l/color/image_raw")
     parser.add_argument("--puppet_arm_cmd_topic", default="/master/joint_right")
     parser.add_argument("--puppet_arm_topic", default="/puppet/joint_right")
-    parser.add_argument("--tactile_left_force_topic", default="/xense/OG001251/force")
-    parser.add_argument("--tactile_right_force_topic", default="/xense/OG000991/force")
-    parser.add_argument("--tactile_left_mesh_3d_topic", default="/xense/OG001251/mesh_3d")
-    parser.add_argument("--tactile_right_mesh_3d_topic", default="/xense/OG000991/mesh_3d")
-    parser.add_argument("--tactile_left_mesh_3d_flow_topic", default="/xense/OG001251/mesh_3d_flow")
-    parser.add_argument("--tactile_right_mesh_3d_flow_topic", default="/xense/OG000991/mesh_3d_flow")
-    parser.add_argument("--tactile_window_size", type=int, default=30)
-    parser.add_argument("--captioner_checkpoint", type=Path, default=DEFAULT_CAPTIONER)
-    parser.add_argument("--captioner_device", default="auto")
-    parser.add_argument("--no-captioner", action="store_true")
+    if visual_only:
+        parser.set_defaults(no_captioner=True, captioner_checkpoint=None, captioner_device="auto", tactile_window_size=0)
+    else:
+        parser.add_argument("--tactile_left_force_topic", default="/xense/OG001251/force")
+        parser.add_argument("--tactile_right_force_topic", default="/xense/OG000991/force")
+        parser.add_argument("--tactile_left_mesh_3d_topic", default="/xense/OG001251/mesh_3d")
+        parser.add_argument("--tactile_right_mesh_3d_topic", default="/xense/OG000991/mesh_3d")
+        parser.add_argument("--tactile_left_mesh_3d_flow_topic", default="/xense/OG001251/mesh_3d_flow")
+        parser.add_argument("--tactile_right_mesh_3d_flow_topic", default="/xense/OG000991/mesh_3d_flow")
+        parser.add_argument("--tactile_window_size", type=int, default=30)
+        parser.add_argument("--captioner_checkpoint", type=Path, default=DEFAULT_CAPTIONER)
+        parser.add_argument("--captioner_device", default="auto")
+        parser.add_argument("--no-captioner", action="store_true")
     parser.add_argument("--start-immediately", action="store_true")
     parser.add_argument("--success-key", default="s")
     parser.add_argument("--quit-key", default="q")
@@ -807,7 +898,18 @@ def get_arguments(argv: list[str] | None = None) -> tuple[argparse.Namespace, ar
 def validate_args(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
     if args.noise_seed < 0:
         parser.error("--noise-seed must be non-negative")
-    if args.no_captioner:
+    visual_only = getattr(args, "visual_only", False)
+    if visual_only:
+        if args.expected_checkpoint_step <= 0 or args.state_history_fps != 30.0:
+            parser.error("V7.8 requires a positive checkpoint step and 30Hz history grid")
+        if args.instruction != v52.DEFAULT_INSTRUCTION:
+            parser.error("V7.8 requires its original task instruction")
+        if not args.no_captioner or args.captioner_checkpoint is not None or args.tactile_topics_enabled:
+            parser.error("V7.8 requires no captioner or tactile topics")
+        for name in ("publish_rate", "observation_poll_rate", "state_history_max_gap_seconds", "need_recovery_rate_hz", "adjustment_end_rate_hz", "request_timeout_seconds", "phase_change_timeout_seconds"):
+            if not np.isfinite(getattr(args, name)):
+                parser.error(f"{name} must be finite")
+    if not visual_only and args.no_captioner:
         parser.error("V7.7 phase inference requires the tactile captioner")
     if not args.norm_stats_file.is_file():
         parser.error(f"--norm-stats-file does not exist: {args.norm_stats_file}")
@@ -846,15 +948,15 @@ def validate_args(args: argparse.Namespace, parser: argparse.ArgumentParser) -> 
         parser.error("success/quit keys must be distinct single characters")
 
 
-def main() -> None:
-    args, parser = get_arguments()
+def main(*, argument_parser=None, deployment_label="V7.7") -> None:
+    args, parser = (argument_parser or get_arguments)()
     runtime.apply_yaml_defaults(args, parser)
     validate_args(args, parser)
     if not sys.stdin.isatty():
-        parser.error("V7.7 real-robot inference requires an interactive TTY")
+        parser.error(f"{deployment_label} real-robot inference requires an interactive TTY")
     runtime.shutdown_event.clear()
     signal.signal(signal.SIGINT, runtime._on_sigint)
-    captioner = runtime.load_captioner(args)
+    captioner = None if getattr(args, "visual_only", False) else runtime.load_captioner(args)
     action_policy = v53.TimeoutWebsocketPolicy(args.host, args.port)
     phase_client = StreamingPhaseClient(args.host, args.port, timeout=args.request_timeout_seconds)
     operator = runtime.RosOperator(args)
@@ -872,7 +974,7 @@ def main() -> None:
         )
     try:
         if not args.start_immediately:
-            input("Press enter to start V7.7 EXECUTION")
+            input(f"Press enter to start {deployment_label} EXECUTION")
         with runtime.KeyboardPoller() as keyboard:
             run_v7_7_async(
                 args, operator, action_policy, phase_client, captioner, keyboard, logger,
@@ -887,6 +989,14 @@ def main() -> None:
         print(f"FAIL-CLOSED safety stop: {exc}. No more model actions will be published.")
         raise
     finally:
+        if getattr(args, "visual_only", False):
+            runtime.shutdown_event.set()
+            feedback, _ = v52._latest_feedback(operator)
+            if feedback is not None and not args.no_publish:
+                hold = np.asarray(feedback, dtype=np.float32).copy()
+                if hold.shape == (7,) and np.isfinite(hold).all():
+                    hold[6] = max(float(args.gripper_min), float(hold[6]))
+                    operator.puppet_arm_publish(hold)
         phase_client.close()
         close = getattr(getattr(action_policy, "_ws", None), "close", None)
         if callable(close):
