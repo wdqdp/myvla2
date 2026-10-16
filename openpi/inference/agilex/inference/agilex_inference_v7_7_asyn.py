@@ -585,6 +585,17 @@ def run_v7_7_async(
         f"{args.success_key}=success, {args.quit_key}=quit."
     )
 
+    if not visual_only and not isinstance(operator, runtime.ReplayOperator):
+        def poll_tactile_warmup():
+            hold()
+            key = keyboard.get_key()
+            if key in {args.quit_key, args.success_key}:
+                runtime.shutdown_event.set()
+                logger.record({"event": "operator_quit" if key == args.quit_key else "operator_success", "during": "tactile_warmup"})
+
+        if not v53._wait_for_tactile_ready(args, operator, captioner, poll_control=poll_tactile_warmup):
+            return
+
     # This is the only H100 reset: phase and attempt transitions preserve it.
     operator.reset_state_history()
     # Action prompts contain no touch text; reserve the captioner for the
@@ -865,6 +876,7 @@ def get_arguments(argv: list[str] | None = None, *, visual_only: bool = False) -
     if visual_only:
         parser.set_defaults(no_captioner=True, captioner_checkpoint=None, captioner_device="auto", tactile_window_size=0)
     else:
+        parser.add_argument("--tactile-warmup-timeout-seconds", type=float, default=10.0, help="Maximum startup wait for 30 complete six-topic tactile frames")
         parser.add_argument("--tactile_left_force_topic", default="/xense/OG001251/force")
         parser.add_argument("--tactile_right_force_topic", default="/xense/OG000991/force")
         parser.add_argument("--tactile_left_mesh_3d_topic", default="/xense/OG001251/mesh_3d")
@@ -911,6 +923,9 @@ def validate_args(args: argparse.Namespace, parser: argparse.ArgumentParser) -> 
                 parser.error(f"{name} must be finite")
     if not visual_only and args.no_captioner:
         parser.error("V7.7 phase inference requires the tactile captioner")
+    warmup_timeout = getattr(args, "tactile_warmup_timeout_seconds", 10.0)
+    if not visual_only and (not np.isfinite(warmup_timeout) or warmup_timeout <= 0):
+        parser.error("--tactile-warmup-timeout-seconds must be finite and positive")
     if not args.norm_stats_file.is_file():
         parser.error(f"--norm-stats-file does not exist: {args.norm_stats_file}")
     if args.max_attempts < 1:

@@ -111,6 +111,7 @@ class TactileWindowBuffer:
         self._frames: deque[TactileFrame] = deque(maxlen=self.window_size)
         self._latest: dict[str, np.ndarray] = {}
         self._seen_since_frame: set[str] = set()
+        self._topic_update_counts = {key: 0 for key in _REQUIRED_KEYS}
         self._lock = threading.Lock()
 
     def __len__(self) -> int:
@@ -126,6 +127,20 @@ class TactileWindowBuffer:
             self._frames.clear()
             self._latest.clear()
             self._seen_since_frame.clear()
+            self._topic_update_counts = {key: 0 for key in _REQUIRED_KEYS}
+
+    def status(self) -> dict[str, Any]:
+        """Return one locked snapshot of window progress and six-topic arrival counts."""
+        with self._lock:
+            return {
+                "ready": len(self._frames) >= self.window_size,
+                "complete_frames": len(self._frames),
+                "required_frames": self.window_size,
+                "missing_topics": sorted(_REQUIRED_KEYS.difference(self._latest)),
+                "waiting_topics": sorted(_REQUIRED_KEYS.difference(self._seen_since_frame)),
+                "topic_update_counts": dict(self._topic_update_counts),
+                "last_frame_timestamp": self._frames[-1].timestamp if self._frames else None,
+            }
 
     def push_topic(self, key: str, data: Any, *, layout: Any = None, timestamp: float | None = None) -> bool:
         """Push one ROS topic update.
@@ -138,6 +153,7 @@ class TactileWindowBuffer:
         grid = reshape_tactile_grid(data, layout=layout, grid_shape=self.grid_shape)
         with self._lock:
             self._latest[key] = grid
+            self._topic_update_counts[key] += 1
             self._seen_since_frame.add(key)
             if not _REQUIRED_KEYS.issubset(self._latest) or not _REQUIRED_KEYS.issubset(self._seen_since_frame):
                 return False

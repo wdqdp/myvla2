@@ -142,6 +142,61 @@ def _latest_tactile_timestamp(operator: Any) -> float | None:
     return float(timestamp) if timestamp is not None else None
 
 
+def _require_tactile_captioner(operator: Any, captioner: Any) -> None:
+    if captioner is None:
+        raise FailClosedError("Touch-based classification requires an enabled tactile captioner")
+    if getattr(operator, "tactile", None) is None:
+        raise FailClosedError("Touch-based classification requires configured tactile topics")
+    buffer = getattr(operator.tactile, "buffer", operator.tactile)
+    if getattr(captioner, "window_size", 30) != 30 or getattr(buffer, "window_size", 30) != 30:
+        raise FailClosedError("Touch-based classification requires captioner and buffer window_size=30")
+
+
+def _tactile_status(operator: Any) -> dict[str, Any]:
+    tactile = getattr(operator, "tactile", None)
+    if tactile is None:
+        return {"ready": False, "error": "tactile buffer is not configured"}
+    buffer = getattr(tactile, "buffer", tactile)
+    status = getattr(buffer, "status", None)
+    if not callable(status):
+        return {"ready": bool(tactile.ready), "last_frame_timestamp": _latest_tactile_timestamp(operator)}
+    result = status()
+    topics = getattr(tactile, "topics", None)
+    if topics is not None:
+        for key in ("missing_topics", "waiting_topics"):
+            result[key] = [getattr(topics, name, name) for name in result[key]]
+        result["topic_update_counts"] = {
+            getattr(topics, name, name): count for name, count in result["topic_update_counts"].items()
+        }
+    return result
+
+
+def _wait_for_tactile_ready(args, operator, captioner, *, poll_control=None) -> bool:
+    """Bound W30 startup warmup before any model action is published."""
+    _require_tactile_captioner(operator, captioner)
+    timeout = float(getattr(args, "tactile_warmup_timeout_seconds", args.phase_change_timeout_seconds))
+    if not np.isfinite(timeout) or timeout <= 0:
+        raise ValueError("tactile warmup timeout must be finite and positive")
+    started, last_log = time.monotonic(), float("-inf")
+    rate = operator.rate(args.observation_poll_rate)
+    while not operator.is_shutdown() and not runtime.shutdown_event.is_set():
+        if poll_control is not None:
+            poll_control()
+        if operator.is_shutdown() or runtime.shutdown_event.is_set():
+            return False
+        if operator.tactile.ready:
+            print(f"[TACTILE] ready: {_tactile_status(operator)}", flush=True)
+            return True
+        now = time.monotonic()
+        if now - started >= timeout:
+            raise FailClosedError(f"Timed out after {timeout:g}s waiting for W30 tactile warmup: {_tactile_status(operator)}")
+        if now - last_log >= 1.0:
+            print(f"[TACTILE] warming up: {_tactile_status(operator)}", flush=True)
+            last_log = now
+        rate.sleep()
+    return False
+
+
 def _capture_classification_observation(
     args: argparse.Namespace,
     operator: Any,
@@ -150,11 +205,23 @@ def _capture_classification_observation(
     after_timestamp: float,
 ) -> tuple[v52.FrozenObservation, dict[str, float]]:
     """Wait for front/left/qpos/tactile that are all newer than the H100 tail."""
+    _require_tactile_captioner(operator, captioner)
     rate = operator.rate(args.observation_poll_rate)
     started = time.monotonic()
+    last_log = float("-inf")
     while not operator.is_shutdown() and not runtime.shutdown_event.is_set():
         if time.monotonic() - started > args.phase_change_timeout_seconds:
-            raise FailClosedError("Timed out waiting for fresh classification observation")
+            raise FailClosedError(
+                f"Timed out waiting for fresh classification observation after_timestamp={after_timestamp}; "
+                f"tactile={_tactile_status(operator)}"
+            )
+        if not operator.tactile.ready and not isinstance(operator, runtime.ReplayOperator):
+            now = time.monotonic()
+            if now - last_log >= 1.0:
+                print(f"[TACTILE] warming up before classification: {_tactile_status(operator)}", flush=True)
+                last_log = now
+            rate.sleep()
+            continue
         if isinstance(operator, runtime.ReplayOperator):
             front, left, joint = runtime.get_ros_observation(args, operator, after_timestamp=after_timestamp)
             timestamp = v52._joint_timestamp(joint)
@@ -163,9 +230,13 @@ def _capture_classification_observation(
             if not operator.img_front_deque or not operator.img_left_deque or not operator.puppet_arm_deque:
                 rate.sleep()
                 continue
-            front_msg = operator.img_front_deque[-1]
-            left_msg = operator.img_left_deque[-1]
-            joint = operator.puppet_arm_deque[-1]
+            try:
+                front_msg = operator.img_front_deque[-1]
+                left_msg = operator.img_left_deque[-1]
+                joint = operator.puppet_arm_deque[-1]
+            except IndexError:
+                rate.sleep()
+                continue
             stamps = {
                 "front": float(front_msg.header.stamp.to_sec()),
                 "left": float(left_msg.header.stamp.to_sec()),
@@ -180,8 +251,9 @@ def _capture_classification_observation(
         if tactile_timestamp is None or tactile_timestamp <= after_timestamp:
             rate.sleep()
             continue
-        if captioner is None or operator.tactile is None or not operator.tactile.ready:
-            raise RuntimeError("V5.3 classification requires a ready 30-frame tactile captioner")
+        if not operator.tactile.ready:
+            rate.sleep()
+            continue
         qpos = np.asarray(joint.position, dtype=np.float32)
         if getattr(args, "use_state_history", True):
             history, mask = operator.get_state_history(joint)
