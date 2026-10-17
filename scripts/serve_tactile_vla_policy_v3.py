@@ -286,16 +286,23 @@ class TactileVLAPolicyV3:
             delta_action_dims=args.output_action_dim,
         )
 
-        backbone = model_config.create(jax.random.key(0))
-        model = StageBV3Model(
-            backbone,
-            paligemma_width=openpi_gemma.get_config(model_config.paligemma_variant).width,
-            need_hidden_dim=int(config.get("need_hidden_dim", 512)),
-            need_dropout=float(config.get("need_dropout", 0.1)),
-            rngs=nnx.Rngs(jax.random.key(1)),
-        )
+        def create_model(backbone_key, heads_key):
+            return StageBV3Model(
+                model_config.create(backbone_key),
+                paligemma_width=openpi_gemma.get_config(model_config.paligemma_variant).width,
+                need_hidden_dim=int(config.get("need_hidden_dim", 512)),
+                need_dropout=float(config.get("need_dropout", 0.1)),
+                rngs=nnx.Rngs(heads_key),
+            )
+
+        if getattr(args, "abstract_model_init", False):
+            logging.info("Building model shape template without allocating random model parameters")
+            model = nnx.eval_shape(create_model, jax.random.key(0), jax.random.key(1))
+        else:
+            model = create_model(jax.random.key(0), jax.random.key(1))
         graphdef, state = nnx.split(model)
         dtype = jnp.bfloat16 if model_config.dtype == "bfloat16" else jnp.float32
+        logging.info("Restoring checkpoint parameters from %s", args.checkpoint)
         params = openpi_model.restore_params(_params_dir(args.checkpoint), dtype=dtype)
         at.check_pytree_equality(
             expected=state.to_pure_dict(),
