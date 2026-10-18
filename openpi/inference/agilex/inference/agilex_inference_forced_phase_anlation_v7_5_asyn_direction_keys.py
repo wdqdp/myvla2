@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""V7.6 async inference with keyboard-selected horizontal recovery plans."""
+"""V7.5/V7.6 async inference with keyboard-selected horizontal recovery plans."""
 
 # ruff: noqa: E402, SLF001
 
@@ -26,10 +26,10 @@ sys.path.insert(0, str(OPENPI_ROOT / "packages" / "openpi-client" / "src"))
 
 import agilex_inference_forced_phase_anlation as v52
 import agilex_inference_forced_phase_anlation_v7_5_asyn as implementation
+from tactile_vla.vla.v7_5_adjustment_end_data import DATA_PROFILE as V7_5_DATA_PROFILE
 from tactile_vla.vla.v7_6_adjustment_end_data import DATA_PROFILE as V7_6_DATA_PROFILE
 
-# Reuse the proven V7.5 online H100 implementation with the V7.6 model identity.
-implementation.DATA_PROFILE = V7_6_DATA_PROFILE
+_validate_h100_server_metadata = implementation.validate_server_metadata
 
 Phase = Literal["execution", "adjustment"]
 DEFAULT_LOG_ROOT = PROJECT_ROOT / "outputs/runtime/forced_phase_ablation_v7_6_async_direction_keys"
@@ -46,6 +46,15 @@ FIXED_SELECTION_OPTIONS = (
     "--forced-recovery-plan",
 )
 ROLLING_QPOS_BUFFER_FRAMES = 100
+
+
+def validate_server_metadata(args: argparse.Namespace, metadata: dict[str, Any]) -> None:
+    """Accept only the two supported classifier identities and validate H100."""
+
+    profile = metadata.get("adjustment_end_data_profile")
+    if profile not in (V7_5_DATA_PROFILE, V7_6_DATA_PROFILE):
+        raise ValueError(f"Direction-key client requires a V7.5 or V7.6 classifier, got {profile!r}")
+    _validate_h100_server_metadata(args, metadata, expected_data_profile=profile)
 
 
 def _select_adjustment(args: argparse.Namespace, key: str) -> None:
@@ -129,7 +138,7 @@ def run_v7_5_async_direction_keys(
     keyboard: Any,
     logger: Any,
 ) -> None:
-    """Run async V7.6 with one continuous H100 feedback window across phases."""
+    """Run async V7.5/V7.6 with one continuous H100 feedback window across phases."""
 
     action_metadata = action_policy.get_server_metadata()
     classification_metadata = classification_policy.get_server_metadata()
@@ -152,7 +161,7 @@ def run_v7_5_async_direction_keys(
         }
     )
     print(
-        "V7.6 async direction controls: "
+        "V7.5/V7.6 async direction controls: "
         "a=left moderately, s=left slightly, d=right slightly, "
         "f=right moderately, q=quit; SPACE is disabled. "
         f"adjustment_end target rate={args.adjustment_end_rate_hz:g}Hz, "
@@ -397,15 +406,15 @@ def main() -> None:
         _keyboard_selection_validate_args(original_validate, args, parser)
 
     implementation.DEFAULT_LOG_ROOT = DEFAULT_LOG_ROOT
-    # V7.6 reuses the V7.5 online H100 construction, but the server identity is
-    # the counterfactual V7.6 classifier profile.
-    implementation.DATA_PROFILE = V7_6_DATA_PROFILE
+    # Both classifiers use the same online H100 prompt. Validate the supported
+    # identity returned by the server without changing the shared client's default.
+    implementation.validate_server_metadata = validate_server_metadata
     implementation.base._poll_key = _poll_key
     implementation.v52._poll_control_key = _poll_control_key
     implementation.base.validate_args = validate_args
     implementation.base.run_v5_3_async = run_v7_5_async_direction_keys
     print(
-        "V7.6 async direction controls: "
+        "V7.5/V7.6 async direction controls: "
         "a=left moderately, s=left slightly, d=right slightly, "
         "f=right moderately, q=quit; SPACE is disabled."
     )

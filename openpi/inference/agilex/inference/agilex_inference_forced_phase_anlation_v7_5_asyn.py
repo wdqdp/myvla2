@@ -117,7 +117,9 @@ def _remap_classification_gripper(
     return mapped, int(np.count_nonzero(mask))
 
 
-def validate_server_metadata(args, metadata: dict[str, Any]) -> None:
+def validate_server_metadata(
+    args, metadata: dict[str, Any], *, expected_data_profile: str | None = None
+) -> None:
     expected = {
         "supports_action_noise": True,
         "requires_action_noise": True,
@@ -140,7 +142,7 @@ def validate_server_metadata(args, metadata: dict[str, Any]) -> None:
         "state_history_len": 0,
         "state_history_dim": 7,
         "use_state_history": False,
-        "adjustment_end_data_profile": DATA_PROFILE,
+        "adjustment_end_data_profile": DATA_PROFILE if expected_data_profile is None else expected_data_profile,
     }
     mismatch = {key: (metadata.get(key), value) for key, value in expected.items() if metadata.get(key) != value}
     if mismatch:
