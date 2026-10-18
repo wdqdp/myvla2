@@ -21,7 +21,7 @@ def main() -> None:
         "/data1/qxh/tac_vla_new/tac_data/demon_data/black_box/outputs/rotation_v4_1_new_env/norm_stats/norm_stats.json"
     )
     runtime.DEFAULT_LOG_ROOT = PROJECT_ROOT / "outputs/runtime/v7_7_2_async"
-    runtime.main()
+    runtime.main(record_adjustment_raw=True)
 
 
 if __name__ == "__main__":

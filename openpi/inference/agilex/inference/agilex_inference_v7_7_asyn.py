@@ -35,6 +35,7 @@ import agilex_inference_forced_phase_anlation as v52
 import agilex_inference_forced_phase_anlation_5_3 as v53
 import agilex_inference_tactile_vla_sync_single as runtime
 from openpi_client import msgpack_numpy
+from tactile_vla.runtime.adjustment_raw_log import AdjustmentRawRecorder
 from tactile_vla.vla.prompts import MINIMAL_PROMPT_PROFILE
 from tactile_vla.vla.prompts import build_recovery_prompt
 from tactile_vla.vla.prompts import update_failure_recovery_memory
@@ -295,6 +296,8 @@ class PhaseAssessmentResult(NamedTuple):
     events: list[dict[str, Any]]
     submitted_monotonic: float
     finished_monotonic: float
+    observation_ready_monotonic: float | None = None
+    decision_received_monotonic: float | None = None
 
     @property
     def decision(self) -> dict[str, Any]:
@@ -342,6 +345,7 @@ def _run_phase_assessment(
     observation, timestamps = v53._capture_classification_observation(
         args, operator, captioner, after_timestamp=after_timestamp,
     )
+    observation_ready = time.monotonic()
     dense_h100, _ = operator.state_history.snapshot(
         current_timestamp=float(observation.timestamp), current_state=observation.qpos,
     )
@@ -372,7 +376,10 @@ def _run_phase_assessment(
         "generation": generation, "action_step": captured_step,
     })
     events = []
+    decision_received = None
     for event in client.events(payload):
+        if event.get("event") == "phase_decision":
+            decision_received = time.monotonic()
         gate.handle_phase_event(event)
         events.append(event)
     if not events:
@@ -384,6 +391,8 @@ def _run_phase_assessment(
         prompt=prompt, qpos_h100_11_discrete=discrete.tolist(), events=events,
         submitted_monotonic=submitted_monotonic,
         finished_monotonic=time.monotonic(),
+        observation_ready_monotonic=observation_ready,
+        decision_received_monotonic=decision_received,
     )
 
 
@@ -407,6 +416,8 @@ def _request_action_chunk(
         "action_noise": noise, "noise_seed": args.noise_seed,
         "noise_phase": phase, "noise_index": phase_index,
     })
+    logger.record({"event": "action_chunk_inference_start", "phase": phase,
+                   "phase_index": phase_index, "recovery_plan": recovery_plan})
     started = time.perf_counter()
     response = policy.infer_with_timeout(payload, timeout=args.request_timeout_seconds)
     actions = np.asarray(response.get("actions"), dtype=np.float32)
@@ -457,6 +468,19 @@ def _phase_result_log(result: PhaseAssessmentResult, *, handled_step: int) -> di
         "need_recovery_probs": decision.get("need_recovery_probs"),
         "adjustment_end": decision.get("adjustment_end"),
         "adjustment_end_probs": decision.get("adjustment_end_probs"),
+        "events": result.events,
+        "capture_caption_ms": (
+            (result.observation_ready_monotonic - result.submitted_monotonic) * 1000.0
+            if result.observation_ready_monotonic is not None else None
+        ),
+        "decision_latency_ms": (
+            (result.decision_received_monotonic - result.submitted_monotonic) * 1000.0
+            if result.decision_received_monotonic is not None else None
+        ),
+        "failure_after_decision_ms": (
+            (result.finished_monotonic - result.decision_received_monotonic) * 1000.0
+            if result.decision_received_monotonic is not None and bool(decision.get("need_recovery")) else None
+        ),
         "total_async_ms": (result.finished_monotonic - result.submitted_monotonic) * 1000.0,
     }
 
@@ -465,11 +489,14 @@ def run_v7_7_async(
     args: argparse.Namespace, operator: Any, action_policy: v53.TimeoutWebsocketPolicy,
     phase_client: StreamingPhaseClient, captioner: Any, keyboard: Any,
     logger: v52.TrialLogger,
+    *, raw_trace: AdjustmentRawRecorder | None = None,
 ) -> None:
     action_metadata = action_policy.get_server_metadata()
     validate_server_metadata(action_metadata)
     if action_metadata != phase_client.metadata:
         raise ValueError("V7.7 action and phase connections expose different metadata")
+    if raw_trace is not None:
+        raw_trace.start(args, action_metadata)
     args.use_state_history = False
     stats = load_state_quantiles(args.norm_stats_file)
     recovery_plan = ""
@@ -576,6 +603,11 @@ def run_v7_7_async(
                 return False, False
             if result.phase == "adjustment":
                 print("[PHASE] adjustment_end=true; holding and switching to EXECUTION.")
+                if raw_trace is not None:
+                    raw_trace.on_adjustment_end(
+                        request_id=result.request_id, attempt_id=active_attempt,
+                        probs=result.decision.get("adjustment_end_probs"),
+                    )
                 gate.switch_phase("execution")
                 last_phase_submit["execution"] = None
                 pending_observation = None
@@ -594,6 +626,8 @@ def run_v7_7_async(
                 print("need_recovery=true at max_attempts; remaining stopped.")
                 logger.record({"event": "max_attempts_reached", "attempt_id": active_attempt,
                                "failure_reason": failure_reason})
+                if raw_trace is not None:
+                    raw_trace.mark_stop("max_attempts_reached")
                 return False, True
             plan_payload, updated_memory = plan_payload_after_failure(
                 instruction=args.instruction,
@@ -604,6 +638,9 @@ def run_v7_7_async(
                 wrist_image=runtime.prepare_rgb(result.observation.img_left),
                 qpos=result.observation.qpos,
             )
+            logger.record({"event": "plan_inference_start", "attempt_id": active_attempt,
+                           "failure_reason": failure_reason, "plan_prompt": plan_payload["prompt"]})
+            plan_started = time.monotonic()
             plan_future = executor.submit(
                 action_policy.infer_with_timeout, plan_payload,
                 timeout=args.request_timeout_seconds,
@@ -622,6 +659,7 @@ def run_v7_7_async(
                 "failure_reason": failure_reason, "recovery_plan": recovery_plan,
                 "memory": memory, "plan_prompt": plan_payload["prompt"],
                 "server_plan_infer_ms": plan_response.get("policy_timing", {}).get("infer_ms"),
+                "client_plan_infer_ms": (time.monotonic() - plan_started) * 1000.0,
             })
             gate.switch_phase("adjustment", increment_attempt=True)
             last_phase_submit["adjustment"] = None
@@ -690,10 +728,14 @@ def run_v7_7_async(
                     runtime.shutdown_event.set()
                     logger.record({"event": "operator_quit", "phase": phase,
                                    "published_steps": published_steps})
+                    if raw_trace is not None:
+                        raw_trace.mark_stop("operator_quit")
                     return
                 if key == args.success_key:
                     logger.record({"event": "operator_success", "phase": phase,
                                    "published_steps": published_steps})
+                    if raw_trace is not None:
+                        raw_trace.mark_stop("operator_success")
                     print("Operator confirmed success.")
                     return
                 raw_action = np.asarray(action_value, dtype=np.float32)
@@ -704,12 +746,23 @@ def run_v7_7_async(
                 )
                 _, before_timestamp = v52._latest_feedback(operator)
                 command_timestamp: list[float | None] = [None]
+                publication_context = {
+                    "phase": phase, "attempt_id": attempt_id, "recovery_plan": recovery_plan,
+                    "generation": action_generation, "phase_index": phase_index,
+                    "action_index": action_index,
+                }
 
-                def publish(value, timestamp_slot=command_timestamp):
+                def publish(value, timestamp_slot=command_timestamp, context=publication_context):
                     if args.no_publish:
                         runtime.published_actions_history.append(np.asarray(value).copy())
                     else:
+                        before = raw_trace.snapshot() if raw_trace is not None else None
                         timestamp_slot[0] = operator.puppet_arm_publish(value)
+                        if raw_trace is not None:
+                            raw_trace.on_publish(
+                                **context, command=value,
+                                command_timestamp=timestamp_slot[0], before=before,
+                            )
                         runtime.published_actions_history.append(np.asarray(value).copy())
 
                 if not gate.try_publish_action(command, generation=action_generation, publish=publish):
@@ -720,6 +773,8 @@ def run_v7_7_async(
                 )
                 hold_target[0] = feedback.copy()
                 last_feedback_timestamp = feedback_timestamp
+                if raw_trace is not None and not args.no_publish:
+                    raw_trace.on_feedback_after_action(feedback, feedback_timestamp)
                 completed += 1
                 published_steps += 1
                 logger.record({
@@ -743,6 +798,8 @@ def run_v7_7_async(
             })
 
         logger.record({"event": "max_publish_step_reached", "published_steps": published_steps})
+        if raw_trace is not None:
+            raw_trace.mark_stop("max_publish_step_reached" if published_steps >= args.max_publish_step else "shutdown")
 
 
 def get_arguments(argv: list[str] | None = None) -> tuple[argparse.Namespace, argparse.ArgumentParser]:
@@ -843,7 +900,7 @@ def validate_args(args: argparse.Namespace, parser: argparse.ArgumentParser) -> 
         parser.error("success/quit keys must be distinct single characters")
 
 
-def main() -> None:
+def main(*, record_adjustment_raw: bool = False) -> None:
     args, parser = get_arguments()
     runtime.apply_yaml_defaults(args, parser)
     validate_args(args, parser)
@@ -860,6 +917,8 @@ def main() -> None:
     if trial_id and (args.log_dir.resolve() / trial_id).exists():
         trial_id = f"{trial_id}_{time.strftime('%Y%m%d_%H%M%S')}"
     logger = v52.TrialLogger(args.log_dir, trial_id=trial_id)
+    raw_trace = None
+    trace_exit_reason = "run_returned"
     print(f"Trial log directory: {logger.directory}")
     if args.classification_gripper_open_threshold is not None:
         print(
@@ -868,13 +927,24 @@ def main() -> None:
             f"{args.classification_gripper_open_value:.6f}."
         )
     try:
+        if record_adjustment_raw:
+            raw_trace = AdjustmentRawRecorder(
+                logger.directory, operator,
+                urdf_path=OPENPI_ROOT / "inference/agilex/Piper_ros_private-ros-noetic/"
+                "src/piper_description/urdf/piper_description.urdf",
+            )
         if not args.start_immediately:
             input("Press enter to start V7.7 EXECUTION")
         with runtime.KeyboardPoller() as keyboard:
             run_v7_7_async(
                 args, operator, action_policy, phase_client, captioner, keyboard, logger,
+                raw_trace=raw_trace,
             )
+    except KeyboardInterrupt:
+        trace_exit_reason = "keyboard_interrupt"
+        raise
     except Exception as exc:
+        trace_exit_reason = f"exception:{type(exc).__name__}:{exc}"
         logger.record({"event": "fail_closed_safety_stop", "error": repr(exc)})
         feedback, _ = v52._latest_feedback(operator)
         if feedback is not None and not args.no_publish:
@@ -884,10 +954,17 @@ def main() -> None:
         print(f"FAIL-CLOSED safety stop: {exc}. No more model actions will be published.")
         raise
     finally:
-        phase_client.close()
-        close = getattr(getattr(action_policy, "_ws", None), "close", None)
-        if callable(close):
-            close()
+        try:
+            if raw_trace is not None:
+                try:
+                    raw_trace.finish(trace_exit_reason)
+                finally:
+                    raw_trace.close()
+        finally:
+            phase_client.close()
+            close = getattr(getattr(action_policy, "_ws", None), "close", None)
+            if callable(close):
+                close()
 
 
 __all__ = [
