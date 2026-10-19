@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Offline FK distances from the V7.7.2 adjustment recording copy."""
+"""Offline FK distances from compatible V7.7.2/V7.9 adjustment recordings."""
 
 # ruff: noqa: E402
 from __future__ import annotations
@@ -77,7 +77,7 @@ def calculate(trial, boundary, max_age_ms):
     records, issues = load_records(trial / "adjustment_measurements.jsonl")
     metadata_rows = [r for r in records if r.get("event") == "run_start"]
     if len(metadata_rows) != 1 or metadata_rows[0].get("schema_version") != SCHEMA:
-        raise ValueError("Expected one V7.7.2 adjustment measurement run_start record")
+        raise ValueError(f"Expected one adjustment measurement run_start with schema {SCHEMA!r}")
     meta = metadata_rows[0]
     if meta.get("no_publish"):
         raise ValueError("This was a --no-publish run; physical distance statistics are not applicable")

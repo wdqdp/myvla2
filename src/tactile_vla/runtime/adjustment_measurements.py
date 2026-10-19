@@ -16,7 +16,7 @@ SCHEMA = "v7_7_2_adjustment_measurements_v1"
 
 
 class AdjustmentMeasurements:
-    """Small boundary records only; disk IO runs outside the control thread."""
+    """Save raw boundaries and optional action feedback with background disk IO."""
 
     def __init__(self, directory: Path, *, urdf: Path, args, metadata):
         contents = urdf.read_bytes()
@@ -82,6 +82,10 @@ class AdjustmentMeasurements:
         except Full as exc:
             self._error = RuntimeError("Adjustment measurement queue is full")
             raise self._error from exc
+
+    def point(self, event, point, **fields):
+        """Enqueue a raw height/trajectory keypoint without doing online FK."""
+        self._record(event, point=point, **fields)
 
     def observe(self, event, point):
         kind = event.get("event")
