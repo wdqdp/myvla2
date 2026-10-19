@@ -17,8 +17,8 @@ PROJECT = Path(__file__).resolve().parents[1]
 sys.path[:0] = [str(PROJECT), str(PROJECT / 'src'), str(PROJECT / 'openpi/src')]
 
 
-def parse_args(argv=None):
-    p = argparse.ArgumentParser(description=__doc__)
+def parse_args(argv=None, *, description=__doc__):
+    p = argparse.ArgumentParser(description=description)
     p.add_argument('--output-dir', type=Path)
     p.add_argument('--dry-run', action='store_true')
     p.add_argument('--wait-for-gpus', action='store_true', help='Wait until BOTH GPUs have no compute processes; never kill jobs')
@@ -77,11 +77,14 @@ def wait_for_gpus(args, runner):
     return False
 
 
-def run_phases(phases, runner):
+def run_phases(phases, runner, *, description='GPU6 A/C; GPU7 B/D', before_phase=None):
     results = []
     # Global barrier: no test starts unless ALL FOUR training jobs have succeeded.
     for stage in ('train', 'test'):
-        print(f'=== {stage.upper()}: GPU6 A/C; GPU7 B/D ===', flush=True)
+        if before_phase is not None and before_phase(stage) is False:
+            results.append({'phase': stage, 'returncode': 130, 'error': 'Phase start cancelled'})
+            break
+        print(f'=== {stage.upper()}: {description} ===', flush=True)
         with ThreadPoolExecutor(max_workers=2) as executor:
             futures = [executor.submit(runner.run_group, lane) for lane in phases[stage]]
             phase = []
