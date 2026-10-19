@@ -162,14 +162,19 @@ def resolve_deployment(args, identity):
 class BookV96Policy(base.V77Policy):
     def __init__(self, *, args, config, model_config, norm_stats, identity, deployment):
         old_profile = base.DATA_PROFILE
-        old_prompt_profile = base.PROMPT_PROFILE
         base.DATA_PROFILE = config["data_profile"]
-        base.PROMPT_PROFILE = PROMPT_PROFILE
         try:
-            super().__init__(args=args, config=config, model_config=model_config, norm_stats=norm_stats)
+            # The parent's default prompt_profile was bound when its function
+            # was defined; pass the V9.6 protocol explicitly.
+            super().__init__(
+                args=args,
+                config=config,
+                model_config=model_config,
+                norm_stats=norm_stats,
+                prompt_profile=PROMPT_PROFILE,
+            )
         finally:
             base.DATA_PROFILE = old_profile
-            base.PROMPT_PROFILE = old_prompt_profile
         actual_sha = parameter_tree_sha256(base.v3.nnx.state(self._model))
         if actual_sha != identity["full_params_sha256"]:
             raise ValueError("Restored Book V9.6 parameter-tree SHA256 differs from export")
