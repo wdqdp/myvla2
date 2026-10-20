@@ -217,6 +217,7 @@ def calculate_heights(trial, max_age_ms, *, height_baseline="marker", lift_start
     return {
         "schema_version": f"v7_7_2_{'sync' if mode == 'synchronous' else 'async'}_failure_measurements_summary_v1",
         "measurement_mode": mode,
+        "phase_history_sampling": recorded_args.get("phase_history_sampling"),
         "reference_frame": chain.base_link, "measurement_point": chain.end_link,
         "tcp_offset_applied": False, "height_unit": "mm", "max_feedback_age_ms": max_age_ms,
         "failure_definition": (

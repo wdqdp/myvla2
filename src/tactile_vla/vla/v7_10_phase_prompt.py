@@ -7,6 +7,7 @@ from collections.abc import Sequence
 import numpy as np
 
 from tactile_vla.vla.v7_7_phase_prompt import TimelinePoint, compact_history, uniform_positions
+from tactile_vla.vla.v7_7_phase_prompt import build_phase_prompt as build_source_phase_prompt
 
 WINDOW_FRAMES = {"0s": 1, "1s": 31, "2s": 61}
 HISTORY_POINTS = 11
@@ -84,3 +85,9 @@ def replace_history(prompt: str, values, window: str) -> str:
     if not prefix.startswith("Mode: phase\n"):
         raise ValueError("V7.10 history substitution only accepts phase prompts")
     return prefix + history_prefix(window) + compact_history(values)
+
+
+def build_phase_prompt(*, window: str, qpos_h100_11_discrete, **fields) -> str:
+    """Adapt the shared runtime's keyword to the exact V7.10 training text."""
+    original = build_source_phase_prompt(qpos_h100_11_discrete=qpos_h100_11_discrete, **fields)
+    return replace_history(original, qpos_h100_11_discrete, window)

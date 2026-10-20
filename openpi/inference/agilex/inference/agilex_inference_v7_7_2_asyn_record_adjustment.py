@@ -12,6 +12,8 @@ import sys
 import threading
 import time
 
+import numpy as np
+
 SCRIPT_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = Path(__file__).resolve().parents[4]
 sys.path[:0] = [str(SCRIPT_DIR), str(PROJECT_ROOT / "src"), str(PROJECT_ROOT / "openpi/src")]
@@ -188,6 +190,9 @@ def main(
     controller=None,
     measurements_type=AdjustmentMeasurements,
     gate_factory=None,
+    phase_history_window_frames=100,
+    phase_history_training_policy=None,
+    record_lift=None,
 ):
     # Versioned entries share the recording hooks and unchanged async controller.
     shared.DATA_PROFILE = data_profile
@@ -203,7 +208,39 @@ def main(
     args, parser = (argument_parser or shared.get_arguments)()
     shared.runtime.apply_yaml_defaults(args, parser)
     shared.validate_args(args, parser)
-    args.asynchronous_lift_measurements = controller is None and data_profile == DATA_PROFILE
+    offsets = shared.phase_history_sample_offsets(phase_history_window_frames)
+    args.phase_history_window_frames = phase_history_window_frames
+    if phase_history_window_frames != 100:
+        if not np.isfinite(args.state_history_fps):
+            parser.error("--state-history-fps must be finite")
+        args.phase_history_sampling = {
+            "method": "uniform_recent_dense_window_v1",
+            "window_frames": phase_history_window_frames,
+            "sampled_points": len(offsets),
+            "h100_sample_offsets": offsets.tolist(),
+            "window_sample_offsets": (offsets - (100 - phase_history_window_frames)).tolist(),
+            "history_grid_fps": args.state_history_fps,
+            "nominal_window_span_seconds": (phase_history_window_frames - 1) / args.state_history_fps,
+            "trained_history_frames": 100,
+            "prompt_profile": shared.PROMPT_PROFILE,
+            "prompt_history_label": "H100",
+        }
+        if phase_history_training_policy is not None:
+            if phase_history_training_policy["history_frames"] != phase_history_window_frames:
+                parser.error("Runtime history window differs from its training policy")
+            args.phase_history_sampling.update(
+                trained_history_frames=phase_history_window_frames,
+                prompt_history_label=f"H{phase_history_window_frames}",
+                training_history_policy=phase_history_training_policy,
+            )
+        print(
+            f"[PHASE HISTORY] recent {phase_history_window_frames} dense frames -> 11 points; "
+            f"H100 offsets={offsets.tolist()}; prompt={args.phase_history_sampling['prompt_history_label']}.",
+            flush=True,
+        )
+    args.asynchronous_lift_measurements = (
+        controller is None and data_profile == DATA_PROFILE if record_lift is None else record_lift
+    )
     if args.asynchronous_lift_measurements and "b" in {args.success_key, args.quit_key}:
         parser.error("Key b is reserved for marking the pre-lift height baseline")
     if not sys.stdin.isatty():

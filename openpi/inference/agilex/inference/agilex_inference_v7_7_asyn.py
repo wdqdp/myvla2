@@ -309,6 +309,7 @@ class PhaseAssessmentResult(NamedTuple):
     submitted_monotonic: float
     finished_monotonic: float
     qpos_h100_raw: list[list[float]] | None = None
+    phase_history_sampling: dict[str, Any] | None = None
 
     @property
     def decision(self) -> dict[str, Any]:
@@ -349,6 +350,13 @@ def validate_server_metadata(metadata: dict[str, Any]) -> None:
             raise ValueError(f"invalid server {key}={value}")
 
 
+def phase_history_sample_offsets(window_frames: int) -> np.ndarray:
+    """Sample 11 points, including now, from a recent dense H100 subwindow."""
+    if window_frames not in (1, 30, 31, 60, 61, 100):
+        raise ValueError(f"unsupported phase history window: {window_frames}")
+    return 100 - window_frames + np.linspace(0, window_frames - 1, 11, dtype=np.int64)
+
+
 def _assess_phase(
     *, args: argparse.Namespace, client: StreamingPhaseClient, operator: Any,
     captioner: Any, stats: StateQuantileStats, gate: V77AsyncControlGate,
@@ -366,10 +374,11 @@ def _assess_phase(
     )
     if dense_h100.shape != (100, 7):
         raise ValueError(f"runtime H100 must be [100,7], got {dense_h100.shape}")
+    window_frames = getattr(args, "phase_history_window_frames", 100)
+    sampled = phase_history_sample_offsets(window_frames)
     if visual_only:
         targets = float(observation.timestamp) + (np.arange(100) - 99) / args.state_history_fps
         before_start = targets < args.episode_start_timestamp - 1e-6
-        sampled = np.linspace(0, 99, 11, dtype=np.int64)
         missing = ~np.asarray(valid_mask, dtype=np.bool_)[sampled] & ~before_start[sampled]
         if missing.any():
             raise ValueError(f"Runtime H100 has missing ROS samples at offsets {sampled[missing].tolist()}; max_gap={args.state_history_max_gap_seconds}s")
@@ -382,7 +391,19 @@ def _assess_phase(
     mapped_current_qpos, _ = _remap_classification_qpos(
         observation.qpos, open_threshold=open_threshold, open_value=open_value,
     )
-    discrete = discretize_state_qpos(mapped_h100[np.linspace(0, 99, 11, dtype=np.int64)], stats)
+    discrete = discretize_state_qpos(mapped_h100[sampled], stats)
+    # Versioned entries choose the trained prompt builder; the H30/H60
+    # fixed-checkpoint entries retain H100 wording. Log the actual input window.
+    sampling = None
+    if window_frames != 100:
+        sampling = {
+            **args.phase_history_sampling,
+            "sampled_qpos_raw": dense_h100[sampled].tolist(),
+            "sampled_valid_mask": np.asarray(valid_mask, dtype=np.bool_)[sampled].tolist(),
+            "sample_target_ros_timestamps": (
+                float(observation.timestamp) + (sampled - 99) / args.state_history_fps
+            ).tolist(),
+        }
     phase_args = {"instruction": args.instruction, "recovery_plan": recovery_plan, "qpos_h100_11_discrete": discrete}
     prompt = (
         visual_prompts.build_phase_prompt(**phase_args)
@@ -413,6 +434,7 @@ def _assess_phase(
         submitted_monotonic=submitted_monotonic,
         finished_monotonic=time.monotonic(),
         qpos_h100_raw=dense_h100.tolist() if visual_only else None,
+        phase_history_sampling=sampling,
     )
 
 
@@ -527,7 +549,9 @@ def _phase_result_log(result: PhaseAssessmentResult, *, handled_step: int) -> di
         "lag_steps": max(0, handled_step - result.captured_step),
         "prompt": result.prompt,
         "qpos_h100_11_discrete": result.qpos_h100_11_discrete,
+        "qpos_history_11_discrete": result.qpos_h100_11_discrete,
         "qpos_h100_raw": result.qpos_h100_raw,
+        "phase_history_sampling": result.phase_history_sampling,
         "tactile_caption": result.observation.tactile_caption,
         "synchronized_timestamps": result.synchronized_timestamps,
         "need_recovery": decision.get("need_recovery"),
