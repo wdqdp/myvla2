@@ -26,9 +26,9 @@ from tactile_vla.vla.blackbox_ablation_v13_1_runtime import (
 
 
 def parse_args(argv=None, *, index_file=INDEX, output_dir=OUTPUT.parent / 'plan_v13_1',
-               run_prefix='pi05_blackbox_ablation_v13_1', description=__doc__):
+               run_prefix='pi05_blackbox_ablation_v13_1', description=__doc__, groups=GROUPS):
     p = argparse.ArgumentParser(description=description)
-    p.add_argument('--group', choices=GROUPS, required=True)
+    p.add_argument('--group', choices=groups, required=True)
     p.add_argument('--index-file', type=Path, default=index_file)
     p.add_argument('--stage-a-checkpoint', type=Path, default=STAGE_A)
     p.add_argument('--output-dir', type=Path, default=output_dir)
@@ -102,7 +102,7 @@ def resume_check(saved, current):
     # All input semantics and optimizer settings remain fixed; total steps may extend.
     for key in ('group', 'seed', 'batch_size', 'fsdp_devices', 'lr', 'weight_decay', 'grad_clip',
                 'max_token_len', 'precision', 'training_data_hash', 'stage_a_checkpoint', 'stage_a_metadata_sha256',
-                'experiment_version', 'qpos_input_protocol'):
+                'experiment_version', 'qpos_input_protocol', 'feedback_input_protocol', 'qpos_scope'):
         if saved.get(key) != current.get(key):
             raise ValueError(f'Resume mismatch: {key}')
 
