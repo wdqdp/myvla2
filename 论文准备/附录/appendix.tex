@@ -1,0 +1,315 @@
+% Section C content only; insert after Sections A and B of the appendix.
+% Tables use booktabs, tabularx, and array. No standalone document or preamble is included.
+
+\section{Complete Semantic Labels, Coordinate Conventions, and Text Examples}
+\label{sec:app_semantics}
+
+Touch, Failure, and Plan use fixed field orders. The placeholders \texttt{<label>}, \texttt{<direction>}, and \texttt{<degree>} denote labels, directions, and magnitudes, respectively.
+
+\subsection{Tactile Attributes and the Left Sensor Frame}
+\label{sec:app_touch}
+
+Table~\ref{tab:app_semantic_interfaces}(a) specifies the five Touch attributes, their template, and complete vocabulary.
+
+\begin{table*}[t]
+\centering
+\small
+\caption{Output templates and complete label vocabularies for (a) Touch, (b) Failure, and (c) Plan. Touch directions use the left finger sensor frame; Failure spatial labels and orientation errors use a fixed scene frame. Plan specifies action directions and shared magnitude labels.}
+\label{tab:app_semantic_interfaces}
+\begin{minipage}{\textwidth}
+\textbf{(a) Touch}\hfill\textit{Left-finger sensor frame}
+\vspace{4pt}
+
+{\footnotesize\ttfamily\raggedright
+Touch[area=<label>; Fx=<label>; Fy=<label>;\\
+\hspace*{3em}Fz=<label>; rotation=<label>]\par}
+\vspace{5pt}
+\setlength{\tabcolsep}{5pt}
+\renewcommand{\arraystretch}{1.15}
+\begin{tabularx}{\linewidth}{@{}p{0.20\linewidth}>{\raggedright\arraybackslash}X@{}}
+\toprule
+\textbf{Attribute / field} & \textbf{Valid labels} \\
+\midrule
+\texttt{area} & \texttt{none}, \texttt{small}, \texttt{medium}, \texttt{full} \\
+\texttt{Fx} & \texttt{negative}, \texttt{near\_zero}, \texttt{positive}, \texttt{pos\_neg}, \texttt{neg\_pos} \\
+\texttt{Fy} & \texttt{negative}, \texttt{near\_zero}, \texttt{positive}, \texttt{pos\_neg}, \texttt{neg\_pos} \\
+\texttt{Fz} & \texttt{near\_zero}, \texttt{negative}, \texttt{left\_stronger}, \texttt{right\_stronger} \\
+\texttt{rotation} & \texttt{none}, \texttt{clockwise}, \texttt{counterclockwise} \\
+\bottomrule
+\end{tabularx}
+\end{minipage}
+\par\vspace{8pt}
+\begin{minipage}{\textwidth}
+\textbf{(b) Failure}\hfill\textit{Fixed scene frame}
+\vspace{4pt}
+
+{\footnotesize\ttfamily\raggedright
+failure[grasp\_position=<label>; shear=<label>; grasp\_force=<label>;\\
+\hspace*{4em}grasp\_balance=<label>; rotate=<label>]\par}
+\vspace{5pt}
+\setlength{\tabcolsep}{5pt}
+\renewcommand{\arraystretch}{1.15}
+\begin{tabularx}{\linewidth}{@{}p{0.20\linewidth}>{\raggedright\arraybackslash}X@{}}
+\toprule
+\textbf{Attribute / field} & \textbf{Valid labels} \\
+\midrule
+\texttt{grasp\_position} & \texttt{too left}, \texttt{too right}, \texttt{too front}, \texttt{too back}, \texttt{too high}, \texttt{too low}, \texttt{appropriate} \\
+\texttt{shear} & \texttt{front}, \texttt{back}, \texttt{left}, \texttt{right}, \texttt{up}, \texttt{down}, \texttt{none} \\
+\texttt{grasp\_force} & \texttt{too small}, \texttt{too large}, \texttt{appropriate} \\
+\texttt{grasp\_balance} & \texttt{front}, \texttt{back}, \texttt{left}, \texttt{right}, \texttt{up}, \texttt{down}, \texttt{appropriate} \\
+\texttt{rotate} & \texttt{yaw\_pos}, \texttt{yaw\_neg}, \texttt{pitch\_pos}, \texttt{pitch\_neg}, \texttt{roll\_pos}, \texttt{roll\_neg}, \texttt{none} \\
+\bottomrule
+\end{tabularx}
+\end{minipage}
+\par\vspace{8pt}
+\begin{minipage}{\textwidth}
+\textbf{(c) Plan}\hfill\textit{Scene translation; wrist-axis rotation}
+\vspace{4pt}
+
+{\footnotesize\ttfamily\raggedright
+plan[horizontal=<direction> <degree>; vertical=<direction> <degree>;\\
+\hspace*{2.5em}rotate=<direction> <degree>; gripper\_distance=<direction> <degree>]\par}
+\vspace{5pt}
+\setlength{\tabcolsep}{5pt}
+\renewcommand{\arraystretch}{1.15}
+\begin{tabularx}{\linewidth}{@{}p{0.20\linewidth}>{\raggedright\arraybackslash}X@{}}
+\toprule
+\textbf{Attribute / field} & \textbf{Valid labels} \\
+\midrule
+\texttt{horizontal} & \texttt{front}, \texttt{back}, \texttt{left}, \texttt{right}, \texttt{none} \\
+\texttt{vertical} & \texttt{up}, \texttt{down}, \texttt{none} \\
+\texttt{rotate} & \texttt{clockwise}, \texttt{counterclockwise}, \texttt{none} \\
+\texttt{gripper\_distance} & \texttt{open}, \texttt{close}, \texttt{none} \\
+\midrule
+\textit{Shared degree} & \texttt{slightly}, \texttt{moderately}, \texttt{significantly} \\
+\bottomrule
+\end{tabularx}
+
+\vspace{2pt}
+{\footnotesize\raggedright
+Degree labels are shared by active fields; inactive fields use \texttt{none} alone.\par}
+\end{minipage}
+\end{table*}
+
+The \texttt{area} labels indicate increasing contact extent, with \texttt{none} denoting no contact. The \texttt{Fx}/\texttt{Fy} attributes describe paired tangential forces along the left sensor's local $X/Y$ axes: \texttt{positive}, \texttt{negative}, and \texttt{near\_zero} indicate forces that are both positive, both negative, or near zero. The labels \texttt{pos\_neg} and \texttt{neg\_pos} denote left-positive/right-negative and left-negative/right-positive combinations. Finger identities are fixed by mounting.
+
+Raw signals retain their respective frames; the shared left-sensor label reference does not imply identical sign tests on raw values. For normal force \texttt{Fz}, \texttt{near\_zero} indicates near-zero force, \texttt{negative} indicates negative force without a clear inter-finger magnitude difference, and \texttt{left\_stronger}/\texttt{right\_stronger} identifies the finger with clearly larger absolute negative force. Categories are annotated by human judgment without fixed numerical thresholds.
+
+The \texttt{rotation} labels use the left sensor's tactile viewpoint, with \texttt{none} indicating no clear in-plane rotation. Opposing sensors may observe opposite rotation directions; labels consistently use the left-sensor reference.
+
+\subsection{Global Failure Fields and the Scene Frame}
+\label{sec:app_failure}
+
+Table~\ref{tab:app_semantic_interfaces}(b) gives the Failure template and complete vocabulary.
+
+The fixed scene frame uses $+X$ toward the front camera, $+Y$ rightward in its view, and $+Z$ vertically upward; negative axes point backward, leftward, and downward. It does not rotate with the gripper.
+
+The fields \texttt{grasp\_position}, \texttt{shear}, and \texttt{grasp\_force} describe grasp-location error, the global direction of failures associated with same-direction tangential forces, and overall grasp force. The \texttt{grasp\_balance} field identifies the side of the grasp center with stronger contact, rather than a force-vector direction or fixed finger; force and balance can both be abnormal. The labels \texttt{appropriate} and \texttt{none} indicate a suitable state and absence of the corresponding failure, respectively.
+
+The \texttt{rotate} field describes orientation error relative to the target. Yaw/pitch/roll refer to fixed scene $Z/Y/X$ axes without prescribing an Euler-angle decomposition order. Signs follow the right-hand rule: viewed from an axis's positive end toward the origin, counterclockwise is positive and clockwise is negative; \texttt{none} indicates no clear rotational failure.
+
+\subsection{Recovery Action Fields and Magnitudes}
+\label{sec:app_plan}
+
+Table~\ref{tab:app_semantic_interfaces}(c) specifies the four Plan fields, direction labels, and shared magnitude vocabulary.
+
+The \texttt{horizontal}/\texttt{vertical} directions follow the fixed scene frame (Sec.~\ref{sec:app_failure}). The \texttt{rotate} field controls the terminal wrist rotation joint immediately preceding the gripper opening joint; clockwise/counterclockwise use a fixed viewpoint along that axis, distinct from Failure's scene-axis orientation errors. For \texttt{gripper\_distance}, \texttt{open}/\texttt{close} increase/decrease finger separation without directly setting grasp force.
+
+Active fields specify a direction and magnitude, and multiple fields may be active simultaneously. Inactive fields use \texttt{none} alone. Magnitudes are human-annotated qualitative categories without fixed distance, angle, or opening ranges.
+
+\subsection{Complete Text Examples}
+\label{sec:app_text_examples}
+
+Consider regrasping an object with an unknown center of mass. A reversal from the preceding failure \texttt{roll\_neg} to the current \texttt{roll\_pos} suggests that the previous correction may have overshot, motivating a smaller recovery. An illustrative output sequence is:
+\begin{quote}
+\footnotesize
+\begin{verbatim}
+Touch[area=medium; Fx=near_zero; Fy=near_zero;
+      Fz=negative; rotation=clockwise]
+
+failure[grasp_position=appropriate;
+        shear=none; grasp_force=appropriate;
+        grasp_balance=appropriate;
+        rotate=roll_pos]
+
+plan[horizontal=right slightly;
+     vertical=none; rotate=none;
+     gripper_distance=none]
+\end{verbatim}
+\end{quote}
+Here, \texttt{clockwise} and \texttt{roll\_pos} use the left-sensor and fixed scene $X$-axis references, respectively; their correspondence depends on the visually observed gripper pose.
+
+% D: dimensions verified in captioner/model.py, stage_b_v3_model.py,
+% v7_7_multitask_model.py, openpi/models/{pi0,gemma,siglip}.py.
+% Stage B values checked against the saved Bottle V11.2 config.json.
+% Stage A 15000 updates / batch 8 and 4 x A6000 (48 GB), End=0.9:
+% author-confirmed paper settings. Legacy checkpoint interfaces are not adopted.
+% Captioner output cardinalities follow Section C's paper vocabulary.
+
+\section{Network Configuration, Loss Details, and Training Parameters}
+\label{sec:app_network_training}
+
+\subsection{Network Configuration}
+
+Tables~\ref{tab:app_captioner_network} and~\ref{tab:app_vla_network} specify the tactile descriptor and VLA.
+
+\begin{table*}[t]
+\centering
+\small
+\caption{Tactile descriptor architecture. $K_j$ denotes the number of classes for attribute $j$.}
+\label{tab:app_captioner_network}
+\setlength{\tabcolsep}{5pt}
+\renewcommand{\arraystretch}{1.12}
+\begin{tabularx}{\textwidth}{@{}p{0.23\linewidth}>{\raggedright\arraybackslash}X@{}}
+\toprule
+\textbf{Module} & \textbf{Configuration} \\
+\midrule
+Input & 30 frames; $18\times35\times20$ per frame \\
+Spatial encoder & Three $3\times3$ CNN layers, channels $18\!\to\!32\!\to\!64\!\to\!128$; max pooling after the first two layers and global average pooling after the last \\
+Feature mapping & 128-dimensional frame features mapped to 192-dimensional temporal features \\
+TCN & Four residual blocks, two kernel-3 convolutions per block; width 192 and dilations 1, 2, 4, 8 \\
+Attribute heads & Final temporal feature, dropout 0.1, and five independent Linear$(192,K_j)$ heads \\
+\bottomrule
+\end{tabularx}
+\end{table*}
+
+The TCN uses symmetric padding and reads its final temporal position; inputs contain only current and past frames.
+
+\begin{table*}[t]
+\centering
+\small
+\caption{Shared VLA and assessment-head architecture.}
+\label{tab:app_vla_network}
+\setlength{\tabcolsep}{5pt}
+\renewcommand{\arraystretch}{1.12}
+\begin{tabularx}{\textwidth}{@{}p{0.23\linewidth}>{\raggedright\arraybackslash}X@{}}
+\toprule
+\textbf{Module} & \textbf{Configuration} \\
+\midrule
+Visual encoder & SigLIP So400m/14; $224\times224$ inputs; 27 layers, width 1152 \\
+Language backbone & 18 layers, width 2048; LoRA rank 16, $\alpha=16$ \\
+Action expert & 18 layers, width 1024; LoRA rank 32, $\alpha=32$ \\
+Need / End & Two independent heads: LayerNorm $\to$ Linear $2048\!\to\!512$ $\to$ GELU $\to$ dropout 0.1 $\to$ Linear $512\!\to\!2$ \\
+\bottomrule
+\end{tabularx}
+\end{table*}
+
+\subsection{Losses and Supervision Masks}
+
+Tactile supervision uses class-weighted cross-entropy only on annotated attributes:
+\begin{equation}
+\mathcal{L}_{\mathrm{touch}}=
+\frac{\sum_{b,j}m_{bj}\,\mathrm{CE}_{w_j}^{(\epsilon_s)}(z_{bj},y_{bj})}
+{\sum_{b,j}m_{bj}},
+\end{equation}
+where $m$ is the annotation mask, $w_j$ is proportional to inverse square-root class frequency and normalized to mean one per attribute, and label smoothing is $\epsilon_s=0.03$.
+
+For normalized $30\times32$ action chunks, sample $\epsilon\sim\mathcal{N}(0,I)$ and $u\sim\mathrm{Beta}(1.5,1)$, with $\tau=0.001+0.999u$:
+\begin{equation}
+\begin{aligned}
+A_\tau&=(1-\tau)A+\tau\epsilon,\\
+\mathcal{L}_{\mathrm{act}}&=
+\mathbb{E}\!\left[\frac{\|v_\theta(A_\tau,\tau\mid X)-(\epsilon-A)\|_F^2}{30\times32}\right],
+\end{aligned}
+\end{equation}
+where $X$ denotes the current action conditions. Need and End use ordinary softmax cross-entropy over two logits without class weighting. Failure and Plan use teacher forcing with loss only on valid answer tokens:
+\begin{equation}
+\mathcal{L}_{\mathrm{text}}=
+-\frac{\sum_i a_i\log\widetilde P_\theta(y_i\mid X,y_{<i})}{\sum_i a_i},
+\end{equation}
+where $a$ excludes input and padding positions, and invalid-token logits are masked before softmax. Stage B updates one task at a time in an equal-frequency cycle, implementing the equally weighted objective in the main text. Action gradients propagate through the frozen action expert to the language LoRA parameters.
+
+\subsection{Training Parameters}
+
+Training uses four NVIDIA RTX A6000 GPUs with 48 GB memory each. Table~\ref{tab:app_training_parameters} lists the VLA settings; the tactile descriptor remains frozen during VLA training.
+
+\begin{table*}[t]
+\centering
+\small
+\caption{VLA optimization and parameter-update settings.}
+\label{tab:app_training_parameters}
+\setlength{\tabcolsep}{5pt}
+\renewcommand{\arraystretch}{1.12}
+\begin{tabularx}{\textwidth}{@{}p{0.18\linewidth}>{\raggedright\arraybackslash}X>{\raggedright\arraybackslash}X@{}}
+\toprule
+\textbf{Setting} & \textbf{Stage A} & \textbf{Stage B} \\
+\midrule
+Initialization & $\pi_{0.5}$ base & Corresponding Stage A model \\
+Updates & 15000 & 2000 \\
+Batch size & 8 & 8 \\
+Optimizer & AdamW; $\beta_1=0.9$, $\beta_2=0.95$ & Same \\
+Learning rate & $5\times10^{-5}$ for 7000 steps, then $5\times10^{-7}$ & Constant $10^{-4}$ \\
+Weight decay & $10^{-10}$ & $10^{-4}$ \\
+Compute dtype & bfloat16 & bfloat16 \\
+Trainable parameters & SigLIP; language/action LoRA; action projections and time MLP & Language LoRA and Need/End heads \\
+Task sampling & Execution and recovery demonstrations & Five tasks with equal frequency; 1:1 execution/recovery in action batches \\
+\bottomrule
+\end{tabularx}
+\end{table*}
+
+\subsection{Action Parameters and Decision Thresholds}
+
+\begin{table*}[t]
+\centering
+\small
+\caption{Action generation and deployment parameters.}
+\label{tab:app_action_parameters}
+\setlength{\tabcolsep}{5pt}
+\renewcommand{\arraystretch}{1.12}
+\begin{tabularx}{\textwidth}{@{}p{0.23\linewidth}>{\raggedright\arraybackslash}X@{}}
+\toprule
+\textbf{Setting} & \textbf{Configuration} \\
+\midrule
+Action chunk & 30 steps; 32 internal dimensions, 7 effective control dimensions \\
+Flow sampling & Gaussian initialization and 10 Euler steps \\
+Control / assessment & 30 Hz action publishing; approximately 3 Hz Need/End assessment \\
+Decision thresholds & Need: 0.5; End: 0.9 \\
+\bottomrule
+\end{tabularx}
+\end{table*}
+
+After denormalization, the seven effective dimensions are converted to absolute targets as $a_{t+h}=q_t+\Delta a_{t,h}$ for $h=0,\ldots,29$. The End threshold is selected using macro-F1 on a held-out validation set and fixed at 0.9 for all real-world tests.
+
+% Pseudocode uses \usepackage{algorithm} and \usepackage{algpseudocode}.
+\section{Asynchronous Closed-Loop Control}
+\label{sec:app_async_control}
+
+Algorithm~\ref{alg:app_async_loop} summarizes the online loop. An action executor continuously requests and executes chunks for the active phase, while assessment runs asynchronously with physical action execution. Model-server calls remain serialized. Interruption pauses the robot and clears remaining actions; resumption generates actions from the latest observations.
+
+\begin{algorithm}[t]
+\caption{Asynchronous execution and recovery}
+\label{alg:app_async_loop}
+\small
+\begin{algorithmic}[1]
+\Require Task instruction, model server, stopping condition
+\State $s\gets\mathrm{E}$, $p\gets\texttt{none}$, $\mathcal F\gets\varnothing$
+\State \Call{StartExecutor}{$s,p$} \Comment{30 Hz action publishing}
+\While{the stopping condition is not met} \Comment{Assessment at ${\sim}3$ Hz}
+    \State $\mathcal C_t,c_t\gets$ current common observations and tactile text
+    \If{$s=\mathrm{E}$}
+        \State $b\gets\mathrm{Need}(\mathcal C_t,c_t,p)$
+        \If{$b=\mathrm{true}$}
+            \State \Call{InterruptAndHold}{}
+            \State $f\gets$ receive the subsequent Failure output
+            \State $\mathcal F\gets(\operatorname{Tail}_4(\mathcal F),f)$
+            \State $p\gets\mathrm{Plan}(\mathcal C_t,\mathcal F)$
+            \State $\mathcal F\gets\operatorname{Tail}_4(\mathcal F)$
+            \State $s\gets\mathrm{R}$
+            \State \Call{ResumeExecutor}{$s,p$}
+        \EndIf
+    \Else
+        \State $M_t\gets$ current motion history
+        \State $b\gets\mathrm{End}(\mathcal C_t,c_t,M_t,p)$
+        \If{$b=\mathrm{true}$}
+            \State \Call{InterruptAndHold}{}
+            \State $s\gets\mathrm{E}$
+            \State \Call{ResumeExecutor}{$s,p$}
+        \EndIf
+    \EndIf
+\EndWhile
+\State \Call{StopExecutor}{}
+\end{algorithmic}
+\end{algorithm}
+
+The executor conditions on $\mathcal C_t$ during execution and additionally on $p$ during recovery. Need retains the most recent plan as context after execution resumes. End terminates the current recovery operation; further detected failures initiate another round using the retained failure history.
+

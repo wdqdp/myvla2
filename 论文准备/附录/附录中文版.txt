@@ -1,0 +1,219 @@
+## C. 完整语义标签、坐标约定与文本实例
+
+Touch、Failure与Plan均采用固定字段顺序，模板中的<label>、<direction>与<degree>分别表示标签、方向与程度占位符。
+
+### C.1 触觉属性与左指传感器参考
+
+Touch的五类属性、完整模板与取值见表C1(a)。
+
+**表C1．Touch、Failure与Plan的完整文本模板和合法取值。**
+
+**(a) Touch：方向标签以左指传感器局部坐标系为参考。**
+
+```text
+Touch[area=<label>; Fx=<label>; Fy=<label>;
+      Fz=<label>; rotation=<label>]
+```
+
+| 属性／字段 | 全部合法取值 |
+| --- | --- |
+| area | none、small、medium、full |
+| Fx | negative、near_zero、positive、pos_neg、neg_pos |
+| Fy | negative、near_zero、positive、pos_neg、neg_pos |
+| Fz | near_zero、negative、left_stronger、right_stronger |
+| rotation | none、clockwise、counterclockwise |
+
+area描述接触面积，none表示无接触，其余类别按面积递增。Fx/Fy描述沿左指局部X/Y轴的双指切向受力：positive、negative与near_zero分别表示双指同为正向、负向与近零；pos_neg为左正右负，neg_pos为左负右正。左右身份按安装固定。
+
+原始双指信号保留各自坐标，上述符号按统一左指参考解释，不对原始数值直接套用相同符号判据。Fz中near_zero表示近零，negative表示负向受力且双指无明显幅值差异；left_stronger/right_stronger表示对应手指的负向受力绝对值明显更大。类别由人工判读，无固定数值阈值。
+
+rotation按左指触觉观测视角定义顺逆时针，none表示无明确平面内旋转；相向传感器的旋转观测可能相反，输出统一采用左指参考。
+
+### C.2 全局故障字段与场景坐标
+
+Failure的完整模板与取值见表C1(b)。
+
+**(b) Failure：位置、受力方向与旋转偏差采用固定场景参考。**
+
+```text
+failure[grasp_position=<label>; shear=<label>; grasp_force=<label>;
+        grasp_balance=<label>; rotate=<label>]
+```
+
+| 属性／字段 | 全部合法取值 |
+| --- | --- |
+| grasp_position | too left、too right、too front、too back、too high、too low、appropriate |
+| shear | front、back、left、right、up、down、none |
+| grasp_force | too small、too large、appropriate |
+| grasp_balance | front、back、left、right、up、down、appropriate |
+| rotate | yaw_pos、yaw_neg、pitch_pos、pitch_neg、roll_pos、roll_neg、none |
+
+固定场景坐标以主摄和工作平面为参考：+X为靠近主摄的前方，+Y为主摄视角下的右方，+Z竖直向上；负轴分别对应后、左、下，不随夹爪转动。
+
+grasp_position描述夹取位置偏差，shear描述同向切向受力相关故障的全局方向，grasp_force判断整体夹取力度。grasp_balance标记较强接触位于夹取中心的哪一侧，不表示力矢量方向或固定手指；力度与平衡可同时异常。appropriate与none分别表示对应状态合适或无该类故障。
+
+rotate描述当前姿态相对目标的偏差，yaw/pitch/roll对应场景固定Z/Y/X轴，不规定欧拉角分解顺序。pos/neg遵循右手定则：从正轴端朝原点观察，逆时针为正、顺时针为负；none表示无明确旋转故障。
+
+### C.3 恢复动作字段与程度
+
+Plan的四个动作字段、方向与共享程度词见表C1(c)。
+
+**(c) Plan：动作方向与共享程度词。degree为各活动字段的共享取值集合，不是独立动作字段。**
+
+```text
+plan[horizontal=<direction> <degree>; vertical=<direction> <degree>;
+     rotate=<direction> <degree>; gripper_distance=<direction> <degree>]
+```
+
+| 属性／字段 | 全部合法取值 |
+| --- | --- |
+| horizontal | front、back、left、right、none |
+| vertical | up、down、none |
+| rotate | clockwise、counterclockwise、none |
+| gripper_distance | open、close、none |
+| 共享程度词（degree） | slightly、moderately、significantly |
+
+horizontal与vertical沿固定场景方向移动。rotate仅控制夹爪开合关节之前的末端腕部旋转关节，顺逆时针按该轴的固定观察方向定义，区别于Failure的场景固定轴旋转偏差。gripper_distance的open/close增大/减小开口，不直接设置夹取力。
+
+活动字段采用“方向 程度”，可同时激活多个字段；不活动字段只填none。程度词为人工定性标注，不绑定固定距离、角度或开口范围。
+
+### C.4 完整文本实例
+
+以未知重心物体的重新夹取为例。若历史故障为roll_neg，当前故障转为roll_pos，方向反转提示前次纠正可能过量，可据此选择较小幅度的恢复：
+
+```text
+Touch[area=medium; Fx=near_zero; Fy=near_zero;
+      Fz=negative; rotation=clockwise]
+
+failure[grasp_position=appropriate; shear=none;
+        grasp_force=appropriate; grasp_balance=appropriate;
+        rotate=roll_pos]
+
+plan[horizontal=right slightly; vertical=none;
+     rotate=none; gripper_distance=none]
+```
+
+其中clockwise与roll_pos分别采用左指与场景固定X轴参考，其对应依赖视觉中的夹爪姿态。
+
+## D. 网络配置、损失细节与训练参数
+
+### D.1 网络配置
+
+触觉描述器及VLA结构分别见表D1、D2。
+
+**表D1．触觉描述器结构。K_j为第j个属性的类别数。**
+
+| 模块 | 配置 |
+| --- | --- |
+| 输入 | 30帧，每帧18×35×20 |
+| 空间编码 | 3层3×3 CNN，通道18→32→64→128；前两层最大池化，末层全局平均池化 |
+| 特征映射 | 帧特征128维，映射至192维时序特征 |
+| TCN | 4个残差块，每块两层核大小3的卷积；通道192，膨胀率1、2、4、8 |
+| 属性分类 | 读取末时间位置，Dropout=0.1，5个独立Linear(192,K_j) |
+
+TCN采用对称padding，读取窗口末位置特征；输入仅含当前及过去帧。
+
+**表D2．共享VLA与判断头结构。**
+
+| 模块 | 配置 |
+| --- | --- |
+| 视觉编码器 | SigLIP So400m/14；输入224×224；27层、宽度1152 |
+| 语言主干 | 18层、宽度2048；LoRA rank=16、alpha=16 |
+| 动作专家 | 18层、宽度1024；LoRA rank=32、alpha=32 |
+| Need／End | 两个独立头；LayerNorm→Linear 2048→512→GELU→Dropout(0.1)→Linear 512→2 |
+
+### D.2 损失与监督范围
+
+触觉监督仅在已标注属性上计算类别加权交叉熵：
+\[
+\mathcal L_{\mathrm{touch}}=
+\frac{\sum_{b,j}m_{bj}\,\mathrm{CE}_{w_j}^{(\epsilon_s)}(z_{bj},y_{bj})}
+{\sum_{b,j}m_{bj}}.
+\]
+其中m为标注mask，类别权重w_j与频次平方根的倒数成比例，并按属性归一化至均值1；标签平滑ε_s=0.03。
+
+动作损失在归一化的30×32动作块上计算。令ε∼N(0,I)、u∼Beta(1.5,1)，τ=0.001+0.999u，则
+\[
+\begin{aligned}
+A_\tau&=(1-\tau)A+\tau\epsilon,\\
+\mathcal L_{\mathrm{act}}&=
+\mathbb E\!\left[\frac{\|v_\theta(A_\tau,\tau\mid X)-(\epsilon-A)\|_F^2}{30\times32}\right].
+\end{aligned}
+\]
+X表示当前动作条件。Need与End对各自两个logits计算普通softmax交叉熵，不使用类别权重。Failure与Plan采用教师强制，仅监督有效回答token：
+\[
+\mathcal L_{\mathrm{text}}=
+-\frac{\sum_i a_i\log\widetilde P_\theta(y_i\mid X,y_{<i})}{\sum_i a_i},
+\]
+其中a排除输入和padding，合法token之外的logits在softmax前屏蔽。Stage B每次更新使用一种任务，等频循环对应正文的等权联合目标；动作梯度经固定动作专家回传至语言主干LoRA。
+
+### D.3 训练参数
+
+训练使用4张NVIDIA RTX A6000 GPU，每张显存48 GB。VLA训练设置见表D3，触觉描述器在VLA训练期间固定。
+
+**表D3．VLA训练与参数更新配置。**
+
+| 参数 | Stage A | Stage B |
+| --- | --- | --- |
+| 初始化 | π0.5 base | 对应Stage A模型 |
+| 训练更新数 | 15000 | 2000 |
+| Batch size | 8 | 8 |
+| 优化器 | AdamW，β₁=0.9、β₂=0.95 | 同左 |
+| 学习率 | 前7000步5×10⁻⁵，此后5×10⁻⁷ | 固定10⁻⁴ |
+| Weight decay | 10⁻¹⁰ | 10⁻⁴ |
+| 模型计算精度 | bfloat16 | bfloat16 |
+| 更新参数 | SigLIP、语言与动作LoRA、动作投影及时间MLP | 语言LoRA、Need／End头 |
+| 任务采样 | 正常执行与恢复示教 | 五任务等频循环；Action中正常执行／恢复各占一半 |
+
+### D.4 动作参数与判断阈值
+
+**表D4．动作生成与部署参数。**
+
+| 项目 | 配置 |
+| --- | --- |
+| 动作块 | 30步；内部32维，7维有效控制量 |
+| 流匹配采样 | 高斯初始化，10步Euler积分 |
+| 控制与评估 | 动作发布30 Hz；Need／End判断约3 Hz |
+| 判断阈值 | Need=0.5；End=0.9 |
+
+七维有效动作反归一化后按a_{t+h}=q_t+Δa_{t,h}恢复绝对目标，h=0,…,29。End阈值以独立验证集上的Macro-F1为选择依据，最终统一采用0.9，并在真机测试中保持固定。
+
+## E. 异步控制的实现细节
+
+算法E1概括在线闭环。动作执行器持续请求并执行当前阶段的动作块，状态判断与物理动作执行异步运行；模型服务端的推理调用仍串行处理。中断操作同时暂停机械臂并清空剩余动作，恢复执行时根据最新观测生成动作。
+
+**算法E1．执行与恢复的异步闭环。**
+
+```text
+输入：任务指令，模型服务端，任务终止条件
+初始化：阶段 s ← 正常执行；计划 p ← none；故障历史 F ← 空
+启动动作执行器(s, p)                         // 动作发布30 Hz
+
+while 未满足任务终止条件 do                  // 状态判断约3 Hz
+    C, c ← 获取当前通用观测与触觉描述
+    if s = 正常执行 then
+        b ← 请求Need(C, c, p)
+        if b = true then
+            中断动作并暂停
+            f ← 接收模型服务端随后返回的Failure
+            F ← 最近四条历史故障与f组成的序列
+            p ← 请求Plan(C, F)
+            F ← 保留最近四条故障
+            s ← 恢复
+            恢复动作执行器(s, p)
+        end if
+    else
+        M ← 获取当前运动历史
+        b ← 请求End(C, c, M, p)
+        if b = true then
+            中断动作并暂停
+            s ← 正常执行
+            恢复动作执行器(s, p)
+        end if
+    end if
+end while
+停止动作执行器
+```
+
+正常执行的动作输入为C，恢复时额外加入p；Need在返回正常执行后仍可读取最近的计划。End结束的是当前恢复操作，若随后再次检出故障，则保留故障历史并进入下一轮恢复。
+
