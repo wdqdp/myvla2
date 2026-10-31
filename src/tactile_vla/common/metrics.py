@@ -30,6 +30,7 @@ def classification_report(
     *,
     num_classes: int,
     class_names: Sequence[str] | None = None,
+    present_classes_only: bool = False,
 ) -> dict[str, Any]:
     matrix = confusion_matrix(y_true, y_pred, num_classes=num_classes)
     total = int(matrix.sum())
@@ -54,11 +55,14 @@ def classification_report(
             "f1": f1,
             "support": support,
         }
-        precision_values.append(precision)
-        recall_values.append(recall)
-        f1_values.append(f1)
+        if not present_classes_only or support > 0:
+            precision_values.append(precision)
+            recall_values.append(recall)
+            f1_values.append(f1)
+        if present_classes_only:
+            per_class[name]["evaluated"] = support > 0
 
-    return {
+    report = {
         "accuracy": correct / total if total else 0.0,
         "macro_precision": float(np.mean(precision_values)) if precision_values else 0.0,
         "macro_recall": float(np.mean(recall_values)) if recall_values else 0.0,
@@ -67,3 +71,10 @@ def classification_report(
         "per_class": per_class,
         "confusion_matrix": matrix.tolist(),
     }
+
+    if present_classes_only:
+        support = matrix.sum(axis=1, keepdims=True)
+        report['evaluated_class_names'] = [names[i] for i in range(num_classes) if support[i, 0] > 0]
+        report['confusion_matrix_row_normalized'] = np.divide(
+            matrix, support, out=np.zeros_like(matrix, dtype=float), where=support > 0).tolist()
+    return report

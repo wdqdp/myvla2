@@ -9,6 +9,7 @@ from collections.abc import Mapping
 from typing import Any
 
 from tactile_vla.common import labels as legacy
+from tactile_vla.common import labels_v5 as paper
 
 LABEL_SCHEMA_VERSION = "tactile_multifield_v4_masked"
 DATASET_FORMAT = "tactile_captioner_shards_v3_masked"
@@ -29,6 +30,8 @@ def neutral_caption(*, schema_version: str = LABEL_SCHEMA_VERSION) -> str:
 
 
 def schema_for_version(version: str) -> tuple[tuple[str, ...], dict[str, dict[str, int]]]:
+    if version == paper.LABEL_SCHEMA_VERSION:
+        return paper.LABEL_FIELDS, paper.LABEL_MAPS
     if version == LABEL_SCHEMA_VERSION:
         return LABEL_FIELDS, LABEL_MAPS
     if version == legacy.LABEL_SCHEMA_VERSION:
@@ -46,19 +49,23 @@ def validate_label_maps(label_maps: Mapping[str, Any], *, schema_version: str = 
         raise ValueError(f"Tactile label maps do not match {schema_version}: {normalized}")
 
 
-def class_names(field: str) -> tuple[str, ...]:
-    mapping = LABEL_MAPS[field]
+def class_names(field: str, *, schema_version: str = LABEL_SCHEMA_VERSION) -> tuple[str, ...]:
+    _, maps = schema_for_version(schema_version)
+    mapping = maps[field]
     return tuple(name for name, _ in sorted(mapping.items(), key=lambda item: item[1]))
 
 
-def label_id_to_name(field: str, label_id: int) -> str:
-    for name, value in LABEL_MAPS[field].items():
+def label_id_to_name(field: str, label_id: int, *, schema_version: str = LABEL_SCHEMA_VERSION) -> str:
+    _, maps = schema_for_version(schema_version)
+    for name, value in maps[field].items():
         if value == int(label_id):
             return name
     raise ValueError(f"Unknown {field} label id: {label_id}")
 
 
 def labels_to_caption(labels: Mapping[str, str], *, schema_version: str = LABEL_SCHEMA_VERSION) -> str:
+    if schema_version == paper.LABEL_SCHEMA_VERSION:
+        return paper.labels_to_caption(labels)
     if schema_version == legacy.LABEL_SCHEMA_VERSION:
         return legacy.labels_to_caption(labels)
     fields, maps = schema_for_version(schema_version)

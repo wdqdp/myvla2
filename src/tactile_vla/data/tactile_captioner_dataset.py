@@ -11,6 +11,7 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
+from tactile_vla.common import labels_v5 as paper
 from tactile_vla.common.labels import LABEL_SCHEMA_VERSION as LEGACY_SCHEMA_VERSION
 from tactile_vla.common.labels_v4 import DATASET_FORMAT
 from tactile_vla.common.labels_v4 import INVALID_LABEL_ID
@@ -61,10 +62,11 @@ class TactileCaptionerDataset(Dataset):
         self._validate_windows()
 
     def _validate_meta(self) -> None:
-        self.masked = self.meta.get("dataset_format") == DATASET_FORMAT
+        paper_format = self.meta.get("dataset_format") == paper.DATASET_FORMAT
+        self.masked = self.meta.get("dataset_format") == DATASET_FORMAT or paper_format
         if not self.masked and self.meta.get("dataset_format") != "tactile_captioner_shards_v2":
             raise ValueError(f"Unsupported tactile dataset format: {self.meta.get('dataset_format')!r}")
-        expected_schema = LABEL_SCHEMA_VERSION if self.masked else LEGACY_SCHEMA_VERSION
+        expected_schema = paper.LABEL_SCHEMA_VERSION if paper_format else LABEL_SCHEMA_VERSION if self.masked else LEGACY_SCHEMA_VERSION
         if self.meta.get("label_schema_version") != expected_schema:
             raise ValueError(f"Dataset format requires label schema {expected_schema!r}")
         self.label_fields, self.label_maps = schema_for_version(expected_schema)

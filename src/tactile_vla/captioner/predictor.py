@@ -95,7 +95,7 @@ class TactileCaptionerPredictor:
                 for field in self.label_fields
             }
             label_names = {
-                field: label_id_to_name(field, label_ids[field])
+                field: label_id_to_name(field, label_ids[field], schema_version=self.schema_version)
                 for field in self.label_fields
             }
             predictions.append(

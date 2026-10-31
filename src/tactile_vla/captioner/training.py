@@ -16,6 +16,7 @@ from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
 from tactile_vla.captioner.model import TactileCaptioner
+from tactile_vla.common import labels_v5 as paper
 from tactile_vla.common.labels_v4 import LABEL_FIELDS
 from tactile_vla.common.labels_v4 import LABEL_MAPS
 from tactile_vla.common.labels_v4 import LABEL_SCHEMA_VERSION
@@ -259,7 +260,8 @@ def _run_epoch(
             targets,
             predictions,
             num_classes=model.head_num_classes[field],
-            class_names=class_names(field),
+            class_names=class_names(field, schema_version=getattr(model, "label_schema_version", LABEL_SCHEMA_VERSION)),
+            present_classes_only=getattr(model, "label_schema_version", LABEL_SCHEMA_VERSION) == paper.LABEL_SCHEMA_VERSION,
         )
         report["loss"] = total_head_losses[field] / max(1, head_samples[field])
         heads[field] = report
@@ -297,10 +299,10 @@ def save_checkpoint(
         "config": _jsonable(config),
         "model_config": model.config_dict(),
         "metrics": _jsonable(metrics),
-        "label_schema_version": LABEL_SCHEMA_VERSION,
-        "label_maps": LABEL_MAPS,
+        "label_schema_version": train_dataset.meta["label_schema_version"],
+        "label_maps": train_dataset.label_maps,
         "class_counts": class_counts,
-        "class_weights": {field: class_weights[field].detach().cpu().tolist() for field in LABEL_FIELDS},
+        "class_weights": {field: class_weights[field].detach().cpu().tolist() for field in train_dataset.label_fields},
         "normalization": train_dataset.normalization_stats(),
         "dataset_meta": {
             "dataset_format": train_dataset.meta["dataset_format"],
@@ -364,8 +366,9 @@ def train(config: CaptionerTrainConfig) -> dict[str, Any]:
     )
     val_dataset = TactileCaptionerDataset(config.dataset_dir, split="val", balanced=False, normalize=config.normalize)
     test_dataset = TactileCaptionerDataset(config.dataset_dir, split="test", balanced=False, normalize=config.normalize)
-    if any(dataset.meta["dataset_format"] != DATASET_FORMAT for dataset in (train_dataset, val_dataset, test_dataset)):
-        raise ValueError(f"Six-head training requires the current masked format {DATASET_FORMAT!r}")
+    if any(dataset.meta["dataset_format"] not in {DATASET_FORMAT, paper.DATASET_FORMAT} for dataset in (train_dataset, val_dataset, test_dataset)):
+        raise ValueError("Captioner training requires masked V4 or paper V5 data")
+    fields = train_dataset.label_fields
     if not (train_dataset.head_num_classes == val_dataset.head_num_classes == test_dataset.head_num_classes):
         raise ValueError("train/val/test tactile label maps do not match")
 
@@ -405,13 +408,13 @@ def train(config: CaptionerTrainConfig) -> dict[str, Any]:
             num_classes=train_dataset.head_num_classes[field],
             mode=config.class_weighting,
         ).to(device)
-        for field in LABEL_FIELDS
+        for field in fields
     }
     train_criteria = _make_criteria(class_weights, label_smoothing=config.label_smoothing)
     eval_criteria = _make_criteria(
         {
             field: torch.ones((train_dataset.head_num_classes[field],), dtype=torch.float32, device=device)
-            for field in LABEL_FIELDS
+            for field in fields
         },
         label_smoothing=0.0,
     )
@@ -452,7 +455,7 @@ def train(config: CaptionerTrainConfig) -> dict[str, Any]:
             "class_counts": counts,
             "class_weights": {
                 field: class_weights[field].detach().cpu().tolist()
-                for field in LABEL_FIELDS
+                for field in fields
             },
             "device": str(device),
         }

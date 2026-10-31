@@ -13,6 +13,7 @@ from tactile_vla.common.labels import LABEL_FIELDS
 from tactile_vla.common.labels import LABEL_MAPS
 from tactile_vla.common.labels_v4 import LABEL_FIELDS as V4_LABEL_FIELDS
 from tactile_vla.common.labels_v4 import LABEL_MAPS as V4_LABEL_MAPS
+from tactile_vla.common import labels_v5 as paper
 
 
 class FrameGridEncoder(nn.Module):
@@ -77,12 +78,16 @@ class TactileCaptioner(nn.Module):
         self.mesh_channels = mesh_channels
         self.force_channels = force_channels
         provided_head_sizes = dict(head_num_classes or {field: len(LABEL_MAPS[field]) for field in LABEL_FIELDS})
-        if set(provided_head_sizes) == set(V4_LABEL_FIELDS):
+        if provided_head_sizes == {field: len(paper.LABEL_MAPS[field]) for field in paper.LABEL_FIELDS}:
+            fields, maps = paper.LABEL_FIELDS, paper.LABEL_MAPS
+        elif set(provided_head_sizes) == set(V4_LABEL_FIELDS):
             fields, maps = V4_LABEL_FIELDS, V4_LABEL_MAPS
         elif set(provided_head_sizes) == set(LABEL_FIELDS):
             fields, maps = LABEL_FIELDS, LABEL_MAPS
         else:
-            raise ValueError(f"Expected five V3 or six V4 classification heads, got {tuple(provided_head_sizes)}")
+            raise ValueError(f"Expected V3/V4 or paper V5 classification heads, got {tuple(provided_head_sizes)}")
+        self.label_schema_version = (paper.LABEL_SCHEMA_VERSION if maps is paper.LABEL_MAPS else
+                                     "tactile_multifield_v4_masked" if maps is V4_LABEL_MAPS else "tactile_multifield_v3")
         self.head_num_classes = {field: int(provided_head_sizes[field]) for field in fields}
         if self.head_num_classes != {field: len(maps[field]) for field in fields}:
             raise ValueError(f"Classification head sizes do not match tactile labels: {self.head_num_classes}")
