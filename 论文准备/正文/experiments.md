@@ -20,7 +20,7 @@
 
 *图3．四项真机任务的故障恢复示例，自上而下为Black-box、Book、Bottle与Sponge。灰色、红色和绿色阶段条分别表示正常执行、故障与恢复；Need与End标记恢复的启动和当前恢复操作的完成。故障帧中展示相关的诊断与计划字段。上方曲线对应Black-box示例中左右触觉传感器的Tz扭矩变化。*
 
-**评价指标。**任务成功率（Task Success Rate，TSR）为完成指令目标的测试回合比例。Need Accuracy（NA）按Need头正确检出的真实故障次数/实际故障次数计算；实际未发生故障却触发Need时，记为一次误检，即一次检测失败，不计入成功检出的真实故障。由于部分测试不发生故障，而部分测试会出现多个故障，我们合并所有测试中的真实故障事件，计算恢复成功率（Recovery Success Rate，RSR），即成功纠正并能继续原任务的故障次数/实际故障次数。故障总数包含未检出或未启动恢复的故障。计划正确率（Plan Accuracy，PA）为人工判定正确的计划数/全部计划数，包含最终失败回合中的输出。表1的NA按真实故障事件计算，误触发现象另作定性分析；完整计数规则见附录A。
+**评价指标。**任务成功率（Task Success Rate，TSR）为完成指令目标的测试回合比例。Need Accuracy（NA）按Need头正确检出的真实故障次数/实际故障次数计算；实际未发生故障却触发Need时，记为一次误检，即一次检测失败，不计入成功检出的真实故障。由于部分测试不发生故障，而部分测试会出现多个故障，我们合并所有测试中的真实故障事件，计算恢复成功率（Recovery Success Rate，RSR），即成功纠正并能继续原任务的故障次数/实际故障次数。故障总数包含未检出或未启动恢复的故障。计划正确率（Plan Accuracy，PA）为人工判定正确的计划数/全部计划数，包含最终失败回合中的输出。表1的NA按真实故障事件计算，误触发现象另作定性分析。
 
 ## 4.2 真机任务表现
 
@@ -28,7 +28,7 @@
 
 **任务完成表现。**如表1所示，TARO在四项任务上均优于无触觉版本，平均TSR由38.75%提高至85.00%，提升46.25个百分点。Black-box由3/20提高至18/20，提升75个百分点；Book、Sponge和Bottle分别提升35、40和35个百分点。
 
-**表1．四项真机任务的分条件结果与恢复表现。C1—C5为各任务独立编号的测试条件，具体设置见附录A.3；条件单元格为成功数/失败数（S/F），“—”表示不适用。TSR、NA、RSR与PA以百分比报告，括号内为原始分子/分母。总体行的TSR为四任务均值，NA与RSR按真实故障事件汇总，PA按计划计数汇总。**
+**表1．四项真机任务的分条件结果与恢复表现。C1—C5为各任务独立编号的测试条件，具体设置见附录A.2；条件单元格为成功数/失败数（S/F），“—”表示不适用。TSR、NA、RSR与PA以百分比报告，括号内为原始分子/分母。总体行的TSR为四任务均值，NA与RSR按真实故障事件汇总，PA按计划计数汇总。**
 
 | 任务 | 方法 | C1 | C2 | C3 | C4 | C5 | TSR ↑ | NA ↑ | RSR ↑ | PA ↑ |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
@@ -212,7 +212,7 @@ We attach a paper disk to the grasped sponge to occlude obstacles along its path
 \end{figure*}
 
 \noindent\textbf{Evaluation metrics.}
-Task Success Rate (TSR) is the fraction of trials completing the instructed goal. Need Accuracy (NA) is defined as the number of actual failure events correctly detected by Need divided by the total number of actual failures. A Need activation without an actual failure is counted as a false positive, i.e., a detection error, and not as a correctly detected failure. Trials may contain no failures or multiple failures; we therefore pool actual failure events across trials to compute Recovery Success Rate (RSR), the fraction resolved sufficiently to resume the task. Its denominator includes undetected failures and those that do not trigger recovery. Plan Accuracy (PA) is the fraction of generated plans judged correct by a human, including plans from unsuccessful trials. NA in Table~\ref{tab:real_world_results} measures detection over actual failures; false activations are analyzed qualitatively. Full counting rules are provided in the appendix.
+Task Success Rate (TSR) is the fraction of trials completing the instructed goal. Need Accuracy (NA) is defined as the number of actual failure events correctly detected by Need divided by the total number of actual failures. A Need activation without an actual failure is counted as a false positive, i.e., a detection error, and not as a correctly detected failure. Trials may contain no failures or multiple failures; we therefore pool actual failure events across trials to compute Recovery Success Rate (RSR), the fraction resolved sufficiently to resume the task. Its denominator includes undetected failures and those that do not trigger recovery. Plan Accuracy (PA) is the fraction of generated plans judged correct by a human, including plans from unsuccessful trials. NA in Table~\ref{tab:real_world_results} measures detection over actual failures; false activations are analyzed qualitatively.
 ```
 
 ## 英文 LaTeX：4.2 真机任务表现

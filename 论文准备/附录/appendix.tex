@@ -1,5 +1,181 @@
-% Section C content only; insert after Sections A and B of the appendix.
-% Tables use booktabs, tabularx, and array. No standalone document or preamble is included.
+% Appendix Sections A--E and G; Section F can be inserted between E and G.
+% Tables use booktabs, tabularx, and array; figures use graphicx.
+% Figure paths are relative to the paper directory (论文准备). No standalone preamble is included.
+
+\section{Platform Setup and Test Conditions}
+\label{sec:app_platform_conditions}
+
+\subsection{Platform and Sensor Placement}
+\label{sec:app_platform}
+
+Our platform comprises a six-degree-of-freedom Piper arm with a two-finger gripper, with an Xense G1-WS tactile sensor mounted on each finger. A fixed Intel RealSense D435i camera observes the workspace externally, while a wrist camera mounted above the gripper moves with the end effector and provides a close-up view. Figure~\ref{fig:app_robot_platform} shows the arm and sensor arrangement, including an enlarged view of the wrist camera and paired tactile sensors. The two camera views and paired tactile signals provide the perceptual inputs.
+
+\begin{figure*}[t]
+    \centering
+    \includegraphics[width=\textwidth]{试验结果/robot.png}
+    \caption{Robot platform and sensor placement. The fixed camera, Piper arm, and enlarged end-effector assembly are shown from left to right. The end-effector view highlights the wrist camera and paired Xense G1-WS tactile sensors. Dashed outlines and connectors indicate the enlarged region.}
+    \label{fig:app_robot_platform}
+\end{figure*}
+
+\subsection{Test Conditions and Identifiers}
+\label{sec:app_test_conditions}
+
+Figure~\ref{fig:app_test_conditions} shows the physical configurations for all four tasks. Condition identifiers C1--C5 are defined independently within each task and do not denote equivalent configurations across tasks. The per-condition results in the main text use these identifiers. Table~\ref{tab:app_test_conditions} maps the configurations to their identifiers and the repetitions used in the main-text results.
+
+\begin{figure*}[t]
+    \centering
+    \includegraphics[width=\textwidth]{试验结果/exp_set.png}
+    \caption{Task-specific test configurations. Black-box uses five internal weight positions; Book uses four arrangements of neighboring books; Bottle shows remaining opening angles of $90^\circ$, $180^\circ$, and $0^\circ$, with $0^\circ$ shown for illustration only and excluded from the reported results; Sponge uses four relative arrangements of the sponge, obstacle, and target frame. Identifiers are local to each task.}
+    \label{fig:app_test_conditions}
+\end{figure*}
+
+\begin{table*}[t]
+\centering
+\small
+\caption{Test-condition definitions and repetitions per method. Bottle C3 is illustrated but excluded from the reported results.}
+\label{tab:app_test_conditions}
+\setlength{\tabcolsep}{5pt}
+\renewcommand{\arraystretch}{1.15}
+\begin{tabularx}{\textwidth}{@{}p{0.12\linewidth}>{\raggedright\arraybackslash}X>{\raggedright\arraybackslash}p{0.27\linewidth}@{}}
+\toprule
+\textbf{Task} & \textbf{Condition and physical configuration} & \textbf{Trials per method} \\
+\midrule
+Black-box & C1--C5: five successive internal weight positions along the box, from one end to the other & 4 per condition; 20 total \\
+Book & C1: 3 books on the left; C2: 2 on the left; C3: 3 on the right; C4: 2 on the right & 5 per condition; 20 total \\
+Bottle & C1: $90^\circ$ remaining opening angle; C2: $180^\circ$; the figure additionally shows C3: $0^\circ$ & 10 each for C1 and C2; 20 total; C3 excluded \\
+Sponge & C1--C4: the four relative configurations shown in Fig.~\ref{fig:app_test_conditions} & 5 per condition; 20 total \\
+\bottomrule
+\end{tabularx}
+\end{table*}
+
+\textbf{Black-box.} Moving the internal weight changes the center of mass while preserving the appearance of the closed box. The weight position is not provided to the robot. The box is opened in the figure only to reveal the internal configurations.
+
+\textbf{Book.} Left and right refer to the two sides of the target insertion location. The counts specify the number of neighboring books on the indicated side. These configurations vary the lateral constraints and resulting insertion obstructions.
+
+\textbf{Bottle.} Each twisting action is limited to $90^\circ$, and the remaining opening angle is not provided to the model. C3 illustrates a $0^\circ$ configuration requiring no further twisting and is excluded from the success-rate evaluation. The per-condition results in the main text report C1 and C2, with ten trials each.
+
+\textbf{Sponge.} A paper disk attached to the grasped sponge occludes obstacles during transport. Figure~\ref{fig:app_test_conditions} uses an overhead view to show the obstacle positions clearly. This explanatory view is not a robot input: neither actual camera view directly reveals the obstacle when motion is obstructed.
+
+\section{Data Collection, Annotation, and Supervision Construction}
+\label{sec:app_data}
+
+\subsection{Collection Protocol and Data Splits}
+\label{sec:app_collection_split}
+
+Our data comprise manipulation demonstrations and independent tactile attribute recordings. Manipulation demonstrations are collected through leader--follower teleoperation, synchronously recording front and wrist images, the seven-dimensional robot state comprising six arm joint positions and the gripper opening, leader-arm control targets, and paired fingertip tactile signals. Each episode contains either an execution segment alone or an execution segment followed by a recovery segment, preserving their temporal order. We collect up to three episode types according to the initial state and the presence of recovery, as detailed in Sec.~\ref{sec:app_demonstration_supervision}.
+
+Demonstrations are collected separately for each manipulation task, and a corresponding model is trained for each task. Table~\ref{tab:app_data_split} summarizes the demonstration and tactile descriptor datasets.
+
+\begin{table*}[t]
+\centering
+\small
+\caption{Collection sizes and episode-level data splits. Counts refer to original manipulation episodes or independent tactile recordings.}
+\label{tab:app_data_split}
+\setlength{\tabcolsep}{6pt}
+\renewcommand{\arraystretch}{1.12}
+\begin{tabularx}{\textwidth}{@{}>{\raggedright\arraybackslash}Xrrrr@{}}
+\toprule
+\textbf{Dataset} & \textbf{Total} & \textbf{Train} & \textbf{Validation} & \textbf{Test} \\
+\midrule
+Black-box demonstrations & 90 & 72 & 9 & 9 \\
+Book demonstrations & 90 & 72 & 9 & 9 \\
+Sponge demonstrations & 40 & 32 & 4 & 4 \\
+Bottle demonstrations & 40 & 32 & 4 & 4 \\
+Independent tactile attribute recordings & 450 & 360 & 45 & 45 \\
+\bottomrule
+\end{tabularx}
+\end{table*}
+
+We split the original episodes into training, validation, and test sets at an approximately $80\%/10\%/10\%$ ratio using random seed 42. Manipulation demonstrations are grouped by collection condition, whereas tactile recordings are stratified by target attribute and category. Failure and recovery segments from the same episode, together with all derived windows, history variants, and counterfactual samples, share the same split. Subsequent sample construction and reconstruction preserve these fixed episode assignments. Overlapping windows and text variants increase the number of supervision samples, but not the number of independently collected episodes.
+
+\subsection{Tactile Attribute Annotation and Preprocessing}
+\label{sec:app_tactile_annotation}
+
+Independent tactile recordings receive manual attribute-level annotations. Each recording is assigned one target attribute and category, and the corresponding state is maintained throughout collection. The five attributes are \texttt{area}, \texttt{Fx}, \texttt{Fy}, \texttt{Fz}, and \texttt{rotation}; their complete vocabularies and reference frames are provided in Sec.~\ref{sec:app_semantics}. The annotation is assigned to every frame in the recording. The remaining four attributes are treated as unannotated and masked out of both the loss and evaluation, rather than assigned a default normal-state label.
+
+Both datasets are aligned by timestamp to a 30\,Hz grid. At each target timestamp, we select the nearest sample from each stream within a maximum time difference of 0.03\,s, retaining the original sensor values and left/right identities. The tactile descriptor uses a 30-frame window ending at the current frame with a stride of one frame, and its label corresponds to the final frame. Windows do not cross recording boundaries or synchronization gaps. Normalization statistics are computed exclusively from the training set, and class balancing is applied only to training samples.
+
+The descriptor is trained independently and then frozen. It generates Touch descriptions frame by frame for the manipulation demonstrations; these predicted descriptions serve as inputs during VLA training.
+
+\subsection{Demonstration Annotation and Five-Task Supervision}
+\label{sec:app_demonstration_supervision}
+
+For each manipulation task, we collect up to three types of episodes as needed:
+\begin{enumerate}
+    \item \textbf{Successful execution without recovery.} The robot completes the instruction directly from the task's initial state. These episodes primarily supervise actions for the original task.
+    \item \textbf{A single recovery from the initial state.} Starting from the task's initial state, an episode contains one execution segment and one recovery segment. A failure is followed by one successful corrective operation, providing supervision for failure detection and recovery actions.
+    \item \textbf{Execution and recovery from a post-recovery state.} An episode starts from a possible recovery endpoint and likewise contains one execution segment and one recovery segment. These episodes cover the post-recovery state distribution and support learning further recovery when failures recur.
+\end{enumerate}
+
+For episodes containing recovery, we record two timestamps during collection: \textbf{failure onset} and \textbf{recovery completion}. The former distinguishes pre-failure and post-failure observations within the execution segment; the latter marks completion of the current recovery operation. Successful episodes without recovery require no recovery-event annotations. Timestamps are aligned offline while retaining execution/recovery segment assignments. Post-failure observations within execution still supervise Need, whereas completion decisions within recovery supervise End.
+
+Each episode records the task instruction, outcome, and manual Failure and Plan annotations. Annotators identify the current global failure from visual and tactile observations and label recovery directions and magnitudes from the demonstrations, following the fields and coordinate conventions in Sec.~\ref{sec:app_semantics}. The third episode type provides real observations of task resumption and subsequent correction after recovery. Combined with the failure-history construction rules below, these observations support multi-round recovery supervision.
+
+\begin{table*}[t]
+\centering
+\small
+\caption{Sources and targets of supervision for the five training tasks.}
+\label{tab:app_supervision_sources}
+\setlength{\tabcolsep}{5pt}
+\renewcommand{\arraystretch}{1.15}
+\begin{tabularx}{\textwidth}{@{}p{0.12\linewidth}>{\raggedright\arraybackslash}X@{}}
+\toprule
+\textbf{Task} & \textbf{Observations and supervision targets} \\
+\midrule
+Action & Extract consecutive 30-step control targets from real demonstrations. Execution is conditioned on the instruction and current observations; recovery additionally receives the current manually annotated Plan. Retain only starting points with complete targets that satisfy phase constraints. \\
+Need & Label observations from successful trajectories and pre-failure execution as \texttt{false}. Label valid observations in the execution segment as \texttt{true} when a failure has occurred and recovery remains necessary. \\
+Failure & Sample stable post-failure observations and use the manually annotated global Failure as the target. \\
+Plan & Use current observations and a chronological failure history to predict the corresponding recovery plan. The history includes the current failure and contains at most five entries. \\
+End & Within recovery segments, use the annotated completion timestamp to distinguish incomplete operations from those that may terminate under the current Plan. \\
+\bottomrule
+\end{tabularx}
+\end{table*}
+
+Action targets are defined relative to the current state at the beginning of each action chunk; chunks crossing phase boundaries are excluded. Failure and Plan training samples are drawn from 15-frame windows of stable failure observations, while validation and testing use the final frame of each window. Positive-to-negative training sample ratios are approximately $1{:}3$ for Need and $1{:}2$ for End. We retain hard samples near event boundaries, but exclude ambiguous transition observations from supervision of the corresponding assessment task.
+
+\subsection{Failure Histories and Magnitude Counterfactuals}
+\label{sec:app_history_counterfactual}
+
+Histories contain only chronologically ordered \textbf{Failure} descriptions, without past Plans. Keeping the current real observation and its Failure fixed, we construct up to four preceding Failure entries using manual annotations and rule-based variants. The final entry is always the current failure. The current Plan is supplied separately as the supervision target, never as a history entry. Histories of different lengths and their targets inherit the split of the episode containing the current observation.
+
+For Black-box, where feedback indicating a direction reversal can require a smaller recovery magnitude, we construct \texttt{moderately} and \texttt{slightly} samples using the rules below. The history length $L\in\{1,\ldots,5\}$ includes the current Failure, and failure directions are compared in the same global reference frame.
+
+\begin{center}
+\small
+\setlength{\tabcolsep}{4pt}
+\renewcommand{\arraystretch}{1.15}
+\begin{tabularx}{\linewidth}{@{}p{0.23\linewidth}>{\raggedright\arraybackslash}X@{}}
+\toprule
+\textbf{Target magnitude} & \textbf{Failure-history construction rule} \\
+\midrule
+\texttt{moderately} & For $L=1$, the history contains only the current Failure, with no preceding feedback. For $L>1$, construct a failure sequence without a direction reversal. \\
+\texttt{slightly} & For $L=2,\ldots,5$, include at least one failure indicating the opposite direction, suggesting that a preceding correction may have overshot. Once a reversal occurs, subsequent targets remain \texttt{slightly}. \\
+\bottomrule
+\end{tabularx}
+\end{center}
+
+The final Failure remains consistent with the current observation, and the recovery direction is determined by the current failure and manual recovery annotation. Other tasks retain the target Plans from their real recovery demonstrations. Rule-based histories provide supervision under different feedback conditions and are not counted as collected complete multi-round trajectories. During online deployment, histories instead accumulate the model's diagnoses within the current task episode.
+
+For Black-box, we additionally construct magnitude counterfactuals for End by changing only the magnitude word in the current Plan while keeping images, Touch, robot state, and motion history unchanged. Let $b$ and $e$ denote the start and end frames of the recovery motion. The start is located offline from the state trajectory, and the end uses the recovery-completion annotation; no additional motion-onset timestamp is required during collection. Table~\ref{tab:app_end_counterfactual} gives the proxy labels.
+
+\begin{table*}[t]
+\centering
+\small
+\caption{Proxy End labels for magnitude counterfactuals within the observed recovery interval $[b,e]$.}
+\label{tab:app_end_counterfactual}
+\setlength{\tabcolsep}{5pt}
+\renewcommand{\arraystretch}{1.15}
+\begin{tabularx}{\textwidth}{@{}p{0.19\linewidth}p{0.19\linewidth}>{\raggedright\arraybackslash}X@{}}
+\toprule
+\textbf{Demonstrated magnitude} & \textbf{Replacement magnitude} & \textbf{End labels in $[b,e]$} \\
+\midrule
+\texttt{moderately} & \texttt{slightly} & Use the frame midpoint $\lfloor(b+e)/2\rfloor$ as a proxy completion boundary: \texttt{false} before it and \texttt{true} from that frame onward. \\
+\texttt{slightly} & \texttt{moderately} & Assign \texttt{false} throughout the interval: the observed smaller motion is insufficient to complete the larger-magnitude plan. \\
+\bottomrule
+\end{tabularx}
+\end{table*}
+
+The frame midpoint is a proxy training boundary and does not imply half the measured displacement. These samples supervise only End and do not create additional action trajectories. They inherit the original episode's split and are evaluated separately from samples using the original demonstration plans.
 
 \section{Complete Semantic Labels, Coordinate Conventions, and Text Examples}
 \label{sec:app_semantics}
@@ -312,4 +488,55 @@ Algorithm~\ref{alg:app_async_loop} summarizes the online loop. An action executo
 \end{algorithm}
 
 The executor conditions on $\mathcal C_t$ during execution and additionally on $p$ during recovery. Need retains the most recent plan as context after execution resumes. End terminates the current recovery operation; further detected failures initiate another round using the retained failure history.
+
+\section{Tactile Captioner Accuracy and Inference Cost}
+\label{sec:app_captioner_evaluation}
+
+\subsection{Attribute Prediction Accuracy}
+
+We evaluate the \texttt{best.pt} checkpoint from epoch 13 of \texttt{tcn\_v5\_w30\_five\_head} on the test set obtained through the stratified episode-level split. The full dataset contains 450 episodes, with 360/45/45 assigned to training/validation/testing, respectively. The test set comprises 4,573 valid 30-frame windows. Each window is scored only for attributes with valid manual annotations. For each attribute, accuracy is the fraction of correctly classified windows among those with valid annotations; macro-F1 averages class-wise F1 equally over classes represented in the ground truth. The five-attribute averages weight all attributes equally. All 21 classes are represented in this test set.
+
+\begin{table}[t]
+\centering
+\small
+\caption{Tactile attribute prediction on the held-out test episodes. The final row averages the five attributes equally.}
+\label{tab:app_captioner_accuracy}
+\setlength{\tabcolsep}{4pt}
+\renewcommand{\arraystretch}{1.12}
+\begin{tabularx}{\linewidth}{@{}>{\raggedright\arraybackslash}Xrrr@{}}
+\toprule
+\textbf{Attribute} & \textbf{Windows} & \textbf{Accuracy} & \textbf{Macro-F1} \\
+\midrule
+\texttt{area} & 1,179 & 92.62\% & 92.10\% \\
+\texttt{Fx} & 843 & 100.00\% & 100.00\% \\
+\texttt{Fy} & 1,052 & 100.00\% & 100.00\% \\
+\texttt{Fz} & 691 & 100.00\% & 100.00\% \\
+\texttt{rotation} & 808 & 100.00\% & 100.00\% \\
+\midrule
+Mean & --- & 98.52\% & 98.42\% \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+For \texttt{area}, 87 windows labeled \texttt{small} are predicted as \texttt{medium}; all valid test windows for the other attributes are classified correctly. These windows originate from 45 test episodes. Overlapping windows within an episode are not independently collected trials, so window counts do not represent numbers of independent trials. These results characterize the present episode-level test split and do not directly establish generalization to new environments.
+
+\subsection{Resource Cost of Tactile Description Generation}
+
+We benchmark on a single NVIDIA RTX A6000 with batch size 1 and float32 precision. Each input is a 30-frame tactile window from both fingers. After 50 warm-up runs, we measure 1,000 runs. Timing starts with the input already on the GPU and ends when the complete Touch text has been generated.
+
+\begin{table*}[t]
+\centering
+\small
+\caption{Resource cost of tactile description generation. Text length is measured in characters.}
+\label{tab:app_captioner_cost}
+\setlength{\tabcolsep}{5pt}
+\renewcommand{\arraystretch}{1.12}
+\begin{tabularx}{\textwidth}{@{}>{\raggedright\arraybackslash}X*{4}{>{\centering\arraybackslash}X}@{}}
+\toprule
+\textbf{Method} & \textbf{Parameters (M)} & \textbf{Median latency (ms)} & \textbf{Peak process GPU memory (GB)} & \textbf{Mean text length} \\
+\midrule
+Our captioner & 1.032 & 1.174 & 0.377 & 76.28 \\
+\bottomrule
+\end{tabularx}
+\end{table*}
 
