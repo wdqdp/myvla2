@@ -1575,17 +1575,15 @@ def main() -> None:
         print("\n===== Dry-run transformed batch shapes =====")
         for task, batch in first_batches.items():
             print_batch_shapes(task, batch)
-        print(
-            json.dumps(
-                {
-                    "failure_compact_vocab": len(failure_codec.compact_token_ids),
-                    "failure_max_target_tokens": failure_codec.max_target_tokens,
-                    "plan_compact_vocab": len(plan_codec.compact_token_ids),
-                    "plan_max_target_tokens": plan_codec.max_target_tokens,
-                },
-                indent=2,
-            )
-        )
+        grammar_info = {}
+        if "failure" in TASK_CYCLE:
+            grammar_info.update(failure_compact_vocab=len(failure_codec.compact_token_ids),
+                                failure_max_target_tokens=failure_codec.max_target_tokens)
+        if "plan" in TASK_CYCLE:
+            grammar_info.update(plan_compact_vocab=len(plan_codec.compact_token_ids),
+                                plan_max_target_tokens=plan_codec.max_target_tokens)
+        if grammar_info:
+            print(json.dumps(grammar_info, indent=2))
         return
 
     run_dir = args.output_dir / args.run_name
@@ -1653,15 +1651,15 @@ def main() -> None:
             "precision": precision,
             "task_cycle": list(TASK_CYCLE),
             "updates_per_task": args.num_steps // len(TASK_CYCLE),
-            "failure_grammar": list(failure_codec.texts),
-            "recovery_grammar": list(plan_codec.texts),
+            "failure_grammar": list(failure_codec.texts) if "failure" in TASK_CYCLE else [],
+            "recovery_grammar": list(plan_codec.texts) if "plan" in TASK_CYCLE else [],
             "grammar_profile": args.grammar_profile,
             "training_target_coverage": {
-                "failure_reason": [
+                **({"failure_reason": [
                     f"failure_reason=rotate {direction},grasp appropriate."
                     for direction in ("right", "left", "front", "back")
-                ],
-                "recovery_plan": [
+                ]} if "failure" in TASK_CYCLE else {}),
+                **({"recovery_plan": [
                     f"recovery_plan=move horizontally {direction} {magnitude}, "
                     "move vertically none moderately."
                     for direction in ("right", "left", "front", "back")
@@ -1670,7 +1668,7 @@ def main() -> None:
                         if args.data_profile == ROTATION_V4
                         else ("moderately",)
                     )
-                ],
+                ]} if "plan" in TASK_CYCLE else {}),
             },
             "artifact_identity": identity,
             "data_config_hash": identity["data_config_hash"],
@@ -1857,38 +1855,20 @@ def main() -> None:
                 raise ValueError(
                     f"Stratified need validation lost class support: {need_support}"
                 )
-            failure_metrics = evaluate_text(
-                state,
-                loaders["val"]["failure"],
-                "failure",
-                failure_codec,
-                data_sharding,
-                max_samples=text_eval_sample_limit(
-                    args.data_profile,
-                    args.eval_max_text_samples,
-                ),
-            )
-            plan_metrics = evaluate_text(
-                state,
-                loaders["val"]["plan"],
-                "plan",
-                plan_codec,
-                data_sharding,
-                max_samples=text_eval_sample_limit(
-                    args.data_profile,
-                    args.eval_max_text_samples,
-                ),
-            )
-            validate_text_eval_coverage(
-                args.data_profile,
-                failure_metrics,
-                plan_metrics,
-            )
+            text_metrics = {}
+            for text_task, codec in (("failure", failure_codec), ("plan", plan_codec)):
+                if text_task in TASK_CYCLE:
+                    text_metrics[text_task] = evaluate_text(
+                        state, loaders["val"][text_task], text_task, codec, data_sharding,
+                        max_samples=text_eval_sample_limit(args.data_profile, args.eval_max_text_samples),
+                    )
+            if {"failure", "plan"} <= text_metrics.keys():
+                validate_text_eval_coverage(args.data_profile, text_metrics["failure"], text_metrics["plan"])
             action_metrics = action_retention_metrics(
                 action_report, baseline_action_report, limit=args.action_loss_degradation_limit,
             )
-            score_terms = [
-                need_metrics["macro_f1"], failure_metrics["exact_match"], plan_metrics["exact_match"]
+            score_terms = [need_metrics["macro_f1"]] + [
+                value["exact_match"] for value in text_metrics.values()
             ]
             if adjustment_metrics is not None:
                 score_terms.append(adjustment_metrics["macro_f1"])
@@ -1899,8 +1879,8 @@ def main() -> None:
                 **action_metrics,
                 "need_recovery": need_metrics,
                 **({"adjustment_end": adjustment_metrics} if adjustment_metrics is not None else {}),
-                "failure_reason": failure_metrics,
-                "recovery_plan": plan_metrics,
+                **({"failure_reason": text_metrics["failure"]} if "failure" in text_metrics else {}),
+                **({"recovery_plan": text_metrics["plan"]} if "plan" in text_metrics else {}),
             }
             progress.write(json.dumps(metrics, ensure_ascii=False))
             write_jsonl(metrics_file, metrics)
