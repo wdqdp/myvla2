@@ -219,6 +219,7 @@ V4_STAGE_B_FROZEN_COMPONENTS = ("action_expert", "paligemma_non_lora")
 # Kept as a module-level extension point so later versioned trainers can reuse
 # the checkpoint/optimizer machinery without changing the V3 protocol.
 TASK_CYCLE = ("action", "need", "failure", "plan")
+REQUIRE_FULL_TASK_CYCLE = True
 CHECKPOINT_EXPORT_HOOK = None
 ACTION_EVALUATION_HOOK = None
 EXTRA_CONFIG: dict[str, Any] = {}
@@ -1427,7 +1428,7 @@ def main() -> None:
         )
     if args.num_steps <= 0:
         raise ValueError("--num-steps must be positive")
-    if args.num_steps % len(TASK_CYCLE) != 0:
+    if REQUIRE_FULL_TASK_CYCLE and args.num_steps % len(TASK_CYCLE) != 0:
         raise ValueError(
             f"Stage B total updates must be divisible by the {len(TASK_CYCLE)}-task cycle"
         )
