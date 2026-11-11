@@ -540,3 +540,43 @@ Our captioner & 1.032 & 1.174 & 0.377 & 76.28 \\
 \end{tabularx}
 \end{table*}
 
+\section{Ablation of Explicit Failure Diagnosis and Recovery Planning}
+\label{sec:app_no_plan_ablation}
+
+To evaluate the role of explicit failure diagnosis and recovery planning, we compare TARO with a direct tactile recovery policy (\emph{w/o Plan}) across all four real-world tasks. The ablation removes Failure generation, Plan generation, and the associated failure history, while retaining tactile sensing, the Need and End heads, and asynchronous execution--recovery switching. Execution actions use the original task observations, whereas recovery actions are generated directly from the current camera images, robot state, task instruction, and tactile description. Need and End no longer receive a Plan but retain their task-specific motion-history inputs. The ablation is trained in two stages using the corresponding task demonstrations and data-processing procedures, excluding counterfactual samples. Each method is evaluated for 20 trials per task under the same task-specific conditions, with at most ten recovery operations per trial.
+
+\begin{table}[t]
+\centering
+\scriptsize
+\setlength{\tabcolsep}{2pt}
+\renewcommand{\arraystretch}{1.08}
+\caption{Real-world task success with and without explicit diagnosis and planning. C1--C5 are task-specific conditions; entries report success/failure counts (S/F), and TSR is the task success rate. Dashes indicate inapplicable conditions.}
+\label{tab:app_no_plan_ablation}
+\begin{tabular}{@{}lccccc c@{}}
+\toprule
+\textbf{Method} & \textbf{C1} & \textbf{C2} & \textbf{C3} & \textbf{C4} & \textbf{C5} & \textbf{TSR} \\
+\midrule
+\multicolumn{7}{@{}l}{\textit{Black-box}} \\
+w/o Plan & 0/4 & 3/1 & 2/2 & 1/3 & 1/3 & 35\% \\
+TARO & 3/1 & 4/0 & 3/1 & 4/0 & 4/0 & \textbf{90\%} \\
+\addlinespace
+\multicolumn{7}{@{}l}{\textit{Book}} \\
+w/o Plan & 3/2 & 3/2 & 4/1 & 1/4 & --- & 55\% \\
+TARO & 4/1 & 4/1 & 5/0 & 3/2 & --- & \textbf{80\%} \\
+\addlinespace
+\multicolumn{7}{@{}l}{\textit{Sponge}} \\
+w/o Plan & 2/3 & 4/1 & 4/1 & 1/4 & --- & 55\% \\
+TARO & 3/2 & 5/0 & 4/1 & 4/1 & --- & \textbf{80\%} \\
+\addlinespace
+\multicolumn{7}{@{}l}{\textit{Bottle}} \\
+w/o Plan & 4/6 & 3/7 & --- & --- & --- & 35\% \\
+TARO & 10/0 & 8/2 & --- & --- & --- & \textbf{90\%} \\
+\midrule
+\multicolumn{7}{@{}l}{\textit{Mean}} \\
+w/o Plan & & & & & & 45\% \\
+TARO & & & & & & \textbf{85\%} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+As shown in Table~\ref{tab:app_no_plan_ablation}, TARO achieves an average TSR of 85\%, compared with 45\% for w/o Plan. The gains are 55 percentage points on Black-box and Bottle and 25 points on Book and Sponge. These results show that the complete recovery pipeline outperforms directly conditioning recovery actions on tactile observations across the evaluated tasks. Because the ablation also changes the recovery-action inputs and excludes counterfactual supervision, the comparison evaluates the combined pipeline rather than isolating the effect of Plan generation alone.
